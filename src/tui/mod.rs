@@ -2,9 +2,11 @@ pub mod theme;
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -17,7 +19,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
 };
 use ratatui::{Frame, Terminal};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::clipboard::{
     clear_clipboard_best_effort, copy_secret, ClipboardOptions, DEFAULT_CLIPBOARD_TIMEOUT_SECS,
@@ -28,14 +30,18 @@ use crate::crypto::VaultHeader;
 use crate::daemon::{DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS};
 use crate::error::{Result, VaultError};
 use crate::generator::{
-    estimate_entropy_bits, generate_passphrase, generate_password, strength_label,
-    PassphraseOptions, PasswordOptions,
+    estimate_entropy_bits, generate_passphrase, generate_password, generated_password_entropy_bits,
+    passphrase_entropy_bits, strength_label, PassphraseOptions, PasswordOptions,
 };
-use crate::hardening::{HardeningStatus, LockedKey};
+use crate::hardening::{
+    boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, HardeningStatus, LockedKey,
+};
 use crate::totp::TotpConfig;
 use crate::vault::audit::{run_audit, AuditReport};
 use crate::vault::storage::{load_vault_from_disk, read_header_from_disk, save_vault_to_disk};
 use crate::vault::{Entry, Vault};
+
+const SUSPEND_SKEW_THRESHOLD_MS: u64 = 2000;
 
 pub struct TuiConfig {
     pub vault_path: PathBuf,
@@ -48,8 +54,18 @@ pub struct TuiConfig {
     pub hardening: HardeningStatus,
 }
 
+#[derive(Clone, Copy)]
+enum ToastLevel {
+    Ok,
+    Warn,
+    Error,
+}
+
 enum SessionBackend {
-    Daemon,
+    Daemon {
+        revision: Option<String>,
+        mlocked: bool,
+    },
     Standalone {
         master_key: LockedKey<32>,
         header: Box<VaultHeader>,
@@ -74,6 +90,9 @@ enum Mode {
 
 struct EntryForm {
     editing_original_name: Option<String>,
+    original_totp: Option<TotpConfig>,
+    totp_modified: bool,
+    reveal_secrets: bool,
     active_field: usize,
     name: String,
     username: String,
@@ -89,35 +108,44 @@ impl EntryForm {
     fn new_blank() -> Self {
         Self {
             editing_original_name: None,
+            original_totp: None,
+            totp_modified: false,
+            reveal_secrets: false,
             active_field: 0,
             name: String::new(),
             username: String::new(),
-            password: Zeroizing::new(String::new()),
+            password: Zeroizing::new(String::with_capacity(256)),
             url: String::new(),
             tags: String::new(),
-            totp: Zeroizing::new(String::new()),
-            notes: Zeroizing::new(String::new()),
+            totp: Zeroizing::new(String::with_capacity(256)),
+            notes: Zeroizing::new(String::with_capacity(512)),
             error: None,
         }
     }
 
     fn from_entry(entry: &Entry) -> Self {
+        let mut password = Zeroizing::new(String::with_capacity(entry.password.len().max(256)));
+        password.push_str(&entry.password);
+        let mut totp = Zeroizing::new(String::with_capacity(256));
+        if let Some(t) = &entry.totp {
+            totp.push_str(&t.secret_base32);
+        }
+        let mut notes = Zeroizing::new(String::with_capacity(entry.notes.len().max(512)));
+        notes.push_str(&entry.notes);
+
         Self {
             editing_original_name: Some(entry.name.clone()),
+            original_totp: entry.totp.clone(),
+            totp_modified: false,
+            reveal_secrets: false,
             active_field: 0,
             name: entry.name.clone(),
             username: entry.username.clone(),
-            password: Zeroizing::new(entry.password.clone()),
+            password,
             url: entry.url.clone(),
             tags: entry.tags.join(", "),
-            totp: Zeroizing::new(
-                entry
-                    .totp
-                    .as_ref()
-                    .map(|t| t.secret_base32.clone())
-                    .unwrap_or_default(),
-            ),
-            notes: Zeroizing::new(entry.notes.clone()),
+            totp,
+            notes,
             error: None,
         }
     }
@@ -125,6 +153,9 @@ impl EntryForm {
     const FIELD_COUNT: usize = 7;
 
     fn current_mut(&mut self) -> &mut String {
+        if self.active_field == 5 {
+            self.totp_modified = true;
+        }
         match self.active_field {
             0 => &mut self.name,
             1 => &mut self.username,
@@ -182,55 +213,87 @@ struct App {
     mode: Mode,
     backend: Option<SessionBackend>,
     vault: Option<Vault>,
-    search_query: String,
+    search_query: Zeroizing<String>,
     list_state: ListState,
     reveal_password: bool,
-    status_toast: Option<(String, Instant)>,
-    last_activity: Instant,
+    status_toast: Option<(ToastLevel, String, Instant)>,
+    last_activity_boot_secs: u64,
+    last_sleep_skew_ms: Option<u64>,
+    last_watchdog_check: Instant,
+    my_uid: u32,
     should_quit: bool,
+}
+
+fn current_boot_secs() -> u64 {
+    boottime_secs().unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
 }
 
 impl App {
     fn new(cfg: TuiConfig) -> Result<Self> {
         let header_preview = read_header_from_disk(&cfg.vault_path, true)?;
+        let my_uid = unsafe { libc::geteuid() };
         let mut app = Self {
             cfg,
             header_preview,
             mode: Mode::Locked {
-                passphrase_input: Zeroizing::new(String::new()),
+                passphrase_input: Zeroizing::new(String::with_capacity(256)),
                 error_msg: None,
             },
             backend: None,
             vault: None,
-            search_query: String::new(),
+            search_query: Zeroizing::new(String::with_capacity(128)),
             list_state: ListState::default(),
             reveal_password: false,
             status_toast: None,
-            last_activity: Instant::now(),
+            last_activity_boot_secs: current_boot_secs(),
+            last_sleep_skew_ms: boottime_monotonic_skew_ms(),
+            last_watchdog_check: Instant::now(),
+            my_uid,
             should_quit: false,
         };
 
-        // If the auto-lock daemon is already unlocked for this vault, attach seamlessly!
+        // If the auto-lock daemon is already unlocked for this vault, attach seamlessly
+        // and read real mlock telemetry from DaemonStatus.
         let client = DaemonClient::new(app.cfg.socket_path.clone());
-        if let Ok(vault) = client.load_vault(&app.cfg.vault_path) {
-            app.backend = Some(SessionBackend::Daemon);
-            app.vault = Some(vault);
-            app.mode = Mode::Normal;
-            if app.vault.as_ref().is_some_and(|v| !v.entries.is_empty()) {
-                app.list_state.select(Some(0));
+        if let Ok(st) = client.status() {
+            if st.unlocked {
+                if let Ok((vault, rev)) = client.load_vault(&app.cfg.vault_path) {
+                    app.backend = Some(SessionBackend::Daemon {
+                        revision: Some(rev),
+                        mlocked: st.mlocked,
+                    });
+                    app.vault = Some(vault);
+                    app.mode = Mode::Normal;
+                    if app.vault.as_ref().is_some_and(|v| !v.entries.is_empty()) {
+                        app.list_state.select(Some(0));
+                    }
+                    app.set_toast(
+                        ToastLevel::Ok,
+                        if st.mlocked {
+                            "Attached to unlocked omavault daemon (mlock ACTIVE)"
+                        } else {
+                            "Attached to unlocked omavault daemon (mlock unavailable)"
+                        },
+                    );
+                }
             }
-            app.set_toast("Attached to unlocked omavault daemon");
         }
 
         Ok(app)
     }
 
-    fn set_toast(&mut self, msg: impl Into<String>) {
-        self.status_toast = Some((msg.into(), Instant::now()));
+    fn set_toast(&mut self, level: ToastLevel, msg: impl Into<String>) {
+        self.status_toast = Some((level, msg.into(), Instant::now()));
     }
 
-    fn lock_vault(&mut self, reason: &str) {
-        if let Some(SessionBackend::Daemon) = self.backend {
+    /// Lock vault locally (and optionally tell daemon to lock as well).
+    fn lock_vault(&mut self, reason: &str, notify_daemon: bool) {
+        if notify_daemon && matches!(self.backend, Some(SessionBackend::Daemon { .. })) {
             let client = DaemonClient::new(self.cfg.socket_path.clone());
             let _ = client.lock();
         }
@@ -239,46 +302,61 @@ impl App {
         self.vault = None;
         self.backend = None;
         self.reveal_password = false;
-        self.search_query.clear();
+        self.search_query.zeroize();
+        self.status_toast = None;
         clear_clipboard_best_effort();
         self.mode = Mode::Locked {
-            passphrase_input: Zeroizing::new(String::new()),
+            passphrase_input: Zeroizing::new(String::with_capacity(256)),
             error_msg: Some(format!("Vault locked ({reason})")),
         };
     }
 
     fn attempt_unlock(&mut self, passphrase: Zeroizing<String>) {
         let client = DaemonClient::new(self.cfg.socket_path.clone());
-        if client.is_available() {
+        if let Ok(st_before) = client.status() {
+            let _ = st_before;
             match client.unlock(
                 &self.cfg.vault_path,
                 passphrase,
                 self.cfg.keyfile_path.clone(),
                 self.cfg.fido2_device.clone(),
             ) {
-                Ok(()) => match client.load_vault(&self.cfg.vault_path) {
-                    Ok(vault) => {
-                        self.backend = Some(SessionBackend::Daemon);
-                        self.vault = Some(vault);
-                        self.mode = Mode::Normal;
-                        self.last_activity = Instant::now();
-                        if self.vault.as_ref().is_some_and(|v| !v.entries.is_empty()) {
-                            self.list_state.select(Some(0));
+                Ok(()) => {
+                    let mlocked = client.status().map(|s| s.mlocked).unwrap_or(false);
+                    match client.load_vault(&self.cfg.vault_path) {
+                        Ok((vault, rev)) => {
+                            self.backend = Some(SessionBackend::Daemon {
+                                revision: Some(rev),
+                                mlocked,
+                            });
+                            self.vault = Some(vault);
+                            self.mode = Mode::Normal;
+                            self.last_activity_boot_secs = current_boot_secs();
+                            if self.vault.as_ref().is_some_and(|v| !v.entries.is_empty()) {
+                                self.list_state.select(Some(0));
+                            }
+                            self.set_toast(
+                                ToastLevel::Ok,
+                                if mlocked {
+                                    "Unlocked via omavault daemon (mlock ACTIVE)"
+                                } else {
+                                    "Unlocked via omavault daemon (mlock unavailable)"
+                                },
+                            );
+                            return;
                         }
-                        self.set_toast("Unlocked via omavault daemon (mlock active)");
-                        return;
+                        Err(e) => {
+                            self.mode = Mode::Locked {
+                                passphrase_input: Zeroizing::new(String::with_capacity(256)),
+                                error_msg: Some(e.to_string()),
+                            };
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        self.mode = Mode::Locked {
-                            passphrase_input: Zeroizing::new(String::new()),
-                            error_msg: Some(e.to_string()),
-                        };
-                        return;
-                    }
-                },
+                }
                 Err(e) => {
                     self.mode = Mode::Locked {
-                        passphrase_input: Zeroizing::new(String::new()),
+                        passphrase_input: Zeroizing::new(String::with_capacity(256)),
                         error_msg: Some(e.to_string()),
                     };
                     return;
@@ -333,36 +411,39 @@ impl App {
                 });
                 self.vault = Some(vault);
                 self.mode = Mode::Normal;
-                self.last_activity = Instant::now();
+                self.last_activity_boot_secs = current_boot_secs();
                 if self.vault.as_ref().is_some_and(|v| !v.entries.is_empty()) {
                     self.list_state.select(Some(0));
                 }
-                self.set_toast(mlock_msg);
+                self.set_toast(ToastLevel::Ok, mlock_msg);
             }
             Err(e) => {
                 self.mode = Mode::Locked {
-                    passphrase_input: Zeroizing::new(String::new()),
+                    passphrase_input: Zeroizing::new(String::with_capacity(256)),
                     error_msg: Some(e.to_string()),
                 };
             }
         }
     }
 
-    fn persist_vault(&mut self) -> Result<()> {
-        let vault = self
-            .vault
-            .as_ref()
-            .ok_or_else(|| VaultError::Daemon("vault not unlocked".into()))?;
+    /// Persist a staged vault snapshot cleanly; only commit to `self.vault` if disk/daemon write succeeds.
+    fn persist_staged_vault(&mut self, staged: Vault) -> Result<()> {
         match self.backend.as_mut() {
-            Some(SessionBackend::Daemon) => {
+            Some(SessionBackend::Daemon { revision, .. }) => {
                 let client = DaemonClient::new(self.cfg.socket_path.clone());
-                client.save_vault(&self.cfg.vault_path, vault)
+                client.save_vault(&self.cfg.vault_path, &staged, revision.clone())?;
+                // Refresh latest revision token after save.
+                if let Ok((_, new_rev)) = client.load_vault(&self.cfg.vault_path) {
+                    *revision = Some(new_rev);
+                }
             }
             Some(SessionBackend::Standalone { master_key, header }) => {
-                save_vault_to_disk(&self.cfg.vault_path, master_key, header, vault)
+                save_vault_to_disk(&self.cfg.vault_path, master_key, header, &staged)?;
             }
-            None => Err(VaultError::Daemon("vault not unlocked".into())),
+            None => return Err(VaultError::Daemon("vault not unlocked".into())),
         }
+        self.vault = Some(staged);
+        Ok(())
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -397,6 +478,10 @@ impl App {
     }
 
     fn copy_to_secret_clipboard(&mut self, label: &str, secret: &str) {
+        if secret.is_empty() {
+            self.set_toast(ToastLevel::Warn, format!("{label} is empty — nothing copied"));
+            return;
+        }
         let opts = ClipboardOptions {
             timeout_secs: self.cfg.clipboard_timeout_secs,
             paste_once: self.cfg.paste_once,
@@ -408,51 +493,103 @@ impl App {
                 } else {
                     format!("clears in {}s", opts.timeout_secs)
                 };
-                self.set_toast(format!(
-                    "Copied {label} (Wayland secret-tagged · {mode_str})"
-                ));
+                self.set_toast(
+                    ToastLevel::Ok,
+                    format!("Copied {label} (Wayland secret-tagged · {mode_str})"),
+                );
             }
-            Err(e) => self.set_toast(format!("Clipboard unavailable: {e}")),
+            Err(e) => self.set_toast(ToastLevel::Error, format!("Clipboard unavailable: {e}")),
         }
     }
 
     fn is_mlocked(&self) -> bool {
         match &self.backend {
             Some(SessionBackend::Standalone { master_key, .. }) => master_key.is_mlocked(),
-            Some(SessionBackend::Daemon) => true,
+            Some(SessionBackend::Daemon { mlocked, .. }) => *mlocked,
             None => false,
         }
     }
 
     fn remaining_lock_secs(&self) -> u64 {
-        let timeout = Duration::from_secs(self.cfg.idle_timeout_secs.max(10));
-        timeout.saturating_sub(self.last_activity.elapsed()).as_secs()
+        let timeout = self.cfg.idle_timeout_secs.max(10);
+        let elapsed = current_boot_secs().saturating_sub(self.last_activity_boot_secs);
+        timeout.saturating_sub(elapsed)
     }
 
+    /// Periodic security watchdog executed every tick:
+    /// 1. Suspend/lid-close detection (`CLOCK_BOOTTIME - CLOCK_MONOTONIC` skew >= 2s)
+    /// 2. Hyprlock / Wayland screen-locker detection (`/proc/<pid>/status`)
+    /// 3. `CLOCK_BOOTTIME` inactivity timeout (counts suspend time!)
+    /// 4. Daemon lock synchronization (immediately wipes TUI RAM if `omavaultd` locked!)
     fn on_tick(&mut self) {
-        if !matches!(self.mode, Mode::Locked { .. }) {
-            let timeout = Duration::from_secs(self.cfg.idle_timeout_secs.max(10));
-            if self.last_activity.elapsed() >= timeout {
-                self.lock_vault("inactivity timeout");
-            }
-        }
-        if let Some((_, ts)) = &self.status_toast {
+        if let Some((_, _, ts)) = &self.status_toast {
             if ts.elapsed() > Duration::from_secs(6) {
                 self.status_toast = None;
+            }
+        }
+
+        if matches!(self.mode, Mode::Locked { .. }) {
+            self.last_sleep_skew_ms = boottime_monotonic_skew_ms();
+            return;
+        }
+
+        if self.last_watchdog_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_watchdog_check = Instant::now();
+
+        // 1. Check system suspend/resume skew.
+        let current_skew = boottime_monotonic_skew_ms();
+        if let (Some(prev), Some(curr)) = (self.last_sleep_skew_ms, current_skew) {
+            if curr.saturating_sub(prev) >= SUSPEND_SKEW_THRESHOLD_MS {
+                self.last_sleep_skew_ms = current_skew;
+                self.lock_vault("system suspend/resume detected", true);
+                return;
+            }
+        }
+        self.last_sleep_skew_ms = current_skew;
+
+        // 2. Check active Hyprlock / screen locker (even in standalone mode!).
+        if is_screen_locker_active(self.my_uid) {
+            self.lock_vault("screen lock (hyprlock) detected", true);
+            return;
+        }
+
+        // 3. Check CLOCK_BOOTTIME inactivity timeout.
+        let timeout = self.cfg.idle_timeout_secs.max(10);
+        if current_boot_secs().saturating_sub(self.last_activity_boot_secs) >= timeout {
+            self.lock_vault("inactivity timeout", true);
+            return;
+        }
+
+        // 4. Synchronize with omavaultd if running in daemon-backed mode.
+        if let Some(SessionBackend::Daemon { mlocked, .. }) = self.backend.as_mut() {
+            let client = DaemonClient::new(self.cfg.socket_path.clone());
+            match client.status() {
+                Ok(st) if st.unlocked => {
+                    *mlocked = st.mlocked;
+                }
+                Ok(st) => {
+                    let reason = st
+                        .last_lock_reason
+                        .unwrap_or_else(|| "daemon locked".to_string());
+                    self.lock_vault(&reason, false);
+                }
+                Err(_) => {
+                    self.lock_vault("daemon disconnected", false);
+                }
             }
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        self.last_activity = Instant::now();
+        self.last_activity_boot_secs = current_boot_secs();
 
-        // Global Ctrl+C exits cleanly and wipes memory.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
         }
 
-        // Handle mode-specific keys.
         match &mut self.mode {
             Mode::Locked {
                 passphrase_input,
@@ -462,7 +599,7 @@ impl App {
                 KeyCode::Enter => {
                     let entered = std::mem::replace(
                         passphrase_input,
-                        Zeroizing::new(String::new()),
+                        Zeroizing::new(String::with_capacity(256)),
                     );
                     *error_msg = None;
                     self.attempt_unlock(entered);
@@ -477,7 +614,7 @@ impl App {
             },
             Mode::Search => match key.code {
                 KeyCode::Esc => {
-                    self.search_query.clear();
+                    self.search_query.zeroize();
                     self.clamp_selection();
                     self.mode = Mode::Normal;
                 }
@@ -504,13 +641,20 @@ impl App {
                 let name = entry_name.clone();
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        if let Some(vault) = self.vault.as_mut() {
-                            if vault.remove_by_name(&name).is_ok() {
-                                if let Err(e) = self.persist_vault() {
-                                    self.set_toast(format!("Save failed: {e}"));
-                                } else {
-                                    self.set_toast(format!("Deleted entry '{name}'"));
-                                }
+                        if let Some(current) = &self.vault {
+                            let mut staged = current.clone();
+                            match staged.remove_by_name(&name) {
+                                Ok(_) => match self.persist_staged_vault(staged) {
+                                    Ok(()) => self.set_toast(
+                                        ToastLevel::Ok,
+                                        format!("Deleted entry '{name}'"),
+                                    ),
+                                    Err(e) => self.set_toast(
+                                        ToastLevel::Error,
+                                        format!("Save failed (rolled back): {e}"),
+                                    ),
+                                },
+                                Err(e) => self.set_toast(ToastLevel::Error, e.to_string()),
                             }
                         }
                         self.clamp_selection();
@@ -547,7 +691,7 @@ impl App {
                 }
                 KeyCode::Char('-') | KeyCode::Left => {
                     if gen_state.passphrase_mode {
-                        gen_state.words = gen_state.words.saturating_sub(1).max(4);
+                        gen_state.words = gen_state.words.saturating_sub(1).max(6);
                     } else {
                         gen_state.length = gen_state.length.saturating_sub(2).max(12);
                     }
@@ -565,6 +709,10 @@ impl App {
                         form.password = pw;
                         form.error = None;
                     }
+                    return;
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+                    form.reveal_secrets = !form.reveal_secrets;
                     return;
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
@@ -604,18 +752,21 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
-            self.lock_vault("manual lock");
+            self.lock_vault("manual lock", true);
             return;
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('L') => self.lock_vault("manual lock"),
+            KeyCode::Char('L') => self.lock_vault("manual lock", true),
             KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('g') => self.mode = Mode::Generator(GenModalState::new()),
             KeyCode::Char('A') => {
                 if let Some(vault) = &self.vault {
-                    self.mode = Mode::Audit(run_audit(vault));
+                    match run_audit(vault) {
+                        Ok(report) => self.mode = Mode::Audit(report),
+                        Err(e) => self.set_toast(ToastLevel::Error, format!("Audit failed: {e}")),
+                    }
                 }
             }
             KeyCode::Char('r') => {
@@ -645,15 +796,21 @@ impl App {
             }
             KeyCode::Char('y') => {
                 if let Some(entry) = self.selected_entry().cloned() {
-                    self.copy_to_secret_clipboard(&format!("'{}' password", entry.name), &entry.password);
+                    self.copy_to_secret_clipboard(
+                        &format!("'{}' password", entry.name),
+                        &entry.password,
+                    );
                 }
             }
             KeyCode::Char('u') => {
                 if let Some(entry) = self.selected_entry().cloned() {
                     if entry.username.is_empty() {
-                        self.set_toast("Entry has no username");
+                        self.set_toast(ToastLevel::Warn, "Entry has no username");
                     } else {
-                        self.copy_to_secret_clipboard(&format!("'{}' username", entry.name), &entry.username);
+                        self.copy_to_secret_clipboard(
+                            &format!("'{}' username", entry.name),
+                            &entry.username,
+                        );
                     }
                 }
             }
@@ -667,10 +824,10 @@ impl App {
                                     &code.code,
                                 );
                             }
-                            Err(e) => self.set_toast(format!("TOTP error: {e}")),
+                            Err(e) => self.set_toast(ToastLevel::Error, format!("TOTP error: {e}")),
                         }
                     } else {
-                        self.set_toast("Entry has no TOTP configured");
+                        self.set_toast(ToastLevel::Warn, "Entry has no TOTP configured");
                     }
                 }
             }
@@ -690,7 +847,7 @@ impl App {
                 }
             }
             KeyCode::Esc if !self.search_query.is_empty() => {
-                self.search_query.clear();
+                self.search_query.zeroize();
                 self.clamp_selection();
             }
             _ => {}
@@ -708,7 +865,10 @@ impl App {
             return;
         }
 
-        let totp_cfg = if form.totp.trim().is_empty() {
+        // Preserve original TotpConfig (algorithm, digits, period, issuer) unless modified!
+        let totp_cfg = if !form.totp_modified {
+            form.original_totp.clone()
+        } else if form.totp.trim().is_empty() {
             None
         } else {
             match TotpConfig::parse(form.totp.trim()) {
@@ -729,42 +889,48 @@ impl App {
 
         let editing = form.editing_original_name.clone();
         let username = form.username.trim().to_string();
-        let password = form.password.to_string();
+        let password = form.password.clone();
         let url = form.url.trim().to_string();
-        let notes = form.notes.to_string();
+        let notes = form.notes.clone();
 
-        if let Some(vault) = self.vault.as_mut() {
-            if let Some(orig) = editing {
-                if let Some(entry) = vault.find_by_name_mut(&orig) {
-                    entry.name = name.clone();
-                    entry.username = username;
-                    entry.set_password(password);
-                    entry.url = url;
-                    entry.tags = tags;
-                    entry.totp = totp_cfg;
-                    entry.notes = notes;
-                    entry.updated_at = chrono::Utc::now();
-                }
-            } else {
-                let mut entry = Entry::new(name.clone(), username, password);
+        let Some(current_vault) = &self.vault else {
+            return;
+        };
+        let mut staged = current_vault.clone();
+
+        let mutate_res = if let Some(orig) = editing {
+            staged.update_entry(&orig, &name, |entry| {
+                entry.username = username;
+                entry.set_password(password);
                 entry.url = url;
                 entry.tags = tags;
                 entry.totp = totp_cfg;
-                entry.notes = notes;
-                if let Err(e) = vault.add_entry(entry) {
-                    if let Mode::Editor(f) = &mut self.mode {
-                        f.error = Some(e.to_string());
-                    }
-                    return;
-                }
+                entry.notes = notes.to_string();
+            })
+        } else {
+            let mut entry = Entry::new(name.clone(), username, password.to_string());
+            entry.url = url;
+            entry.tags = tags;
+            entry.totp = totp_cfg;
+            entry.notes = notes.to_string();
+            staged.add_entry(entry)
+        };
+
+        if let Err(e) = mutate_res {
+            if let Mode::Editor(f) = &mut self.mode {
+                f.error = Some(e.to_string());
             }
+            return;
         }
 
-        match self.persist_vault() {
+        match self.persist_staged_vault(staged) {
             Ok(()) => {
                 self.clamp_selection();
                 self.mode = Mode::Normal;
-                self.set_toast(format!("Encrypted & saved '{name}' (fresh key + nonce)"));
+                self.set_toast(
+                    ToastLevel::Ok,
+                    format!("Encrypted & saved '{name}' (fresh key + nonce)"),
+                );
             }
             Err(e) => {
                 if let Mode::Editor(f) = &mut self.mode {
@@ -778,6 +944,9 @@ impl App {
 /// Launch the interactive Omarchy Ratatui password manager.
 pub fn run_tui(cfg: TuiConfig) -> Result<()> {
     let mut app = App::new(cfg)?;
+    let signal_quit = Arc::new(AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&signal_quit));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&signal_quit));
 
     enable_raw_mode().map_err(VaultError::Io)?;
     let mut stdout = io::stdout();
@@ -791,24 +960,38 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
 
             if event::poll(Duration::from_millis(250)).map_err(VaultError::Io)? {
                 if let Event::Key(key) = event::read().map_err(VaultError::Io)? {
-                    app.handle_key(key);
+                    if key.kind == KeyEventKind::Press {
+                        app.handle_key(key);
+                    }
                 }
             }
             app.on_tick();
 
-            if app.should_quit {
+            if app.should_quit || signal_quit.load(Ordering::SeqCst) {
                 break;
             }
         }
         Ok(())
     })();
 
-    // Always restore terminal state cleanly even on error.
+    // Cleanly wipe RAM and clear any active secret clipboard on exit.
+    clear_clipboard_best_effort();
+    app.vault = None;
+    app.backend = None;
+    app.search_query.zeroize();
+
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 
     run_res
+}
+
+/// Strip C0/C1 control characters & ANSI escapes before rendering untrusted entry strings.
+fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !c.is_control() || c == '\n' || c == '\t')
+        .collect()
 }
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
@@ -883,7 +1066,11 @@ fn draw_locked_screen(
         factors.push("FIDO2 Hardware Touch");
     }
 
-    let masked = "•".repeat(input_len);
+    let masked = if input_len == 0 {
+        String::new()
+    } else {
+        "•".repeat(input_len.min(32))
+    };
     let mut lines = vec![
         Line::from(Span::styled(
             "  OMAVAULT  ·  HARDENED PASSWORD VAULT",
@@ -928,7 +1115,7 @@ fn draw_locked_screen(
 
     if let Some(err) = error_msg {
         lines.push(Line::from(Span::styled(
-            format!("  ! {err}"),
+            format!("  ! {}", sanitize_display(err)),
             theme::danger_style(),
         )));
     } else {
@@ -963,9 +1150,9 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
     let search_text = if app.search_query.is_empty() && !search_active {
         "Press / to search...".to_string()
     } else if search_active {
-        format!("{}_", app.search_query)
+        format!("{}_", sanitize_display(&app.search_query))
     } else {
-        app.search_query.clone()
+        sanitize_display(&app.search_query)
     };
 
     let line = Line::from(vec![
@@ -1003,11 +1190,11 @@ fn draw_entry_list(f: &mut Frame, area: Rect, app: &mut App) {
             .iter()
             .map(|&idx| {
                 let entry = &vault.entries[idx];
-                let mut spans = vec![Span::raw(format!(" {}", entry.name))];
+                let mut spans = vec![Span::raw(format!(" {}", sanitize_display(&entry.name)))];
                 if entry.totp.is_some() {
                     spans.push(Span::styled(" [2FA]", Style::default().fg(theme::ACCENT_GREEN)));
                 }
-                if estimate_entropy_bits(&entry.password) < 60.0 && !entry.password.is_empty() {
+                if entry.password.is_empty() || estimate_entropy_bits(&entry.password) < 60.0 {
                     spans.push(Span::styled(" [!]", theme::warn_style()));
                 }
                 ListItem::new(Line::from(spans))
@@ -1061,7 +1248,7 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
     let bits = estimate_entropy_bits(&entry.password);
     let label = strength_label(bits);
     let pw_display = if app.reveal_password {
-        entry.password.clone()
+        sanitize_display(&entry.password)
     } else if entry.password.is_empty() {
         "(empty)".to_string()
     } else {
@@ -1080,13 +1267,17 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(" Name:     ", theme::muted_style()),
             Span::styled(
-                &entry.name,
+                sanitize_display(&entry.name),
                 Style::default().fg(theme::ACCENT_CYAN).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
             Span::styled(" Username: ", theme::muted_style()),
-            Span::raw(if entry.username.is_empty() { "-" } else { &entry.username }),
+            Span::raw(if entry.username.is_empty() {
+                "-".to_string()
+            } else {
+                sanitize_display(&entry.username)
+            }),
         ]),
         Line::from(vec![
             Span::styled(" Password: ", theme::muted_style()),
@@ -1097,7 +1288,11 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(" URL:      ", theme::muted_style()),
             Span::styled(
-                if entry.url.is_empty() { "-" } else { &entry.url },
+                if entry.url.is_empty() {
+                    "-".to_string()
+                } else {
+                    sanitize_display(&entry.url)
+                },
                 Style::default().fg(theme::ACCENT_BLUE),
             ),
         ]),
@@ -1107,7 +1302,7 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
                 if entry.tags.is_empty() {
                     "-".to_string()
                 } else {
-                    entry.tags.join(", ")
+                    sanitize_display(&entry.tags.join(", "))
                 },
                 Style::default().fg(theme::ACCENT_MAGENTA),
             ),
@@ -1124,7 +1319,11 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled(" Notes:", theme::muted_style())),
         Line::from(format!(
             " {}",
-            if entry.notes.is_empty() { "(none)" } else { &entry.notes }
+            if entry.notes.is_empty() {
+                "(none)".to_string()
+            } else {
+                sanitize_display(&entry.notes)
+            }
         )),
     ];
 
@@ -1133,11 +1332,15 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(Span::styled(" Custom Fields:", theme::muted_style())));
         for cf in &entry.custom_fields {
             let val = if cf.secret && !app.reveal_password {
-                "••••••••"
+                "••••••••".to_string()
             } else {
-                &cf.value
+                sanitize_display(&cf.value)
             };
-            lines.push(Line::from(format!("  {}: {}", cf.label, val)));
+            lines.push(Line::from(format!(
+                "  {}: {}",
+                sanitize_display(&cf.label),
+                val
+            )));
         }
     }
 
@@ -1176,8 +1379,16 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_bottom_bar(f: &mut Frame, area: Rect, app: &App) {
-    let text = if let Some((msg, _)) = &app.status_toast {
-        Line::from(Span::styled(format!(" ✓ {msg}"), theme::ok_style()))
+    let text = if let Some((level, msg, _)) = &app.status_toast {
+        let (prefix, style) = match level {
+            ToastLevel::Ok => (" ✓ ", theme::ok_style()),
+            ToastLevel::Warn => (" ! ", theme::warn_style()),
+            ToastLevel::Error => (" ✗ ", theme::danger_style()),
+        };
+        Line::from(Span::styled(
+            format!("{prefix}{}", sanitize_display(msg)),
+            style,
+        ))
     } else {
         Line::from(Span::styled(
             " [j/k] Nav  [/] Search  [y] Copy Pass  [u] User  [t] TOTP  [r] Reveal  [a] Add  [e] Edit  [d] Del  [g] Gen  [A] Audit  [L] Lock  [?] Help  [q] Quit",
@@ -1189,23 +1400,34 @@ fn draw_bottom_bar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_editor_modal(f: &mut Frame, area: Rect, form: &EntryForm) {
-    let modal = centered_rect(72, 72, area);
+    let modal = centered_rect(76, 74, area);
     f.render_widget(Clear, modal);
 
     let title = if form.editing_original_name.is_some() {
-        " Edit Entry (Tab: next · Ctrl+G: generate password · Ctrl+S: save · Esc: cancel) "
+        " Edit Entry (Tab: next · Ctrl+G: gen · Ctrl+R: reveal · Ctrl+S: save · Esc: cancel) "
     } else {
-        " New Entry (Tab: next · Ctrl+G: generate password · Ctrl+S: save · Esc: cancel) "
+        " New Entry (Tab: next · Ctrl+G: gen · Ctrl+R: reveal · Ctrl+S: save · Esc: cancel) "
     };
 
-    let fields: [(&str, &str); EntryForm::FIELD_COUNT] = [
-        ("Name", &form.name),
-        ("Username", &form.username),
-        ("Password", &form.password),
-        ("URL", &form.url),
-        ("Tags (comma)", &form.tags),
-        ("TOTP (Base32 / otpauth://)", &form.totp),
-        ("Notes", &form.notes),
+    let masked_pw = if form.reveal_secrets {
+        sanitize_display(&form.password)
+    } else {
+        "•".repeat(form.password.chars().count().min(32))
+    };
+    let masked_totp = if form.reveal_secrets || form.totp.is_empty() {
+        sanitize_display(&form.totp)
+    } else {
+        "•".repeat(form.totp.chars().count().min(32))
+    };
+
+    let fields: [(&str, String); EntryForm::FIELD_COUNT] = [
+        ("Name", sanitize_display(&form.name)),
+        ("Username", sanitize_display(&form.username)),
+        ("Password", masked_pw),
+        ("URL", sanitize_display(&form.url)),
+        ("Tags (comma)", sanitize_display(&form.tags)),
+        ("TOTP (Base32 / otpauth://)", masked_totp),
+        ("Notes", sanitize_display(&form.notes)),
     ];
 
     let mut lines = Vec::new();
@@ -1226,7 +1448,10 @@ fn draw_editor_modal(f: &mut Frame, area: Rect, form: &EntryForm) {
     }
 
     if let Some(err) = &form.error {
-        lines.push(Line::from(Span::styled(format!("  ! {err}"), theme::danger_style())));
+        lines.push(Line::from(Span::styled(
+            format!("  ! {}", sanitize_display(err)),
+            theme::danger_style(),
+        )));
     }
 
     let p = Paragraph::new(lines)
@@ -1246,12 +1471,16 @@ fn draw_generator_modal(f: &mut Frame, area: Rect, gen: &GenModalState) {
     f.render_widget(Clear, modal);
 
     let bits = if gen.passphrase_mode {
-        crate::generator::passphrase_entropy_bits(&PassphraseOptions {
+        passphrase_entropy_bits(&PassphraseOptions {
             words: gen.words,
             ..PassphraseOptions::default()
         })
     } else {
-        estimate_entropy_bits(&gen.preview)
+        generated_password_entropy_bits(&PasswordOptions {
+            length: gen.length,
+            symbols: gen.symbols,
+            ..PasswordOptions::default()
+        })
     };
     let mode_label = if gen.passphrase_mode {
         format!("Diceware Passphrase ({} words)", gen.words)
@@ -1300,7 +1529,7 @@ fn draw_generator_modal(f: &mut Frame, area: Rect, gen: &GenModalState) {
 }
 
 fn draw_audit_modal(f: &mut Frame, area: Rect, report: &AuditReport) {
-    let modal = centered_rect(70, 62, area);
+    let modal = centered_rect(72, 68, area);
     f.render_widget(Clear, modal);
 
     let mut lines = vec![
@@ -1318,26 +1547,38 @@ fn draw_audit_modal(f: &mut Frame, area: Rect, report: &AuditReport) {
             ),
         ]),
         Line::from(format!(
-            "  Total entries: {}  ·  2FA (TOTP) enabled: {}/{}",
-            report.total_entries, report.totp_enabled_count, report.total_entries
+            "  Total entries: {}  ·  2FA (TOTP): {}/{}  ·  Missing 2FA: {}",
+            report.total_entries,
+            report.totp_enabled_count,
+            report.total_entries,
+            report.missing_totp.len()
         )),
         Line::from(""),
     ];
 
     if report.weak_passwords.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  ✓ No weak passwords detected",
+            "  ✓ No weak or empty passwords detected",
             theme::ok_style(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("  ! Weak passwords ({}):", report.weak_passwords.len()),
+            format!("  ! Weak / empty passwords ({}):", report.weak_passwords.len()),
             theme::danger_style(),
         )));
         for w in report.weak_passwords.iter().take(6) {
             lines.push(Line::from(format!(
-                "    - {} ({:.0} bits, len {})",
-                w.entry_name, w.entropy_bits, w.length
+                "    - {} ({:.0} bits · {} · len {})",
+                sanitize_display(&w.entry_name),
+                w.entropy_bits,
+                w.label,
+                w.length
+            )));
+        }
+        if report.weak_passwords.len() > 6 {
+            lines.push(Line::from(Span::styled(
+                format!("    ...and {} more (run `omavault audit` for full list)", report.weak_passwords.len() - 6),
+                theme::muted_style(),
             )));
         }
     }
@@ -1353,7 +1594,16 @@ fn draw_audit_modal(f: &mut Frame, area: Rect, report: &AuditReport) {
             theme::danger_style(),
         )));
         for g in report.reused_groups.iter().take(5) {
-            lines.push(Line::from(format!("    - {}", g.entry_names.join(", "))));
+            lines.push(Line::from(format!(
+                "    - {}",
+                sanitize_display(&g.entry_names.join(", "))
+            )));
+        }
+        if report.reused_groups.len() > 5 {
+            lines.push(Line::from(Span::styled(
+                format!("    ...and {} more groups", report.reused_groups.len() - 5),
+                theme::muted_style(),
+            )));
         }
     }
 
@@ -1362,8 +1612,11 @@ fn draw_audit_modal(f: &mut Frame, area: Rect, report: &AuditReport) {
             format!("  ! Older than 1 year ({}):", report.stale_entries.len()),
             theme::warn_style(),
         )));
-        for (name, days) in report.stale_entries.iter().take(5) {
-            lines.push(Line::from(format!("    - {name} ({days} days old)")));
+        for (name, days) in report.stale_entries.iter().take(4) {
+            lines.push(Line::from(format!(
+                "    - {} ({days} days old)",
+                sanitize_display(name)
+            )));
         }
     }
 
@@ -1391,11 +1644,14 @@ fn draw_confirm_delete(f: &mut Frame, area: Rect, name: &str) {
     let p = Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  Permanently delete entry '{name}'?"),
+            format!("  Permanently delete entry '{}'?", sanitize_display(name)),
             theme::danger_style(),
         )),
         Line::from(""),
-        Line::from(Span::styled("  [y] Yes, delete    [n/Esc] Cancel", theme::muted_style())),
+        Line::from(Span::styled(
+            "  [y] Yes, delete    [n/Esc] Cancel",
+            theme::muted_style(),
+        )),
     ])
     .block(
         Block::default()
@@ -1408,7 +1664,7 @@ fn draw_confirm_delete(f: &mut Frame, area: Rect, name: &str) {
 }
 
 fn draw_help_modal(f: &mut Frame, area: Rect) {
-    let modal = centered_rect(66, 62, area);
+    let modal = centered_rect(68, 64, area);
     f.render_widget(Clear, modal);
     let lines = vec![
         Line::from(Span::styled("  Navigation & Search", theme::title_style())),
@@ -1422,11 +1678,11 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         Line::from("   r               Toggle password reveal"),
         Line::from(""),
         Line::from(Span::styled("  Vault Management", theme::title_style())),
-        Line::from("   a / e / d       Add / Edit / Delete entry"),
+        Line::from("   a / e / d       Add / Edit / Delete entry (Ctrl+R reveals inside editor)"),
         Line::from("   g               CSPRNG Password & Diceware Generator"),
         Line::from("   A               Run local Password Security Audit"),
         Line::from("   L / Ctrl+L      Lock vault & wipe keys from RAM immediately"),
-        Line::from("   q / Ctrl+C      Quit"),
+        Line::from("   q / Ctrl+C      Quit & clear clipboard"),
     ];
     let p = Paragraph::new(lines)
         .block(

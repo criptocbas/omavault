@@ -1,5 +1,10 @@
+use std::fs;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
@@ -10,19 +15,61 @@ use crate::hardening::fill_random;
 
 pub const DEFAULT_RP_ID: &str = "omavault.local";
 const USER_NAME: &str = "omavault";
+/// Hard timeout for FIDO2 authenticator subprocesses so headless calls cannot hang forever.
+const FIDO2_CMD_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Trusted system binary search prefixes (in priority order).
+const TRUSTED_BIN_DIRS: &[&str] = &["/usr/bin", "/usr/local/bin", "/bin"];
 
 /// Non-secret FIDO2 metadata stored inside the AAD-authenticated vault header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fido2Metadata {
-    /// Relying Party ID (e.g. `omavault.local`).
+    /// Relying Party ID (must be `omavault.local`).
     pub rp_id: String,
     /// Base64-encoded non-resident credential ID returned during enrollment.
     pub credential_id_b64: String,
     /// Base64-encoded 32-byte random HMAC challenge salt.
     pub hmac_salt_b64: String,
-    /// Whether User Verification (PIN / biometric) was requested on the authenticator.
+    /// Whether User Verification (PIN / biometric) is required on the authenticator.
     #[serde(default)]
     pub require_uv: bool,
+}
+
+impl Fido2Metadata {
+    /// Strictly validate FIDO2 metadata before trusting it prior to AEAD verification.
+    pub fn validate(&self) -> Result<()> {
+        if self.rp_id != DEFAULT_RP_ID {
+            return Err(VaultError::Fido2Error(
+                "unexpected FIDO2 relying party ID in vault header".into(),
+            ));
+        }
+        if self.rp_id.contains(['\n', '\r', '\0'])
+            || self.credential_id_b64.contains(['\n', '\r', '\0'])
+            || self.hmac_salt_b64.contains(['\n', '\r', '\0'])
+        {
+            return Err(VaultError::Fido2Error(
+                "invalid control characters in FIDO2 metadata".into(),
+            ));
+        }
+        let cred = BASE64
+            .decode(self.credential_id_b64.as_bytes())
+            .map_err(|_| VaultError::Fido2Error("invalid Base64 FIDO2 credential ID".into()))?;
+        if cred.is_empty() || cred.len() > 1024 {
+            return Err(VaultError::Fido2Error(
+                "invalid FIDO2 credential ID length".into(),
+            ));
+        }
+        let salt = BASE64
+            .decode(self.hmac_salt_b64.as_bytes())
+            .map_err(|_| VaultError::Fido2Error("invalid Base64 FIDO2 HMAC salt".into()))?;
+        if salt.len() != 32 {
+            return Err(VaultError::Fido2Error(
+                "FIDO2 HMAC salt must be exactly 32 bytes".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Trait abstracting FIDO2 `hmac-secret` hardware tokens so both real YubiKeys
@@ -43,23 +90,86 @@ pub trait Fido2Provider {
 /// Production FIDO2 provider backed by Arch/Omarchy's `libfido2` CLI tools
 /// (`fido2-token`, `fido2-cred`, `fido2-assert`).
 ///
-/// Uses direct `Command::new` execution (no shell), passes parameters via stdin,
-/// and immediately zeroizes raw stdout buffers containing the HMAC secret.
+/// Security hardening:
+/// - Resolves binaries from trusted root-owned system directories (`/usr/bin/...`), never
+///   from untrusted `PATH` entries.
+/// - Validates device paths as canonicalized `/dev/` character devices and passes `--`
+///   before positional arguments to eliminate `getopt(3)` option injection.
+/// - Reaps child processes on all error paths and enforces a bounded 45s timeout.
+/// - Wraps stdout in `Zeroizing` immediately, verifies challenge echo, `rp_id`, and
+///   authenticator data `UP`/`UV` flags before accepting the 32-byte HMAC secret.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LibFido2Cli;
 
 impl LibFido2Cli {
+    /// Resolve a trusted root-owned non-writable `libfido2` binary path.
+    fn resolve_tool(name: &str) -> Result<PathBuf> {
+        for dir in TRUSTED_BIN_DIRS {
+            let candidate = Path::new(dir).join(name);
+            if let Ok(meta) = fs::metadata(&candidate) {
+                let mode = meta.permissions().mode();
+                if meta.file_type().is_file()
+                    && meta.uid() == 0
+                    && (mode & 0o022) == 0
+                    && (mode & 0o111) != 0
+                {
+                    return Ok(candidate);
+                }
+            }
+        }
+        Err(VaultError::Fido2Error(format!(
+            "trusted root-owned `{name}` not found in /usr/bin (install `libfido2`: `sudo pacman -S libfido2`)"
+        )))
+    }
+
+    /// Validate that a caller-supplied or discovered HID path is a real `/dev/` character device
+    /// and cannot be interpreted as a CLI option flag.
+    pub fn validate_device_path(raw: &str) -> Result<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('-')
+            || trimmed.contains(['\0', '\n', '\r'])
+            || trimmed.contains("..")
+        {
+            return Err(VaultError::Fido2Error(
+                "invalid FIDO2 device path (must be a canonical /dev/* character device)".into(),
+            ));
+        }
+        let canonical = fs::canonicalize(trimmed).map_err(|_| {
+            VaultError::Fido2Error("FIDO2 device path does not exist or cannot be resolved".into())
+        })?;
+        if !canonical.starts_with("/dev/") {
+            return Err(VaultError::Fido2Error(
+                "FIDO2 device path must reside under /dev/".into(),
+            ));
+        }
+        let meta = fs::metadata(&canonical)
+            .map_err(|_| VaultError::Fido2Error("cannot stat FIDO2 device node".into()))?;
+        if !meta.file_type().is_char_device() {
+            return Err(VaultError::Fido2Error(
+                "FIDO2 device path must be a character device".into(),
+            ));
+        }
+        let canonical_str = canonical.to_str().ok_or_else(|| {
+            VaultError::Fido2Error("FIDO2 device path is not valid UTF-8".into())
+        })?;
+        Ok(canonical_str.to_string())
+    }
+
     /// Auto-detect the first connected FIDO2 HID device via `fido2-token -L`.
     pub fn discover_device() -> Result<String> {
-        let output = Command::new("fido2-token")
+        let bin = Self::resolve_tool("fido2-token")?;
+        let child = Command::new(bin)
             .arg("-L")
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .map_err(|e| {
-                VaultError::Fido2Error(format!(
-                    "failed to execute `fido2-token` (install `libfido2` on Arch/Omarchy: `sudo pacman -S libfido2`): {e}"
-                ))
+                VaultError::Fido2Error(format!("failed to execute `fido2-token`: {e}"))
             })?;
 
+        let output = wait_with_timeout(child, Duration::from_secs(10), "fido2-token")?;
         if !output.status.success() {
             return Err(VaultError::Fido2Error(format!(
                 "`fido2-token -L` exited with {}",
@@ -73,11 +183,9 @@ impl LibFido2Cli {
             if trimmed.is_empty() {
                 continue;
             }
-            // Output format: `/dev/hidraw3: vendor=0x1050, product=0x0407 (Yubico ...)`
             if let Some((dev, _)) = trimmed.split_once(':') {
-                let dev = dev.trim();
-                if dev.starts_with('/') {
-                    return Ok(dev.to_string());
+                if let Ok(valid) = Self::validate_device_path(dev) {
+                    return Ok(valid);
                 }
             }
         }
@@ -89,7 +197,7 @@ impl LibFido2Cli {
 
     fn resolve_device(device: Option<&str>) -> Result<String> {
         match device {
-            Some(d) if !d.trim().is_empty() => Ok(d.trim().to_string()),
+            Some(d) if !d.trim().is_empty() => Self::validate_device_path(d),
             _ => Self::discover_device(),
         }
     }
@@ -98,6 +206,7 @@ impl LibFido2Cli {
 impl Fido2Provider for LibFido2Cli {
     fn enroll(&self, device: Option<&str>, require_uv: bool) -> Result<Fido2Metadata> {
         let dev = Self::resolve_device(device)?;
+        let bin = Self::resolve_tool("fido2-cred")?;
 
         let mut client_data_hash = [0u8; 32];
         let mut user_id = [0u8; 32];
@@ -106,41 +215,37 @@ impl Fido2Provider for LibFido2Cli {
         fill_random(&mut user_id)?;
         fill_random(&mut hmac_salt)?;
 
-        let stdin_payload = format!(
+        let expected_cdh_b64 = BASE64.encode(&client_data_hash);
+        let stdin_payload = Zeroizing::new(format!(
             "{}\n{}\n{}\n{}\n",
-            BASE64.encode(&client_data_hash),
+            expected_cdh_b64,
             DEFAULT_RP_ID,
             USER_NAME,
             BASE64.encode(&user_id),
-        );
+        ));
 
-        let mut cmd = Command::new("fido2-cred");
+        let mut cmd = Command::new(bin);
         cmd.arg("-M").arg("-h");
         if require_uv {
             cmd.arg("-v");
         }
-        cmd.arg(&dev)
+        cmd.arg("--")
+            .arg(&dev)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
-        eprintln!("Touch your FIDO2 security key to enroll it with omavault...");
+        eprintln!(
+            "Touch your FIDO2 security key to enroll it with omavault (RP: {DEFAULT_RP_ID}, UV: {require_uv})..."
+        );
 
-        let mut child = cmd.spawn().map_err(|e| {
-            VaultError::Fido2Error(format!(
-                "failed to launch `fido2-cred` (install `libfido2`): {e}"
-            ))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| VaultError::Fido2Error(format!("failed to launch `fido2-cred`: {e}")))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(stdin_payload.as_bytes()).map_err(|e| {
-                VaultError::Fido2Error(format!("failed writing to `fido2-cred`: {e}"))
-            })?;
-        }
-
-        let output = child.wait_with_output().map_err(|e| {
-            VaultError::Fido2Error(format!("`fido2-cred` failed: {e}"))
-        })?;
+        write_stdin_or_reap(&mut child, stdin_payload.as_bytes(), "fido2-cred")?;
+        let output = wait_with_timeout(child, FIDO2_CMD_TIMEOUT, "fido2-cred")?;
+        let stdout_bytes = Zeroizing::new(output.stdout);
 
         if !output.status.success() {
             return Err(VaultError::Fido2Error(format!(
@@ -150,34 +255,32 @@ impl Fido2Provider for LibFido2Cli {
         }
 
         // Per fido2-cred(1):
-        // line 0: client data hash
-        // line 1: rp id
-        // line 2: cred format
-        // line 3: authdata
-        // line 4: credential id (base64)
-        let stdout = String::from_utf8(output.stdout)
+        // 0: client data hash, 1: rp id, 2: cred format, 3: authdata, 4: credential id
+        let stdout = std::str::from_utf8(&stdout_bytes)
             .map_err(|_| VaultError::Fido2Error("non-UTF8 output from `fido2-cred`".into()))?;
         let lines: Vec<&str> = stdout.lines().collect();
         if lines.len() < 5 {
-            return Err(VaultError::Fido2Error(format!(
-                "unexpected `fido2-cred` output ({} lines, expected >= 5)",
-                lines.len()
-            )));
-        }
-
-        let cred_id_b64 = lines[4].trim().to_string();
-        if cred_id_b64.is_empty() || BASE64.decode(cred_id_b64.as_bytes()).is_err() {
             return Err(VaultError::Fido2Error(
-                "invalid credential ID returned by `fido2-cred`".into(),
+                "unexpected `fido2-cred` output format".into(),
             ));
         }
 
-        Ok(Fido2Metadata {
+        if lines[0].trim() != expected_cdh_b64 || lines[1].trim() != DEFAULT_RP_ID {
+            return Err(VaultError::Fido2Error(
+                "FIDO2 enrollment response failed challenge/RP verification".into(),
+            ));
+        }
+        verify_authdata_flags(lines[3].trim(), require_uv)?;
+
+        let cred_id_b64 = lines[4].trim().to_string();
+        let meta = Fido2Metadata {
             rp_id: DEFAULT_RP_ID.to_string(),
             credential_id_b64: cred_id_b64,
             hmac_salt_b64: BASE64.encode(&hmac_salt),
             require_uv,
-        })
+        };
+        meta.validate()?;
+        Ok(meta)
     }
 
     fn get_hmac_secret(
@@ -185,61 +288,45 @@ impl Fido2Provider for LibFido2Cli {
         meta: &Fido2Metadata,
         device: Option<&str>,
     ) -> Result<Zeroizing<[u8; 32]>> {
-        // Validate fields contain no newline/NUL injection before piping to fido2-assert.
-        if meta.rp_id.contains(['\n', '\r', '\0'])
-            || meta.credential_id_b64.contains(['\n', '\r', '\0'])
-            || meta.hmac_salt_b64.contains(['\n', '\r', '\0'])
-        {
-            return Err(VaultError::Fido2Error(
-                "invalid control characters in FIDO2 metadata".into(),
-            ));
-        }
-
+        meta.validate()?;
         let dev = Self::resolve_device(device)?;
+        let bin = Self::resolve_tool("fido2-assert")?;
 
         let mut client_data_hash = [0u8; 32];
         fill_random(&mut client_data_hash)?;
+        let expected_cdh_b64 = BASE64.encode(&client_data_hash);
 
-        // Per fido2-assert(1) for non-resident credential with -h (hmac-secret):
-        // line 0: client data hash (base64)
-        // line 1: rp id
-        // line 2: credential id (base64)
-        // line 3: hmac salt (base64)
-        let stdin_payload = format!(
+        let stdin_payload = Zeroizing::new(format!(
             "{}\n{}\n{}\n{}\n",
-            BASE64.encode(&client_data_hash),
-            meta.rp_id,
-            meta.credential_id_b64,
-            meta.hmac_salt_b64,
-        );
+            expected_cdh_b64, meta.rp_id, meta.credential_id_b64, meta.hmac_salt_b64,
+        ));
 
-        let mut cmd = Command::new("fido2-assert");
-        cmd.arg("-G").arg("-h");
+        let mut cmd = Command::new(bin);
+        cmd.arg("-G").arg("-h").arg("-t").arg("up=true");
         if meta.require_uv {
-            cmd.arg("-t").arg("uv=true");
+            // `-t pin=true` prompts for PIN & requests user verification on PIN-based tokens
+            // (e.g., YubiKey 5 Series), matching `fido2-cred -v` behavior consistently.
+            cmd.arg("-t").arg("pin=true");
         }
-        cmd.arg(&dev)
+        cmd.arg("--")
+            .arg(&dev)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
-        eprintln!("Touch your FIDO2 security key to unlock omavault...");
+        eprintln!(
+            "Touch your FIDO2 security key to unlock omavault (RP: {}, UV: {})...",
+            meta.rp_id, meta.require_uv
+        );
 
-        let mut child = cmd.spawn().map_err(|e| {
-            VaultError::Fido2Error(format!(
-                "failed to launch `fido2-assert` (install `libfido2`): {e}"
-            ))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| VaultError::Fido2Error(format!("failed to launch `fido2-assert`: {e}")))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(stdin_payload.as_bytes()).map_err(|e| {
-                VaultError::Fido2Error(format!("failed writing to `fido2-assert`: {e}"))
-            })?;
-        }
-
-        let output = child.wait_with_output().map_err(|e| {
-            VaultError::Fido2Error(format!("`fido2-assert` failed: {e}"))
-        })?;
+        write_stdin_or_reap(&mut child, stdin_payload.as_bytes(), "fido2-assert")?;
+        let output = wait_with_timeout(child, FIDO2_CMD_TIMEOUT, "fido2-assert")?;
+        // Wrap stdout in Zeroizing BEFORE inspecting status so partial outputs are always wiped.
+        let stdout_bytes = Zeroizing::new(output.stdout);
 
         if !output.status.success() {
             return Err(VaultError::Fido2Error(format!(
@@ -248,29 +335,29 @@ impl Fido2Provider for LibFido2Cli {
             )));
         }
 
-        // Wrap stdout bytes in Zeroizing so raw base64 secret is wiped on drop.
-        let stdout_bytes = Zeroizing::new(output.stdout);
         let stdout_str = std::str::from_utf8(&stdout_bytes)
             .map_err(|_| VaultError::Fido2Error("non-UTF8 output from `fido2-assert`".into()))?;
         let lines: Vec<&str> = stdout_str.lines().collect();
 
         // Per fido2-assert(1) for non-resident + -h:
-        // line 0: client data hash
-        // line 1: rp id
-        // line 2: authdata
-        // line 3: assertion signature
-        // line 4: hmac secret (base64, 32 bytes)
-        if lines.len() < 5 {
-            return Err(VaultError::Fido2Error(format!(
-                "unexpected `fido2-assert` output ({} lines, expected >= 5)",
-                lines.len()
-            )));
+        // 0: client data hash, 1: rp id, 2: authdata, 3: signature, 4: hmac secret (32B)
+        if lines.len() != 5 {
+            return Err(VaultError::Fido2Error(
+                "unexpected `fido2-assert` output line count".into(),
+            ));
         }
+
+        if lines[0].trim() != expected_cdh_b64 || lines[1].trim() != meta.rp_id {
+            return Err(VaultError::Fido2Error(
+                "FIDO2 assertion failed challenge/RP verification".into(),
+            ));
+        }
+        verify_authdata_flags(lines[2].trim(), meta.require_uv)?;
 
         let decoded = Zeroizing::new(
             BASE64
                 .decode(lines[4].trim().as_bytes())
-                .map_err(|_| VaultError::Fido2Error("invalid base64 HMAC secret".into()))?,
+                .map_err(|_| VaultError::Fido2Error("invalid Base64 HMAC secret".into()))?,
         );
         if decoded.len() != 32 {
             return Err(VaultError::Fido2Error(format!(
@@ -285,14 +372,129 @@ impl Fido2Provider for LibFido2Cli {
     }
 }
 
-/// Deterministic software mock FIDO2 authenticator for unit & integration tests.
-/// Computes `BLAKE3(token_secret || credential_id || hmac_salt)` to simulate
-/// a hardware authenticator's `hmac-secret` output.
-#[derive(Debug, Clone)]
+/// Verify CTAP2 authenticator data flags (`UP` bit `0x01`, and `UV` bit `0x04` when required).
+///
+/// `libfido2` outputs CBOR-encoded byte string `authdata` (major type 2 header + >=37 raw bytes:
+/// 32-byte `rpIdHash` + 1-byte `flags` + 4-byte `signCount`).
+fn verify_authdata_flags(authdata_b64: &str, require_uv: bool) -> Result<()> {
+    let raw = BASE64
+        .decode(authdata_b64.as_bytes())
+        .map_err(|_| VaultError::Fido2Error("invalid Base64 FIDO2 authdata".into()))?;
+    let authdata = unwrap_cbor_bstr(&raw).unwrap_or(&raw);
+    if authdata.len() < 37 {
+        return Err(VaultError::Fido2Error(
+            "FIDO2 authdata truncated (expected >= 37 bytes)".into(),
+        ));
+    }
+    let flags = authdata[32];
+    let up = (flags & 0x01) != 0;
+    let uv = (flags & 0x04) != 0;
+    if !up {
+        return Err(VaultError::Fido2Error(
+            "FIDO2 authenticator did not confirm User Presence (UP)".into(),
+        ));
+    }
+    if require_uv && !uv {
+        return Err(VaultError::Fido2Error(
+            "FIDO2 authenticator did not confirm User Verification (UV)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a CBOR major-type-2 byte string wrapper if present.
+fn unwrap_cbor_bstr(data: &[u8]) -> Option<&[u8]> {
+    let first = *data.first()?;
+    if (first >> 5) != 2 {
+        return None;
+    }
+    let ai = first & 0x1f;
+    let (hdr_len, bstr_len) = match ai {
+        0..=23 => (1usize, ai as usize),
+        24 => (2, *data.get(1)? as usize),
+        25 => (3, u16::from_be_bytes([*data.get(1)?, *data.get(2)?]) as usize),
+        26 => (
+            5,
+            u32::from_be_bytes([
+                *data.get(1)?,
+                *data.get(2)?,
+                *data.get(3)?,
+                *data.get(4)?,
+            ]) as usize,
+        ),
+        _ => return None,
+    };
+    let end = hdr_len.checked_add(bstr_len)?;
+    if end == data.len() {
+        Some(&data[hdr_len..end])
+    } else {
+        None
+    }
+}
+
+fn write_stdin_or_reap(child: &mut Child, data: &[u8], tool: &str) -> Result<()> {
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(data) {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(VaultError::Fido2Error(format!(
+                    "failed writing to `{tool}`: {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| VaultError::Fido2Error(format!("`{tool}` failed: {e}")));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(VaultError::Fido2Error(format!(
+                        "`{tool}` timed out after {}s",
+                        timeout.as_secs()
+                    )));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(VaultError::Fido2Error(format!(
+                    "failed waiting on `{tool}`: {e}"
+                )));
+            }
+        }
+    }
+}
+
+/// Deterministic software mock FIDO2 authenticator compiled ONLY for tests (`test-utils`).
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct MockFido2Provider {
     pub token_secret: [u8; 32],
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+impl std::fmt::Debug for MockFido2Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MockFido2Provider")
+            .field("token_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 impl Fido2Provider for MockFido2Provider {
     fn enroll(&self, _device: Option<&str>, require_uv: bool) -> Result<Fido2Metadata> {
         let mut cred_id = [0u8; 32];
@@ -312,11 +514,70 @@ impl Fido2Provider for MockFido2Provider {
         meta: &Fido2Metadata,
         _device: Option<&str>,
     ) -> Result<Zeroizing<[u8; 32]>> {
+        meta.validate()?;
         let mut hasher = blake3::Hasher::new_keyed(&self.token_secret);
+        hasher.update(&(meta.rp_id.len() as u32).to_le_bytes());
         hasher.update(meta.rp_id.as_bytes());
+        hasher.update(&(meta.credential_id_b64.len() as u32).to_le_bytes());
         hasher.update(meta.credential_id_b64.as_bytes());
+        hasher.update(&(meta.hmac_salt_b64.len() as u32).to_le_bytes());
         hasher.update(meta.hmac_salt_b64.as_bytes());
         let hash = hasher.finalize();
         Ok(Zeroizing::new(*hash.as_bytes()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_flag_injection_and_non_dev_fido2_paths() {
+        assert!(LibFido2Cli::validate_device_path("-o/tmp/pwn").is_err());
+        assert!(LibFido2Cli::validate_device_path("--help").is_err());
+        assert!(LibFido2Cli::validate_device_path("/etc/passwd").is_err());
+        assert!(LibFido2Cli::validate_device_path("/dev/../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validates_fido2_metadata_strictly() {
+        let good = Fido2Metadata {
+            rp_id: DEFAULT_RP_ID.into(),
+            credential_id_b64: BASE64.encode(&[1u8; 32]),
+            hmac_salt_b64: BASE64.encode(&[2u8; 32]),
+            require_uv: true,
+        };
+        assert!(good.validate().is_ok());
+
+        let bad_rp = Fido2Metadata {
+            rp_id: "evil.example.com".into(),
+            ..good.clone()
+        };
+        assert!(bad_rp.validate().is_err());
+
+        let bad_salt = Fido2Metadata {
+            hmac_salt_b64: BASE64.encode(&[2u8; 16]),
+            ..good
+        };
+        assert!(bad_salt.validate().is_err());
+    }
+
+    #[test]
+    fn verifies_cbor_authdata_up_and_uv_flags() {
+        // Construct CBOR byte string (0x58 0x25 = 37 bytes) with flags at byte 32.
+        let mut raw = vec![0x58, 37];
+        raw.extend_from_slice(&[0u8; 32]); // rpIdHash
+        raw.push(0x05); // UP | UV
+        raw.extend_from_slice(&[0u8; 4]); // signCount
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), true).is_ok());
+
+        // Clear UV bit: passes when require_uv=false, fails when require_uv=true.
+        raw[2 + 32] = 0x01; // UP only
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), false).is_ok());
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), true).is_err());
+
+        // Clear UP bit: always fails.
+        raw[2 + 32] = 0x00;
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), false).is_err());
     }
 }

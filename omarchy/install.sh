@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
-echo "==> Building omavault (release, LTO, hardened)..."
-cargo build --release
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
+echo "==> Building omavault (release, locked, LTO, hardened)..."
+cargo build --release --locked
 
 BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
@@ -11,18 +15,20 @@ HYPR_DIR="${HOME}/.config/hypr"
 mkdir -p "${BIN_DIR}" "${SYSTEMD_DIR}" "${HYPR_DIR}"
 
 install -m 0700 target/release/omavault "${BIN_DIR}/omavault"
-echo "==> Installed binary to ${BIN_DIR}/omavault"
+echo "==> Installed binary to ${BIN_DIR}/omavault (0700)"
 
-install -m 0644 omarchy/omavaultd.service "${SYSTEMD_DIR}/omavaultd.service"
-echo "==> Installed systemd user unit to ${SYSTEMD_DIR}/omavaultd.service"
+install -m 0600 omarchy/omavaultd.service "${SYSTEMD_DIR}/omavaultd.service"
+echo "==> Installed systemd user unit to ${SYSTEMD_DIR}/omavaultd.service (0600)"
 
-install -m 0644 omarchy/hypr-omavault.conf "${HYPR_DIR}/omavault.conf"
-echo "==> Installed Hyprland config snippet to ${HYPR_DIR}/omavault.conf"
+install -m 0600 omarchy/hypr-omavault.conf "${HYPR_DIR}/omavault.conf"
+echo "==> Installed Hyprland config snippet to ${HYPR_DIR}/omavault.conf (0600)"
 
 if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user daemon-reload || true
-    systemctl --user enable --now omavaultd.service || true
-    echo "==> Enabled and started omavaultd.service"
+    if systemctl --user daemon-reload && systemctl --user enable omavaultd.service && systemctl --user restart omavaultd.service; then
+        echo "==> Enabled and restarted omavaultd.service"
+    else
+        echo "Warning: could not reload/restart omavaultd.service via systemd --user (start manually with: omavault daemon)" >&2
+    fi
 fi
 
 echo ""

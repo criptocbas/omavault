@@ -6,7 +6,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{Result, VaultError};
 use crate::totp::TotpConfig;
@@ -97,7 +97,7 @@ impl Entry {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
-            name,
+            name: name.trim().to_string(),
             username,
             password,
             url: String::new(),
@@ -113,10 +113,14 @@ impl Entry {
     }
 
     /// Update the entry's password while preserving up to 10 previous passwords in history.
-    pub fn set_password(&mut self, new_password: String) {
-        if self.password != new_password {
+    ///
+    /// Accepts `Zeroizing<String>` so even when the password is unchanged, the input buffer
+    /// is always zeroized on drop.
+    pub fn set_password(&mut self, mut new_password: Zeroizing<String>) {
+        if self.password != *new_password {
+            let owned = std::mem::take(&mut *new_password);
             if !self.password.is_empty() {
-                let old = std::mem::replace(&mut self.password, new_password);
+                let old = std::mem::replace(&mut self.password, owned);
                 self.password_history.insert(
                     0,
                     PasswordHistoryItem {
@@ -126,12 +130,13 @@ impl Entry {
                 );
                 self.password_history.truncate(10);
             } else {
-                self.password = new_password;
+                self.password = owned;
             }
             let now = Utc::now();
             self.updated_at = now;
             self.password_updated_at = Some(now);
         }
+        // When unchanged, `new_password` (Zeroizing<String>) is automatically zeroized on drop.
     }
 
     /// Case-insensitive fuzzy/substring match across name, username, URL, and tags.
@@ -189,7 +194,13 @@ impl Vault {
         }
     }
 
-    pub fn add_entry(&mut self, entry: Entry) -> Result<()> {
+    pub fn add_entry(&mut self, mut entry: Entry) -> Result<()> {
+        entry.name = entry.name.trim().to_string();
+        if entry.name.is_empty() {
+            return Err(VaultError::InvalidFormat(
+                "entry name cannot be empty".into(),
+            ));
+        }
         if self
             .entries
             .iter()
@@ -198,6 +209,45 @@ impl Vault {
             return Err(VaultError::DuplicateEntry(entry.name.clone()));
         }
         self.entries.push(entry);
+        self.entries
+            .sort_by_key(|a| a.name.to_ascii_lowercase());
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Update an existing entry by original name, enforcing case-insensitive uniqueness
+    /// on rename, re-sorting entries, and bumping `vault.updated_at`.
+    pub fn update_entry<F>(&mut self, orig_name: &str, new_name: &str, apply: F) -> Result<()>
+    where
+        F: FnOnce(&mut Entry),
+    {
+        let trimmed_new = new_name.trim();
+        if trimmed_new.is_empty() {
+            return Err(VaultError::InvalidFormat(
+                "entry name cannot be empty".into(),
+            ));
+        }
+        let target_idx = self
+            .entries
+            .iter()
+            .position(|e| e.name.eq_ignore_ascii_case(orig_name))
+            .ok_or_else(|| VaultError::EntryNotFound(orig_name.to_string()))?;
+
+        // Check for case-insensitive collision with any OTHER entry.
+        let collides = self
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(i, e)| i != target_idx && e.name.eq_ignore_ascii_case(trimmed_new));
+        if collides {
+            return Err(VaultError::DuplicateEntry(trimmed_new.to_string()));
+        }
+
+        let entry = &mut self.entries[target_idx];
+        entry.name = trimmed_new.to_string();
+        apply(entry);
+        entry.updated_at = Utc::now();
+
         self.entries
             .sort_by_key(|a| a.name.to_ascii_lowercase());
         self.updated_at = Utc::now();

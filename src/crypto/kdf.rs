@@ -5,7 +5,7 @@ use std::path::Path;
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use sha2::Sha512;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Result, VaultError};
 use crate::hardening::LockedKey;
@@ -22,10 +22,15 @@ pub const MIN_ARGON2_MEM_KIB: u32 = 65_536; // 64 MiB
 pub const MIN_ARGON2_TIME: u32 = 3;
 pub const MIN_ARGON2_LANES: u32 = 1;
 
-/// Hard upper bounds to prevent OOM/CPU DoS from maliciously crafted files.
-pub const MAX_ARGON2_MEM_KIB: u32 = 4_194_304; // 4 GiB
-pub const MAX_ARGON2_TIME: u32 = 64;
-pub const MAX_ARGON2_LANES: u32 = 64;
+/// Tight upper bounds to prevent pre-authentication OOM/CPU DoS from crafted vault headers.
+pub const MAX_ARGON2_MEM_KIB: u32 = 1_048_576; // 1 GiB
+pub const MAX_ARGON2_TIME: u32 = 16;
+pub const MAX_ARGON2_LANES: u32 = 16;
+/// Combined memory * iterations ceiling (8 GiB-iterations).
+pub const MAX_ARGON2_WORK_KIB_ITERS: u64 = 8 * 1_048_576;
+
+/// Maximum keyfile size read by `hash_keyfile` (64 MiB).
+const MAX_KEYFILE_BYTES: u64 = 64 * 1024 * 1024;
 
 const HKDF_MASTER_INFO: &[u8] = b"omavault-v1-master-key-combiner";
 const HKDF_PAYLOAD_INFO: &[u8] = b"omavault-v1-payload-xchacha20poly1305";
@@ -48,30 +53,63 @@ impl Default for KdfParams {
 }
 
 impl KdfParams {
-    /// Enforce production minimum and maximum security bounds.
+    /// Always-enforced upper DoS bounds and RFC 9106 structural invariants.
+    pub fn validate_upper_bounds(&self) -> Result<()> {
+        if self.mem_kib == 0 || self.mem_kib > MAX_ARGON2_MEM_KIB {
+            return Err(VaultError::WeakKdfParameters(format!(
+                "Argon2id memory {} KiB exceeds allowed ceiling {} KiB",
+                self.mem_kib, MAX_ARGON2_MEM_KIB
+            )));
+        }
+        if self.time_cost == 0 || self.time_cost > MAX_ARGON2_TIME {
+            return Err(VaultError::WeakKdfParameters(format!(
+                "Argon2id time cost {} outside allowed ceiling 1..={}",
+                self.time_cost, MAX_ARGON2_TIME
+            )));
+        }
+        if self.parallelism == 0 || self.parallelism > MAX_ARGON2_LANES {
+            return Err(VaultError::WeakKdfParameters(format!(
+                "Argon2id parallelism {} outside allowed ceiling 1..={}",
+                self.parallelism, MAX_ARGON2_LANES
+            )));
+        }
+        let work = (self.mem_kib as u64).saturating_mul(self.time_cost as u64);
+        if work > MAX_ARGON2_WORK_KIB_ITERS {
+            return Err(VaultError::WeakKdfParameters(format!(
+                "Argon2id combined work {work} KiB-iters exceeds maximum {MAX_ARGON2_WORK_KIB_ITERS}"
+            )));
+        }
+        // RFC 9106 requires m >= 8 * p.
+        if (self.mem_kib as u64) < (self.parallelism as u64).saturating_mul(8) {
+            return Err(VaultError::WeakKdfParameters(format!(
+                "Argon2id memory {} KiB must be >= 8 * parallelism ({})",
+                self.mem_kib, self.parallelism
+            )));
+        }
+        Params::new(self.mem_kib, self.time_cost, self.parallelism, Some(32))
+            .map_err(|e| VaultError::WeakKdfParameters(format!("invalid Argon2id params: {e}")))?;
+        Ok(())
+    }
+
+    /// Enforce both production minimum floors (anti-downgrade) and upper DoS ceilings.
     pub fn validate(&self) -> Result<()> {
+        self.validate_upper_bounds()?;
         if self.mem_kib < MIN_ARGON2_MEM_KIB {
             return Err(VaultError::WeakKdfParameters(format!(
                 "Argon2id memory {} KiB is below minimum {} KiB",
                 self.mem_kib, MIN_ARGON2_MEM_KIB
             )));
         }
-        if self.mem_kib > MAX_ARGON2_MEM_KIB {
+        if self.time_cost < MIN_ARGON2_TIME {
             return Err(VaultError::WeakKdfParameters(format!(
-                "Argon2id memory {} KiB exceeds maximum {} KiB",
-                self.mem_kib, MAX_ARGON2_MEM_KIB
+                "Argon2id time cost {} is below minimum {}",
+                self.time_cost, MIN_ARGON2_TIME
             )));
         }
-        if self.time_cost < MIN_ARGON2_TIME || self.time_cost > MAX_ARGON2_TIME {
+        if self.parallelism < MIN_ARGON2_LANES {
             return Err(VaultError::WeakKdfParameters(format!(
-                "Argon2id time cost {} outside allowed range {}..={}",
-                self.time_cost, MIN_ARGON2_TIME, MAX_ARGON2_TIME
-            )));
-        }
-        if self.parallelism < MIN_ARGON2_LANES || self.parallelism > MAX_ARGON2_LANES {
-            return Err(VaultError::WeakKdfParameters(format!(
-                "Argon2id parallelism {} outside allowed range {}..={}",
-                self.parallelism, MIN_ARGON2_LANES, MAX_ARGON2_LANES
+                "Argon2id parallelism {} is below minimum {}",
+                self.parallelism, MIN_ARGON2_LANES
             )));
         }
         Ok(())
@@ -88,38 +126,63 @@ impl KdfParams {
     }
 }
 
-/// Hash an arbitrary keyfile using streaming BLAKE3 into a 32-byte digest.
+/// Hash a regular keyfile using streaming BLAKE3 into a 32-byte digest.
 ///
-/// Keyfiles of any size are supported without loading the entire file into RAM at once.
+/// Rejects special files (FIFOs, `/dev/zero`, sockets, directories) on the opened file
+/// descriptor and caps reads at 64 MiB to prevent infinite-read DoS. Zeroizes BLAKE3
+/// internal state on exit.
 pub fn hash_keyfile(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
-    let mut file = File::open(path).map_err(|e| {
+    let file = File::open(path).map_err(|e| {
         VaultError::Io(std::io::Error::new(
             e.kind(),
             format!("failed to open keyfile '{}': {e}", path.display()),
         ))
     })?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(VaultError::InvalidFormat(
+            "keyfile path must be a regular file (special files/FIFOs/devices are rejected)".into(),
+        ));
+    }
+    if meta.len() > MAX_KEYFILE_BYTES {
+        return Err(VaultError::InvalidFormat(format!(
+            "keyfile exceeds maximum allowed size ({MAX_KEYFILE_BYTES} bytes)"
+        )));
+    }
+
+    let mut reader = file.take(MAX_KEYFILE_BYTES.saturating_add(1));
     let mut hasher = blake3::Hasher::new();
     let mut buf = Zeroizing::new([0u8; 8192]);
     let mut total_bytes = 0u64;
     loop {
-        let n = file.read(&mut *buf)?;
+        let n = reader.read(&mut *buf)?;
         if n == 0 {
             break;
         }
-        total_bytes += n as u64;
+        total_bytes = total_bytes.saturating_add(n as u64);
+        if total_bytes > MAX_KEYFILE_BYTES {
+            hasher.zeroize();
+            return Err(VaultError::InvalidFormat(format!(
+                "keyfile exceeds maximum allowed size ({MAX_KEYFILE_BYTES} bytes)"
+            )));
+        }
         hasher.update(&buf[..n]);
     }
     if total_bytes == 0 {
+        hasher.zeroize();
         return Err(VaultError::InvalidFormat("keyfile is empty".into()));
     }
-    let digest = hasher.finalize();
-    Ok(Zeroizing::new(*digest.as_bytes()))
+    let mut digest = hasher.finalize();
+    let out = Zeroizing::new(*digest.as_bytes());
+    hasher.zeroize();
+    digest.zeroize();
+    Ok(out)
 }
 
 /// Derive the 32-byte hardened `MasterKey` stored in `mlock`ed `PROT_NONE` memory.
 ///
 /// Pipeline:
-/// 1. `pw_hash = Argon2id(passphrase, kdf_salt, params)` (32 bytes)
+/// 1. `pw_hash = Argon2id(passphrase, kdf_salt, params)` (32 bytes, zeroized matrix)
 /// 2. Domain-separated IKM construction:
 ///    `b"PW" || pw_hash`
 ///    `|| (if keyfile: b"KF" || blake3(keyfile))`
@@ -135,6 +198,8 @@ pub fn derive_master_key(
 ) -> Result<LockedKey<32>> {
     if enforce_policy {
         params.validate()?;
+    } else {
+        params.validate_upper_bounds()?;
     }
 
     let argon2_params = Params::new(params.mem_kib, params.time_cost, params.parallelism, Some(32))
@@ -146,7 +211,6 @@ pub fn derive_master_key(
         .hash_password_into(passphrase, kdf_salt, &mut *pw_hash)
         .map_err(|e| VaultError::Crypto(format!("Argon2id derivation failed: {e}")))?;
 
-    // Construct domain-separated input key material.
     let mut ikm = Zeroizing::new(Vec::with_capacity(34 * 3));
     ikm.extend_from_slice(b"PW");
     ikm.extend_from_slice(&*pw_hash);
@@ -165,14 +229,10 @@ pub fn derive_master_key(
     hk.expand(HKDF_MASTER_INFO, &mut master_raw)
         .map_err(|_| VaultError::Crypto("HKDF-SHA512 master key expand failed".into()))?;
 
-    // LockedKey::new copies bytes into mlocked PROT_NONE memory and zeroizes `master_raw`.
     LockedKey::new(&mut master_raw)
 }
 
 /// Derive a fresh per-save 256-bit AEAD encryption key from `master_key` and `save_salt`.
-///
-/// Because every save generates a fresh 32-byte `save_salt` AND a fresh 24-byte `nonce`,
-/// no AEAD key or nonce is ever reused across saves.
 pub fn derive_payload_key(
     master_key: &LockedKey<32>,
     save_salt: &[u8; 32],
@@ -183,5 +243,5 @@ pub fn derive_payload_key(
         hk.expand(HKDF_PAYLOAD_INFO, &mut *enc_key)
             .map_err(|_| VaultError::Crypto("HKDF-SHA512 payload key expand failed".into()))?;
         Ok(enc_key)
-    })
+    })?
 }

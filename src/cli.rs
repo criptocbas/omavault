@@ -1,4 +1,5 @@
-use std::io::{self, IsTerminal, Read, Write};
+use std::fs::File;
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -6,7 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::clipboard::{
     clear_clipboard_best_effort, copy_secret, run_clipboard_server, ClipboardOptions,
-    DEFAULT_CLIPBOARD_TIMEOUT_SECS,
+    DEFAULT_CLIPBOARD_TIMEOUT_SECS, MAX_CLIPBOARD_TIMEOUT_SECS, MIN_CLIPBOARD_TIMEOUT_SECS,
 };
 use crate::crypto::fido2::{Fido2Provider, LibFido2Cli};
 use crate::crypto::kdf::{
@@ -14,23 +15,31 @@ use crate::crypto::kdf::{
     DEFAULT_ARGON2_TIME,
 };
 use crate::crypto::VaultHeader;
-use crate::daemon::{
-    default_socket_path, run_daemon, DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS,
-};
+use crate::daemon::{default_socket_path, run_daemon, DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS};
 use crate::error::{Result, VaultError};
 use crate::generator::{
-    estimate_entropy_bits, generate_passphrase, generate_password, strength_label,
-    PassphraseOptions, PasswordOptions,
+    estimate_entropy_bits, generate_passphrase, generate_password, generated_password_entropy_bits,
+    passphrase_entropy_bits, strength_label, PassphraseOptions, PasswordOptions,
 };
 use crate::hardening::{HardeningStatus, LockedKey};
 use crate::totp::TotpConfig;
 use crate::tui::{run_tui, TuiConfig};
 use crate::vault::audit::run_audit;
 use crate::vault::storage::{
-    default_vault_path, generate_keyfile, load_vault_from_disk, read_header_from_disk,
-    save_vault_to_disk,
+    default_vault_path, generate_keyfile, load_vault_from_disk, purge_encrypted_backups,
+    read_header_from_disk, save_vault_to_disk,
 };
 use crate::vault::{Entry, Vault};
+
+fn parse_clip_timeout(s: &str) -> std::result::Result<u64, String> {
+    let val: u64 = s.parse().map_err(|_| "invalid timeout integer".to_string())?;
+    if !(MIN_CLIPBOARD_TIMEOUT_SECS..=MAX_CLIPBOARD_TIMEOUT_SECS).contains(&val) {
+        return Err(format!(
+            "timeout must be between {MIN_CLIPBOARD_TIMEOUT_SECS} and {MAX_CLIPBOARD_TIMEOUT_SECS} seconds"
+        ));
+    }
+    Ok(val)
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,7 +59,7 @@ pub struct Cli {
     #[arg(short = 'k', long, global = true, env = "OMAVAULT_KEYFILE")]
     pub keyfile: Option<PathBuf>,
 
-    /// Explicit FIDO2 HID device path (auto-detected if omitted)
+    /// Explicit FIDO2 HID device path (canonical /dev/hidraw* character device; auto-detected if omitted)
     #[arg(long, global = true)]
     pub fido2_device: Option<String>,
 
@@ -58,7 +67,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "OMAVAULT_SOCKET")]
     pub socket: Option<PathBuf>,
 
-    /// Read master passphrase from stdin (for non-interactive scripts only)
+    /// Read master passphrase line from stdin (for non-interactive scripts only)
     #[arg(long, global = true)]
     pub passphrase_stdin: bool,
 
@@ -73,8 +82,8 @@ pub enum Commands {
         /// Auto-lock inactivity timeout in seconds
         #[arg(long, default_value_t = DEFAULT_IDLE_TIMEOUT_SECS)]
         idle_timeout: u64,
-        /// Clipboard auto-clear timeout in seconds
-        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS)]
+        /// Clipboard auto-clear timeout in seconds (1..=300)
+        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS, value_parser = parse_clip_timeout)]
         clip_timeout: u64,
         /// Clear clipboard immediately after a single paste
         #[arg(long)]
@@ -89,13 +98,13 @@ pub enum Commands {
         /// Require FIDO2 User Verification (PIN / biometric) during touch
         #[arg(long)]
         fido2_uv: bool,
-        /// Argon2id memory cost in MiB (default: 128, minimum: 64)
+        /// Argon2id memory cost in MiB (default: 128, range: 64..=1024)
         #[arg(long, default_value_t = DEFAULT_ARGON2_MEM_KIB / 1024)]
         mem_mib: u32,
-        /// Argon2id time cost / iterations (default: 4, minimum: 3)
+        /// Argon2id time cost / iterations (default: 4, range: 3..=16)
         #[arg(long, default_value_t = DEFAULT_ARGON2_TIME)]
         time: u32,
-        /// Argon2id parallel lanes (default: 4)
+        /// Argon2id parallel lanes (default: 4, range: 1..=16)
         #[arg(long, default_value_t = DEFAULT_ARGON2_LANES)]
         lanes: u32,
     },
@@ -114,14 +123,18 @@ pub enum Commands {
         username: String,
         #[arg(long, default_value = "")]
         url: String,
-        #[arg(long, default_value = "")]
-        notes: String,
+        /// Prompt interactively for sensitive notes (avoids shell history / argv exposure)
+        #[arg(long)]
+        notes_prompt: bool,
         /// Comma-separated tags
         #[arg(long, default_value = "")]
         tags: String,
-        /// TOTP Base32 secret or otpauth://totp/... URI
-        #[arg(long)]
-        totp: Option<String>,
+        /// Prompt securely (no echo) for TOTP Base32 secret or otpauth:// URI
+        #[arg(long, conflicts_with = "totp_file")]
+        totp: bool,
+        /// Read TOTP Base32 secret or otpauth:// URI from a private file (for scripts)
+        #[arg(long, conflicts_with = "totp")]
+        totp_file: Option<PathBuf>,
         /// Automatically generate a strong CSPRNG password instead of prompting
         #[arg(short, long)]
         generate: bool,
@@ -141,14 +154,14 @@ pub enum Commands {
         /// Copy secret to Wayland clipboard with x-kde-passwordManagerHint
         #[arg(short, long)]
         copy: bool,
-        /// Print password to stdout (required if not copying)
+        /// Print sensitive fields (password/notes) to stdout
         #[arg(long)]
         reveal: bool,
         /// Clear clipboard immediately after one paste
         #[arg(long)]
         paste_once: bool,
-        /// Clipboard auto-clear timeout in seconds
-        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS)]
+        /// Clipboard auto-clear timeout in seconds (1..=300)
+        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS, value_parser = parse_clip_timeout)]
         timeout: u64,
     },
 
@@ -160,7 +173,7 @@ pub enum Commands {
         copy: bool,
         #[arg(long)]
         paste_once: bool,
-        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS)]
+        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS, value_parser = parse_clip_timeout)]
         timeout: u64,
     },
 
@@ -171,19 +184,26 @@ pub enum Commands {
         username: Option<String>,
         #[arg(long)]
         url: Option<String>,
+        /// Prompt interactively for updated notes
         #[arg(long)]
-        notes: Option<String>,
-        /// Set or replace TOTP secret (Base32 or otpauth:// URI)
-        #[arg(long)]
-        totp: Option<String>,
+        notes_prompt: bool,
+        /// Prompt securely (no echo) for new TOTP Base32 secret or otpauth:// URI
+        #[arg(long, conflicts_with = "totp_file")]
+        totp: bool,
+        /// Read new TOTP secret or otpauth:// URI from a file
+        #[arg(long, conflicts_with = "totp")]
+        totp_file: Option<PathBuf>,
         /// Prompt for a new password (archives old password in history)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "generate")]
         rotate_password: bool,
         /// Generate a brand new CSPRNG password (archives old password in history)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "rotate_password")]
         generate: bool,
         #[arg(long, default_value_t = 24)]
         length: usize,
+        /// Copy newly generated password to Wayland secret clipboard
+        #[arg(short, long)]
+        copy: bool,
     },
 
     /// Delete an entry from the vault
@@ -201,7 +221,7 @@ pub enum Commands {
         /// Character length for random password
         #[arg(short, long, default_value_t = 24)]
         length: usize,
-        /// Word count for passphrase mode
+        /// Word count for passphrase mode (6..=24, recommend >= 8)
         #[arg(short, long, default_value_t = 8)]
         words: usize,
         /// Exclude symbols in random password mode
@@ -215,7 +235,7 @@ pub enum Commands {
         copy: bool,
         #[arg(long)]
         paste_once: bool,
-        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS)]
+        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS, value_parser = parse_clip_timeout)]
         timeout: u64,
     },
 
@@ -225,26 +245,32 @@ pub enum Commands {
     /// Rotate master passphrase, Argon2id parameters, keyfile, or FIDO2 enrollment
     Rekey {
         /// New keyfile path to bind to the vault
-        #[arg(long)]
+        #[arg(long, conflicts_with = "remove_keyfile")]
         new_keyfile: Option<PathBuf>,
         /// Remove existing keyfile requirement
-        #[arg(long)]
+        #[arg(long, conflicts_with = "new_keyfile")]
         remove_keyfile: bool,
         /// Enroll a new FIDO2 hardware key
-        #[arg(long)]
+        #[arg(long, conflicts_with = "remove_fido2")]
         enable_fido2: bool,
         /// Require User Verification on the newly enrolled FIDO2 key
         #[arg(long)]
         fido2_uv: bool,
         /// Remove existing FIDO2 requirement
-        #[arg(long)]
+        #[arg(long, conflicts_with = "enable_fido2")]
         remove_fido2: bool,
-        #[arg(long, default_value_t = DEFAULT_ARGON2_MEM_KIB / 1024)]
-        mem_mib: u32,
-        #[arg(long, default_value_t = DEFAULT_ARGON2_TIME)]
-        time: u32,
-        #[arg(long, default_value_t = DEFAULT_ARGON2_LANES)]
-        lanes: u32,
+        /// Argon2id memory cost in MiB (defaults to preserving existing vault setting)
+        #[arg(long)]
+        mem_mib: Option<u32>,
+        /// Argon2id time cost / iterations (defaults to preserving existing vault setting)
+        #[arg(long)]
+        time: Option<u32>,
+        /// Argon2id parallel lanes (defaults to preserving existing vault setting)
+        #[arg(long)]
+        lanes: Option<u32>,
+        /// Remove rolling `.bak.*` files encrypted under the previous master key after rekey succeeds
+        #[arg(long)]
+        purge_old_backups: bool,
     },
 
     /// Manage 512-bit cryptographic keyfiles
@@ -275,10 +301,12 @@ pub enum Commands {
     /// Internal Wayland secret clipboard helper (reads secret from stdin)
     #[command(name = "__clip-serve", hide = true)]
     ClipServe {
-        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS)]
+        #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS, value_parser = parse_clip_timeout)]
         timeout: u64,
         #[arg(long)]
         paste_once: bool,
+        #[arg(long)]
+        generation: Option<String>,
     },
 }
 
@@ -302,6 +330,7 @@ enum VaultSession {
         client: DaemonClient,
         vault_path: PathBuf,
         vault: Vault,
+        revision: String,
     },
     Standalone {
         vault_path: PathBuf,
@@ -330,7 +359,8 @@ impl VaultSession {
                 client,
                 vault_path,
                 vault,
-            } => client.save_vault(vault_path, vault),
+                revision,
+            } => client.save_vault(vault_path, vault, Some(revision.clone())),
             Self::Standalone {
                 vault_path,
                 master_key,
@@ -355,7 +385,8 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
         Commands::ClipServe {
             timeout,
             paste_once,
-        } => run_clipboard_server(timeout, paste_once),
+            generation,
+        } => run_clipboard_server(timeout, paste_once, generation),
 
         Commands::Keyfile {
             action: KeyfileAction::Generate { path },
@@ -384,19 +415,15 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     words,
                     ..PassphraseOptions::default()
                 };
-                (
-                    generate_passphrase(&opts)?,
-                    crate::generator::passphrase_entropy_bits(&opts),
-                )
+                (generate_passphrase(&opts)?, passphrase_entropy_bits(&opts))
             } else {
-                let s = generate_password(&PasswordOptions {
+                let opts = PasswordOptions {
                     length,
                     symbols: !no_symbols,
                     exclude_ambiguous: no_ambiguous,
                     ..PasswordOptions::default()
-                })?;
-                let b = estimate_entropy_bits(&s);
-                (s, b)
+                };
+                (generate_password(&opts)?, generated_password_entropy_bits(&opts))
             };
             if copy {
                 copy_secret(
@@ -430,25 +457,27 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
         Commands::StopDaemon => {
             let client = DaemonClient::new(socket_path);
             client.shutdown()?;
+            clear_clipboard_best_effort();
             println!("omavault daemon locked and stopped.");
             Ok(())
         }
 
         Commands::Lock => {
+            // Always clear Wayland clipboard & stop local clipboard helper in the user's session
+            // (even if omavaultd lacks WAYLAND_DISPLAY).
+            clear_clipboard_best_effort();
             let client = DaemonClient::new(socket_path);
-            if client.is_available() {
-                client.lock()?;
+            if client.lock().is_ok() {
                 println!("Vault locked (master key wiped from RAM, clipboard cleared).");
             } else {
-                clear_clipboard_best_effort();
-                println!("Daemon not running; clipboard cleared.");
+                println!("Daemon not running; local clipboard cleared.");
             }
             Ok(())
         }
 
         Commands::Unlock => {
             let client = DaemonClient::new(socket_path);
-            if !client.is_available() {
+            if client.status().is_err() {
                 return Err(VaultError::Daemon(
                     "omavault daemon is not running (start it with `omavault daemon` or `systemctl --user start omavaultd`)".into(),
                 ));
@@ -485,8 +514,7 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 println!("Vault state:       Not initialized (run `omavault init`)");
             }
             let client = DaemonClient::new(socket_path);
-            if client.is_available() {
-                let st = client.status()?;
+            if let Ok(st) = client.status() {
                 println!(
                     "Daemon status:     {} (mlock: {}, guard-page: {}, idle remaining: {}s)",
                     if st.unlocked { "UNLOCKED" } else { "LOCKED" },
@@ -561,7 +589,11 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             );
             println!(
                 "Memory lock: {}",
-                if master_key.is_mlocked() { "ACTIVE (mlock + PROT_NONE)" } else { "fallback (check RLIMIT_MEMLOCK)" }
+                if master_key.is_mlocked() {
+                    "ACTIVE (mlock + guard pages + PROT_NONE)"
+                } else {
+                    "fallback (check RLIMIT_MEMLOCK)"
+                }
             );
             Ok(())
         }
@@ -619,13 +651,21 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             name,
             username,
             url,
-            notes,
+            notes_prompt,
             tags,
             totp,
+            totp_file,
             generate,
             length,
             copy,
         } => {
+            let trimmed_name = name.trim().to_string();
+            if trimmed_name.is_empty() {
+                return Err(VaultError::InvalidFormat(
+                    "entry name cannot be empty".into(),
+                ));
+            }
+
             let mut session = open_session(
                 &vault_path,
                 &socket_path,
@@ -634,18 +674,24 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.passphrase_stdin,
             )?;
 
+            if session.vault().find_by_name(&trimmed_name).is_some() {
+                return Err(VaultError::DuplicateEntry(trimmed_name));
+            }
+
             let password = if generate {
                 generate_password(&PasswordOptions {
                     length,
                     ..PasswordOptions::default()
                 })?
             } else {
-                prompt_passphrase(&format!("Password for '{name}': "), false)?
+                prompt_confirmed_entry_password(&trimmed_name)?
             };
 
-            let totp_cfg = match totp {
-                Some(raw) => Some(TotpConfig::parse(&raw)?),
-                None => None,
+            let totp_cfg = read_totp_input(totp, totp_file.as_deref())?;
+            let notes = if notes_prompt {
+                prompt_tty_secret("Sensitive notes (hidden): ")?
+            } else {
+                Zeroizing::new(String::new())
             };
 
             let parsed_tags: Vec<String> = tags
@@ -654,9 +700,9 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 .filter(|s| !s.is_empty())
                 .collect();
 
-            let mut entry = Entry::new(name.clone(), username, password.to_string());
+            let mut entry = Entry::new(trimmed_name.clone(), username, password.to_string());
             entry.url = url;
-            entry.notes = notes;
+            entry.notes = notes.to_string();
             entry.tags = parsed_tags;
             entry.totp = totp_cfg;
 
@@ -665,9 +711,9 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
 
             if copy {
                 copy_secret(&password, ClipboardOptions::default())?;
-                println!("Added '{name}' and copied password to Wayland secret clipboard.");
+                println!("Added '{trimmed_name}' and copied password to Wayland secret clipboard.");
             } else {
-                println!("Added '{name}' to encrypted vault.");
+                println!("Added '{trimmed_name}' to encrypted vault.");
             }
             Ok(())
         }
@@ -719,9 +765,13 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     "Copied {field:?} for '{name}' (Wayland secret-tagged, clears in {timeout}s)."
                 );
             } else if matches!(field, GetField::Password) && !reveal {
-                eprintln!(
-                    "Refusing to print password to terminal without `--reveal` (use `--copy` for Wayland secret clipboard)."
-                );
+                return Err(VaultError::InvalidFormat(
+                    "refusing to print password without `--reveal` (use `--copy` for Wayland secret clipboard)".into(),
+                ));
+            } else if matches!(field, GetField::Notes) && !reveal && io::stdout().is_terminal() {
+                return Err(VaultError::InvalidFormat(
+                    "refusing to print sensitive notes to terminal without `--reveal` or `--copy`".into(),
+                ));
             } else {
                 println!("{}", *value);
             }
@@ -771,12 +821,27 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             name,
             username,
             url,
-            notes,
+            notes_prompt,
             totp,
+            totp_file,
             rotate_password,
             generate,
             length,
+            copy,
         } => {
+            if username.is_none()
+                && url.is_none()
+                && !notes_prompt
+                && !totp
+                && totp_file.is_none()
+                && !rotate_password
+                && !generate
+            {
+                return Err(VaultError::InvalidFormat(
+                    "no fields specified to update (pass --username, --url, --totp, --rotate-password, --generate, or --notes-prompt)".into(),
+                ));
+            }
+
             let mut session = open_session(
                 &vault_path,
                 &socket_path,
@@ -785,21 +850,30 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.passphrase_stdin,
             )?;
 
+            // Verify entry exists BEFORE prompting for secrets or generating passwords.
+            if session.vault().find_by_name(&name).is_none() {
+                return Err(VaultError::EntryNotFound(name));
+            }
+
             let new_pw = if generate {
                 Some(generate_password(&PasswordOptions {
                     length,
                     ..PasswordOptions::default()
                 })?)
             } else if rotate_password {
-                Some(prompt_passphrase(&format!("New password for '{name}': "), false)?)
+                Some(prompt_confirmed_entry_password(&name)?)
             } else {
                 None
             };
 
-            let parsed_totp = match totp {
-                Some(raw) => Some(TotpConfig::parse(&raw)?),
-                None => None,
+            let parsed_totp = read_totp_input(totp, totp_file.as_deref())?;
+            let new_notes = if notes_prompt {
+                Some(prompt_tty_secret("Updated notes (hidden): ")?)
+            } else {
+                None
             };
+
+            let copy_pw = new_pw.clone();
 
             let entry = session
                 .vault_mut()
@@ -812,18 +886,25 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             if let Some(u) = url {
                 entry.url = u;
             }
-            if let Some(n) = notes {
-                entry.notes = n;
+            if let Some(n) = new_notes {
+                entry.notes = n.to_string();
             }
             if let Some(t) = parsed_totp {
                 entry.totp = Some(t);
             }
             if let Some(pw) = new_pw {
-                entry.set_password(pw.to_string());
+                entry.set_password(pw);
             }
             entry.updated_at = chrono::Utc::now();
 
             session.save()?;
+            if copy {
+                if let Some(pw) = copy_pw {
+                    copy_secret(&pw, ClipboardOptions::default())?;
+                    println!("Updated '{name}' and copied new password to Wayland secret clipboard.");
+                    return Ok(());
+                }
+            }
             println!("Updated '{name}' and re-encrypted vault.");
             Ok(())
         }
@@ -836,6 +917,9 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
             )?;
+            if session.vault().find_by_name(&name).is_none() {
+                return Err(VaultError::EntryNotFound(name));
+            }
             if !yes {
                 print!("Permanently delete '{name}'? [y/N]: ");
                 io::stdout().flush()?;
@@ -860,16 +944,18 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
             )?;
-            let report = run_audit(session.vault());
+            let report = run_audit(session.vault())?;
             println!("=== omavault Security Audit ===");
             println!("Score:          {}/100", report.overall_score);
             println!("Total entries:  {}", report.total_entries);
             println!(
-                "2FA (TOTP):     {}/{}",
-                report.totp_enabled_count, report.total_entries
+                "2FA (TOTP):     {}/{} ({} missing 2FA)",
+                report.totp_enabled_count,
+                report.total_entries,
+                report.missing_totp.len()
             );
             if !report.weak_passwords.is_empty() {
-                println!("\nWeak passwords ({}):", report.weak_passwords.len());
+                println!("\nWeak / empty passwords ({}):", report.weak_passwords.len());
                 for w in &report.weak_passwords {
                     println!(
                         "  - {} ({:.0} bits · {} · len {})",
@@ -901,9 +987,20 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             mem_mib,
             time,
             lanes,
+            purge_old_backups,
         } => {
-            // Open existing vault directly (never via cached daemon session).
+            // Lock daemon BEFORE reading/writing so no concurrent session can revert the rekey.
+            let client = DaemonClient::new(socket_path);
+            let _ = client.lock();
+            clear_clipboard_best_effort();
+
             let old_header = read_header_from_disk(&vault_path, true)?;
+            if cli.keyfile.is_some() && !old_header.requires_keyfile() && new_keyfile.is_none() {
+                eprintln!(
+                    "Warning: global --keyfile is ignored for rekey on a passphrase-only vault; pass --new-keyfile to add a keyfile."
+                );
+            }
+
             let old_pass = prompt_passphrase("Current master passphrase: ", cli.passphrase_stdin)?;
             let old_kf = if old_header.requires_keyfile() {
                 let p = cli.keyfile.as_deref().ok_or(VaultError::KeyfileRequired)?;
@@ -926,17 +1023,23 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 old_fido2.as_deref(),
                 true,
             )?;
-            let (_, vault) = load_vault_from_disk(&vault_path, &old_master_key, true)?;
+            drop(old_pass);
 
-            // Build new key hierarchy with fresh kdf_salt, save_salt, and nonce.
+            let (_, vault) = load_vault_from_disk(&vault_path, &old_master_key, true)?;
+            // Immediately wipe old master key from RAM before prompting for new credentials.
+            drop(old_master_key);
+
+            // Preserve existing hardened KDF params whenever flags are omitted!
             let new_params = KdfParams {
-                mem_kib: mem_mib.saturating_mul(1024),
-                time_cost: time,
-                parallelism: lanes,
+                mem_kib: mem_mib
+                    .map(|m| m.saturating_mul(1024))
+                    .unwrap_or(old_header.kdf_params.mem_kib),
+                time_cost: time.unwrap_or(old_header.kdf_params.time_cost),
+                parallelism: lanes.unwrap_or(old_header.kdf_params.parallelism),
             };
             new_params.validate()?;
 
-            let new_pass = prompt_new_passphrase(false)?;
+            let new_pass = prompt_new_passphrase(cli.passphrase_stdin)?;
 
             let new_kf = if remove_keyfile {
                 None
@@ -967,16 +1070,31 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 new_fido2_secret.as_deref(),
                 true,
             )?;
+            drop(new_pass);
 
             save_vault_to_disk(&vault_path, &new_master_key, &mut new_header, &vault)?;
+            // Verify new vault decrypts cleanly before optionally purging old-key backups.
+            let _ = load_vault_from_disk(&vault_path, &new_master_key, true)?;
 
-            // Lock daemon if running so stale master key is purged immediately.
-            let client = DaemonClient::new(socket_path);
-            if client.is_available() {
-                let _ = client.lock();
+            if purge_old_backups {
+                let removed = purge_encrypted_backups(&vault_path)?;
+                println!(
+                    "Vault re-keyed ({} MiB, t={}, p={}) and purged {removed} old-key backup file(s).",
+                    new_params.mem_kib / 1024,
+                    new_params.time_cost,
+                    new_params.parallelism
+                );
+            } else {
+                println!(
+                    "Vault re-keyed successfully ({} MiB, t={}, p={}).",
+                    new_params.mem_kib / 1024,
+                    new_params.time_cost,
+                    new_params.parallelism
+                );
+                eprintln!(
+                    "Note: Rolling backups (*.bak.*) encrypted under the old key still exist. Pass --purge-old-backups if rotating due to key compromise."
+                );
             }
-
-            println!("Vault re-keyed successfully with fresh KDF salt, payload subkey, and nonce.");
             Ok(())
         }
     }
@@ -989,19 +1107,16 @@ fn open_session(
     fido2_device: Option<&str>,
     passphrase_stdin: bool,
 ) -> Result<VaultSession> {
-    // 1. Prefer unlocked daemon session if available.
     let client = DaemonClient::new(socket_path.to_path_buf());
-    if client.is_available() {
-        if let Ok(vault) = client.load_vault(vault_path) {
-            return Ok(VaultSession::Daemon {
-                client,
-                vault_path: vault_path.to_path_buf(),
-                vault,
-            });
-        }
+    if let Ok((vault, revision)) = client.load_vault(vault_path) {
+        return Ok(VaultSession::Daemon {
+            client,
+            vault_path: vault_path.to_path_buf(),
+            vault,
+            revision,
+        });
     }
 
-    // 2. Fallback to standalone direct decryption.
     let header = read_header_from_disk(vault_path, true)?;
     let passphrase = prompt_passphrase("Master passphrase: ", passphrase_stdin)?;
 
@@ -1037,20 +1152,74 @@ fn open_session(
     })
 }
 
-fn prompt_passphrase(prompt: &str, from_stdin: bool) -> Result<Zeroizing<String>> {
-    if from_stdin || !io::stdin().is_terminal() {
-        let mut buf = Zeroizing::new(String::new());
-        io::stdin().read_to_string(&mut buf)?;
-        let trimmed = buf.trim_end_matches(['\r', '\n']).to_string();
-        return Ok(Zeroizing::new(trimmed));
+fn read_totp_input(prompt_flag: bool, file_path: Option<&Path>) -> Result<Option<TotpConfig>> {
+    if let Some(path) = file_path {
+        let file = File::open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(VaultError::InvalidTotp(
+                "TOTP file must be a regular file".into(),
+            ));
+        }
+        let mut raw = Zeroizing::new(String::with_capacity(256));
+        file.take(4096).read_to_string(&mut raw)?;
+        return Ok(Some(TotpConfig::parse(raw.trim())?));
     }
+    if prompt_flag {
+        let raw = prompt_tty_secret("TOTP Base32 secret or otpauth:// URI (hidden): ")?;
+        return Ok(Some(TotpConfig::parse(raw.trim())?));
+    }
+    Ok(None)
+}
+
+fn prompt_tty_secret(prompt: &str) -> Result<Zeroizing<String>> {
     let pw = rpassword::prompt_password(prompt)
-        .map_err(|e| VaultError::Io(io::Error::other(format!("passphrase prompt failed: {e}"))))?;
+        .map_err(|e| VaultError::Io(io::Error::other(format!("secret prompt failed: {e}"))))?;
     Ok(Zeroizing::new(pw))
 }
 
+fn prompt_confirmed_entry_password(name: &str) -> Result<Zeroizing<String>> {
+    if !io::stdin().is_terminal() {
+        return Err(VaultError::InvalidFormat(
+            "refusing to read entry password from non-interactive stdin (use --generate or run interactively)".into(),
+        ));
+    }
+    loop {
+        let p1 = prompt_tty_secret(&format!("Password for '{name}': "))?;
+        if p1.is_empty() {
+            eprintln!("Password cannot be empty.");
+            continue;
+        }
+        let p2 = prompt_tty_secret(&format!("Confirm password for '{name}': "))?;
+        if *p1 != *p2 {
+            eprintln!("Passwords did not match. Try again.");
+            continue;
+        }
+        return Ok(p1);
+    }
+}
+
+/// Read a single passphrase line when `from_stdin` is requested (preserving subsequent lines
+/// for multi-step scripts like `rekey --passphrase-stdin`), or prompt via TTY otherwise.
+fn prompt_passphrase(prompt: &str, from_stdin: bool) -> Result<Zeroizing<String>> {
+    if from_stdin {
+        let mut line = Zeroizing::new(String::with_capacity(256));
+        let stdin = io::stdin();
+        let n = stdin.lock().read_line(&mut line)?;
+        if n == 0 {
+            return Err(VaultError::InvalidFormat(
+                "unexpected EOF reading passphrase from stdin".into(),
+            ));
+        }
+        while line.ends_with(['\r', '\n']) {
+            line.pop();
+        }
+        return Ok(line);
+    }
+    prompt_tty_secret(prompt)
+}
+
 fn prompt_new_passphrase(from_stdin: bool) -> Result<Zeroizing<String>> {
-    if from_stdin || !io::stdin().is_terminal() {
+    if from_stdin {
         let pw = prompt_passphrase("", true)?;
         if pw.chars().count() < 10 {
             return Err(VaultError::WeakKdfParameters(
@@ -1061,9 +1230,9 @@ fn prompt_new_passphrase(from_stdin: bool) -> Result<Zeroizing<String>> {
     }
 
     loop {
-        let p1 = prompt_passphrase("New master passphrase (min 10 chars): ", false)?;
+        let p1 = prompt_tty_secret("New master passphrase (min 10 chars): ")?;
         if p1.chars().count() < 10 {
-            eprintln!("Master passphrase too short — use at least 10 characters (recommend a 6+ word passphrase).");
+            eprintln!("Master passphrase too short — use at least 10 characters (recommend an 8+ word passphrase).");
             continue;
         }
         let bits = estimate_entropy_bits(&p1);
@@ -1072,7 +1241,7 @@ fn prompt_new_passphrase(from_stdin: bool) -> Result<Zeroizing<String>> {
             bits,
             strength_label(bits)
         );
-        let p2 = prompt_passphrase("Confirm master passphrase: ", false)?;
+        let p2 = prompt_tty_secret("Confirm master passphrase: ")?;
         if *p1 != *p2 {
             eprintln!("Passphrases did not match. Try again.");
             continue;
@@ -1092,4 +1261,3 @@ mod tests {
         Cli::command().debug_assert();
     }
 }
-

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,8 @@ use crate::error::{Result, VaultError};
 type HmacSha1 = Hmac<Sha1>;
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
+
+const MIN_TOTP_SECRET_BYTES: usize = 10; // 80-bit minimum (RFC 4226 floor)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
@@ -36,7 +39,7 @@ impl fmt::Display for TotpAlgorithm {
 /// RFC 6238 TOTP configuration stored encrypted inside a vault entry.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct TotpConfig {
-    /// Base32-encoded shared secret (uppercase, stripped of spaces/padding).
+    /// Base32-encoded shared secret (uppercase, stripped of spaces/trailing padding).
     pub secret_base32: String,
     #[zeroize(skip)]
     #[serde(default)]
@@ -92,44 +95,68 @@ impl fmt::Debug for TotpCode {
 }
 
 impl TotpConfig {
-    /// Parse either an `otpauth://totp/...` URI or a raw Base32 secret string.
+    /// Validate invariants consistently across parsed and deserialized configs.
+    pub fn validate(&self) -> Result<()> {
+        if self.digits != 6 && self.digits != 8 {
+            return Err(VaultError::InvalidTotp("TOTP digits must be 6 or 8".into()));
+        }
+        if self.period == 0 || self.period > 300 {
+            return Err(VaultError::InvalidTotp(
+                "TOTP period must be between 1 and 300 seconds".into(),
+            ));
+        }
+        let decoded = decode_base32(&self.secret_base32)?;
+        if decoded.len() < MIN_TOTP_SECRET_BYTES {
+            return Err(VaultError::InvalidTotp(
+                "TOTP secret too short (minimum 10 bytes / 80 bits)".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Parse either an `otpauth://totp/...` URI (case-insensitive scheme) or a raw Base32 secret.
+    ///
+    /// Never echoes raw input substrings in error messages so malformed URIs cannot leak seeds.
     pub fn parse(input: &str) -> Result<Self> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Err(VaultError::InvalidTotp("TOTP secret cannot be empty".into()));
         }
-        if trimmed.starts_with("otpauth://") {
-            Self::parse_otpauth_uri(trimmed)
+        let cfg = if trimmed.len() >= 10 && trimmed[..10].eq_ignore_ascii_case("otpauth://") {
+            Self::parse_otpauth_uri(trimmed)?
         } else {
             let normalized = normalize_base32(trimmed)?;
-            Ok(Self {
-                secret_base32: normalized,
+            Self {
+                secret_base32: normalized.to_string(),
                 algorithm: TotpAlgorithm::Sha1,
                 digits: 6,
                 period: 30,
                 issuer: None,
-            })
-        }
+            }
+        };
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     fn parse_otpauth_uri(uri: &str) -> Result<Self> {
-        let rest = uri
-            .strip_prefix("otpauth://")
-            .ok_or_else(|| VaultError::InvalidTotp("invalid otpauth scheme".into()))?;
+        let rest = &uri[10..]; // after case-insensitive "otpauth://"
         let (kind, after_kind) = rest
             .split_once('/')
             .ok_or_else(|| VaultError::InvalidTotp("missing otpauth path".into()))?;
         if !kind.eq_ignore_ascii_case("totp") {
-            return Err(VaultError::InvalidTotp(format!(
-                "unsupported otpauth type '{kind}' (only 'totp' is supported)"
-            )));
+            return Err(VaultError::InvalidTotp(
+                "unsupported otpauth type (only 'totp' is supported)".into(),
+            ));
         }
 
-        let (_label, query) = after_kind
-            .split_once('?')
-            .ok_or_else(|| VaultError::InvalidTotp("missing query parameters in otpauth URI".into()))?;
+        // Strip URI #fragment before parsing query parameters.
+        let without_fragment = after_kind.split('#').next().unwrap_or(after_kind);
+        let (_label, query) = without_fragment.split_once('?').ok_or_else(|| {
+            VaultError::InvalidTotp("missing query parameters in otpauth URI".into())
+        })?;
 
-        let mut secret: Option<String> = None;
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let mut secret: Option<Zeroizing<String>> = None;
         let mut algorithm = TotpAlgorithm::Sha1;
         let mut digits: u32 = 6;
         let mut period: u64 = 30;
@@ -140,53 +167,82 @@ impl TotpConfig {
                 continue;
             }
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let key_lower = k.to_ascii_lowercase();
             let val = percent_decode(v);
-            match k.to_ascii_lowercase().as_str() {
-                "secret" => secret = Some(normalize_base32(&val)?),
+
+            match key_lower.as_str() {
+                "secret" => {
+                    if !seen_keys.insert(key_lower) {
+                        return Err(VaultError::InvalidTotp(
+                            "duplicate 'secret' parameter in otpauth URI".into(),
+                        ));
+                    }
+                    secret = Some(normalize_base32(&val)?);
+                }
                 "algorithm" => {
+                    if !seen_keys.insert(key_lower) {
+                        return Err(VaultError::InvalidTotp(
+                            "duplicate 'algorithm' parameter in otpauth URI".into(),
+                        ));
+                    }
                     algorithm = match val.to_ascii_uppercase().as_str() {
                         "SHA1" => TotpAlgorithm::Sha1,
                         "SHA256" => TotpAlgorithm::Sha256,
                         "SHA512" => TotpAlgorithm::Sha512,
-                        other => {
-                            return Err(VaultError::InvalidTotp(format!(
-                                "unsupported TOTP algorithm '{other}'"
-                            )));
+                        _ => {
+                            return Err(VaultError::InvalidTotp(
+                                "unsupported TOTP algorithm (expected SHA1, SHA256, or SHA512)"
+                                    .into(),
+                            ));
                         }
                     };
                 }
                 "digits" => {
+                    if !seen_keys.insert(key_lower) {
+                        return Err(VaultError::InvalidTotp(
+                            "duplicate 'digits' parameter in otpauth URI".into(),
+                        ));
+                    }
                     digits = val
                         .parse::<u32>()
                         .map_err(|_| VaultError::InvalidTotp("invalid digits value".into()))?;
                     if digits != 6 && digits != 8 {
-                        return Err(VaultError::InvalidTotp(
-                            "digits must be 6 or 8".into(),
-                        ));
+                        return Err(VaultError::InvalidTotp("TOTP digits must be 6 or 8".into()));
                     }
                 }
                 "period" => {
+                    if !seen_keys.insert(key_lower) {
+                        return Err(VaultError::InvalidTotp(
+                            "duplicate 'period' parameter in otpauth URI".into(),
+                        ));
+                    }
                     period = val
                         .parse::<u64>()
                         .map_err(|_| VaultError::InvalidTotp("invalid period value".into()))?;
                     if period == 0 || period > 300 {
                         return Err(VaultError::InvalidTotp(
-                            "period must be between 1 and 300 seconds".into(),
+                            "TOTP period must be between 1 and 300 seconds".into(),
                         ));
                     }
                 }
                 "issuer" if !val.is_empty() => {
-                    issuer = Some(val);
+                    if !seen_keys.insert(key_lower) {
+                        return Err(VaultError::InvalidTotp(
+                            "duplicate 'issuer' parameter in otpauth URI".into(),
+                        ));
+                    }
+                    issuer = Some(val.to_string());
                 }
                 _ => {}
             }
         }
 
-        let secret_base32 = secret
-            .ok_or_else(|| VaultError::InvalidTotp("otpauth URI missing 'secret' parameter".into()))?;
+        let secret_base32 = secret.ok_or_else(|| {
+            VaultError::InvalidTotp("otpauth URI missing 'secret' parameter".into())
+        })?;
 
         Ok(Self {
-            secret_base32,
+            secret_base32: secret_base32.to_string(),
             algorithm,
             digits,
             period,
@@ -205,12 +261,7 @@ impl TotpConfig {
 
     /// Generate a TOTP code for a specific UNIX timestamp (deterministic, RFC 6238 compliant).
     pub fn generate_at(&self, unix_secs: u64) -> Result<TotpCode> {
-        if self.period == 0 {
-            return Err(VaultError::InvalidTotp("TOTP period cannot be zero".into()));
-        }
-        if self.digits < 6 || self.digits > 8 {
-            return Err(VaultError::InvalidTotp("TOTP digits must be 6..=8".into()));
-        }
+        self.validate()?;
 
         let key = decode_base32(&self.secret_base32)?;
         let counter = unix_secs / self.period;
@@ -218,7 +269,7 @@ impl TotpConfig {
 
         let code = hotp_raw(&key, counter, self.algorithm, self.digits)?;
         Ok(TotpCode {
-            code,
+            code: code.to_string(),
             remaining_secs,
             period: self.period,
         })
@@ -226,30 +277,42 @@ impl TotpConfig {
 }
 
 /// Core RFC 4226 HOTP / RFC 6238 dynamic truncation implementation.
+///
+/// Validates `digits` in `6..=8` and non-empty `key` to eliminate integer overflow and
+/// release-mode division-by-zero aborts.
 pub fn hotp_raw(
     key: &[u8],
     counter: u64,
     algorithm: TotpAlgorithm,
     digits: u32,
-) -> Result<String> {
+) -> Result<Zeroizing<String>> {
+    if key.is_empty() {
+        return Err(VaultError::InvalidTotp("HOTP key cannot be empty".into()));
+    }
+    if !(6..=8).contains(&digits) {
+        return Err(VaultError::InvalidTotp(
+            "HOTP digits must be between 6 and 8".into(),
+        ));
+    }
+
     let counter_be = counter.to_be_bytes();
 
     let digest: Zeroizing<Vec<u8>> = match algorithm {
         TotpAlgorithm::Sha1 => {
             let mut mac = HmacSha1::new_from_slice(key)
-                .map_err(|e| VaultError::InvalidTotp(e.to_string()))?;
+                .map_err(|_| VaultError::InvalidTotp("HMAC-SHA1 initialization failed".into()))?;
             mac.update(&counter_be);
             Zeroizing::new(mac.finalize().into_bytes().to_vec())
         }
         TotpAlgorithm::Sha256 => {
             let mut mac = HmacSha256::new_from_slice(key)
-                .map_err(|e| VaultError::InvalidTotp(e.to_string()))?;
+                .map_err(|_| VaultError::InvalidTotp("HMAC-SHA256 initialization failed".into()))?;
             mac.update(&counter_be);
             Zeroizing::new(mac.finalize().into_bytes().to_vec())
         }
         TotpAlgorithm::Sha512 => {
             let mut mac = HmacSha512::new_from_slice(key)
-                .map_err(|e| VaultError::InvalidTotp(e.to_string()))?;
+                .map_err(|_| VaultError::InvalidTotp("HMAC-SHA512 initialization failed".into()))?;
             mac.update(&counter_be);
             Zeroizing::new(mac.finalize().into_bytes().to_vec())
         }
@@ -261,22 +324,36 @@ pub fn hotp_raw(
         | (u32::from(digest[offset + 2]) << 8)
         | u32::from(digest[offset + 3]);
 
-    let modulo = 10u32.pow(digits);
+    let modulo = 10u32
+        .checked_pow(digits)
+        .ok_or_else(|| VaultError::InvalidTotp("TOTP digits overflow".into()))?;
     let otp = binary % modulo;
-    Ok(format!("{:0width$}", otp, width = digits as usize))
+    Ok(Zeroizing::new(format!(
+        "{:0width$}",
+        otp,
+        width = digits as usize
+    )))
 }
 
-fn normalize_base32(input: &str) -> Result<String> {
-    let cleaned: String = input
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '=')
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
-    if cleaned.is_empty() {
-        return Err(VaultError::InvalidTotp("empty Base32 secret".into()));
+fn normalize_base32(input: &str) -> Result<Zeroizing<String>> {
+    // Strip whitespace and hyphens, uppercase, then strip ONLY trailing RFC 4648 '=' padding.
+    let stripped: Zeroizing<String> = Zeroizing::new(
+        input
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .map(|c| c.to_ascii_uppercase())
+            .collect(),
+    );
+    let cleaned = Zeroizing::new(stripped.trim_end_matches('=').to_string());
+    if cleaned.is_empty() || cleaned.contains('=') {
+        return Err(VaultError::InvalidTotp("invalid Base32 TOTP secret".into()));
     }
-    // Verify it decodes cleanly.
-    let _ = decode_base32(&cleaned)?;
+    let decoded = decode_base32(&cleaned)?;
+    if decoded.len() < MIN_TOTP_SECRET_BYTES {
+        return Err(VaultError::InvalidTotp(
+            "TOTP secret too short (minimum 10 bytes / 80 bits)".into(),
+        ));
+    }
     Ok(cleaned)
 }
 
@@ -287,12 +364,16 @@ fn decode_base32(cleaned: &str) -> Result<Zeroizing<Vec<u8>>> {
     Ok(Zeroizing::new(bytes))
 }
 
-fn percent_decode(s: &str) -> String {
+fn percent_decode(s: &str) -> Zeroizing<String> {
     let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
             if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
                 if let Ok(val) = u8::from_str_radix(hex, 16) {
                     out.push(val);
@@ -304,7 +385,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Zeroizing::new(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
@@ -331,15 +412,15 @@ mod tests {
             let c1 = hotp_raw(seed_sha1, ts / 30, TotpAlgorithm::Sha1, 8).unwrap();
             let c256 = hotp_raw(seed_sha256, ts / 30, TotpAlgorithm::Sha256, 8).unwrap();
             let c512 = hotp_raw(seed_sha512, ts / 30, TotpAlgorithm::Sha512, 8).unwrap();
-            assert_eq!(c1, exp1, "SHA1 mismatch at ts={ts}");
-            assert_eq!(c256, exp256, "SHA256 mismatch at ts={ts}");
-            assert_eq!(c512, exp512, "SHA512 mismatch at ts={ts}");
+            assert_eq!(&*c1, exp1, "SHA1 mismatch at ts={ts}");
+            assert_eq!(&*c256, exp256, "SHA256 mismatch at ts={ts}");
+            assert_eq!(&*c512, exp512, "SHA512 mismatch at ts={ts}");
         }
     }
 
     #[test]
-    fn parses_otpauth_uri() {
-        let uri = "otpauth://totp/GitHub:alice%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&algorithm=SHA256&digits=6&period=30";
+    fn parses_otpauth_uri_and_rejects_malformed_edge_cases() {
+        let uri = "OTPAUTH://totp/GitHub:alice%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&algorithm=SHA256&digits=6&period=30#frag";
         let cfg = TotpConfig::parse(uri).expect("parse otpauth");
         assert_eq!(cfg.algorithm, TotpAlgorithm::Sha256);
         assert_eq!(cfg.digits, 6);
@@ -347,6 +428,33 @@ mod tests {
         assert_eq!(cfg.issuer.as_deref(), Some("GitHub"));
         let code = cfg.generate_at(1_700_000_000).expect("generate totp");
         assert_eq!(code.code.len(), 6);
-        assert!(code.remaining_secs >= 1 && code.remaining_secs <= 30);
+
+        // Duplicate secret rejected.
+        assert!(TotpConfig::parse(
+            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&secret=JBSWY3DPEHPK3PXP"
+        )
+        .is_err());
+
+        // Interior '=' rejected.
+        assert!(TotpConfig::parse("JBSW====Y3DPEHPK3PXP").is_err());
+
+        // percent_decode does not treat %+a as hex.
+        assert_eq!(&*percent_decode("%+a"), "%+a");
+
+        // Error messages must never echo secret substrings.
+        let err = TotpConfig::parse(
+            "otpauth://totp/x?algorithm=SHA1secret=MYSECRETSEED123456&secret=JBSWY3DPEHPK3PXP",
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("MYSECRETSEED"));
+    }
+
+    #[test]
+    fn hotp_raw_rejects_overflow_and_zero_digits() {
+        let key = b"12345678901234567890";
+        assert!(hotp_raw(key, 1, TotpAlgorithm::Sha1, 0).is_err());
+        assert!(hotp_raw(key, 1, TotpAlgorithm::Sha1, 10).is_err());
+        assert!(hotp_raw(key, 1, TotpAlgorithm::Sha1, 32).is_err());
+        assert!(hotp_raw(&[], 1, TotpAlgorithm::Sha1, 6).is_err());
     }
 }

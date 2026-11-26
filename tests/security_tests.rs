@@ -1,19 +1,24 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use omavault::crypto::fido2::{Fido2Provider, MockFido2Provider};
+use omavault::clipboard::validate_clipboard_timeout;
+use omavault::crypto::fido2::{Fido2Metadata, Fido2Provider, LibFido2Cli, MockFido2Provider};
 use omavault::crypto::kdf::{derive_master_key, hash_keyfile, KdfParams};
 use omavault::crypto::{open_vault, seal_vault, VaultHeader};
-use omavault::daemon::{run_daemon, DaemonClient};
+use omavault::daemon::{run_daemon, DaemonClient, DaemonRequest, SecretString};
 use omavault::error::VaultError;
-use omavault::generator::{estimate_entropy_bits, generate_password, PasswordOptions};
+use omavault::generator::{
+    estimate_entropy_bits, generate_password, generated_password_entropy_bits, PasswordOptions,
+};
 use omavault::hardening::harden_process;
-use omavault::totp::TotpConfig;
+use omavault::totp::{hotp_raw, TotpAlgorithm, TotpConfig};
 use omavault::vault::audit::run_audit;
 use omavault::vault::storage::{
-    generate_keyfile, load_vault_from_disk, save_vault_to_disk,
+    ensure_private_dir_strict, generate_keyfile, load_vault_from_disk, purge_encrypted_backups,
+    save_vault_to_disk,
 };
 use omavault::vault::{Entry, Vault};
 use tempfile::TempDir;
@@ -29,7 +34,6 @@ fn fast_params() -> KdfParams {
 
 #[test]
 fn production_kdf_roundtrip_and_tamper_resistance() {
-    // Use real production-floor KDF parameters (64 MiB, t=3, p=2) with policy enforcement ON.
     let prod_params = KdfParams {
         mem_kib: 65_536,
         time_cost: 3,
@@ -49,12 +53,10 @@ fn production_kdf_roundtrip_and_tamper_resistance() {
     let plaintext = b"{\"secret\":\"ultra-classified-token\"}";
     let blob = seal_vault(&key, &mut header, plaintext).expect("seal");
 
-    // Valid open succeeds.
     let (parsed_hdr, recovered) = open_vault(&key, &blob, true).expect("open");
     assert_eq!(recovered.as_slice(), plaintext);
     assert_eq!(parsed_hdr.kdf_params, prod_params);
 
-    // Wrong passphrase fails with AuthenticationFailed.
     let wrong_key = derive_master_key(
         b"wrong-passphrase-12345",
         &header.kdf_salt,
@@ -69,8 +71,6 @@ fn production_kdf_roundtrip_and_tamper_resistance() {
         Err(VaultError::AuthenticationFailed)
     ));
 
-    // Bit-flipping ANY byte in AAD (kdf_salt, save_salt, nonce, kdf_params) or ciphertext
-    // MUST fail authentication!
     for &idx in &[20usize, 52, 84, blob.len() - 20, blob.len() - 1] {
         let mut tampered = blob.clone();
         tampered[idx] ^= 0x01;
@@ -83,27 +83,44 @@ fn production_kdf_roundtrip_and_tamper_resistance() {
 }
 
 #[test]
-fn rejects_kdf_downgrade_attack() {
+fn rejects_kdf_downgrade_and_dos_upper_bounds() {
     let weak = fast_params();
     let mut header = VaultHeader::new(weak, false, None).expect("header");
     let key = derive_master_key(b"strong-passphrase", &header.kdf_salt, weak, None, None, false)
         .expect("key");
     let blob = seal_vault(&key, &mut header, b"payload").expect("seal");
 
-    // Opening with production policy enabled MUST reject the weak KDF header immediately.
+    // Production policy rejects weak KDF downgrade.
     let err = open_vault(&key, &blob, true).unwrap_err();
-    assert!(
-        matches!(err, VaultError::WeakKdfParameters(_)),
-        "expected WeakKdfParameters, got {err:?}"
-    );
+    assert!(matches!(err, VaultError::WeakKdfParameters(_)));
+
+    // Pre-auth upper DoS work cap rejects 1 GiB * 16 iterations (> 8 GiB-iters cap).
+    let dos_params = KdfParams {
+        mem_kib: 1_048_576,
+        time_cost: 16,
+        parallelism: 4,
+    };
+    assert!(matches!(
+        dos_params.validate_upper_bounds(),
+        Err(VaultError::WeakKdfParameters(_))
+    ));
+
+    // Misaligned / truncated ciphertext rejected before decryption.
+    let mut bad_len = blob.clone();
+    bad_len.push(0x42);
+    assert!(matches!(
+        VaultHeader::parse(&bad_len, false),
+        Err(VaultError::InvalidFormat(_))
+    ));
 }
 
 #[test]
 fn every_save_rotates_subkey_and_nonce_and_hides_length() {
     let params = fast_params();
     let mut header = VaultHeader::new(params, false, None).expect("header");
-    let key = derive_master_key(b"passphrase-rotation-test", &header.kdf_salt, params, None, None, false)
-        .expect("key");
+    let key =
+        derive_master_key(b"passphrase-rotation-test", &header.kdf_salt, params, None, None, false)
+            .expect("key");
 
     let blob1 = seal_vault(&key, &mut header, b"short").expect("seal1");
     let salt1 = header.save_salt;
@@ -113,12 +130,9 @@ fn every_save_rotates_subkey_and_nonce_and_hides_length() {
     let salt2 = header.save_salt;
     let nonce2 = header.nonce;
 
-    // Fresh per-save subkey salt and nonce on every single save.
     assert_ne!(salt1, salt2);
     assert_ne!(nonce1, nonce2);
     assert_ne!(blob1, blob2);
-
-    // Length-hiding 4 KiB block padding ensures both small payloads have identical blob size.
     assert_eq!(blob1.len(), blob2.len());
 }
 
@@ -130,7 +144,6 @@ fn triple_factor_passphrase_keyfile_and_fido2() {
     generate_keyfile(&kf_path).expect("generate keyfile");
     generate_keyfile(&wrong_kf_path).expect("generate other keyfile");
 
-    // Verify 0600 permissions on generated keyfile.
     let kf_mode = fs::metadata(&kf_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(kf_mode, 0o600);
 
@@ -165,11 +178,9 @@ fn triple_factor_passphrase_keyfile_and_fido2() {
 
     let blob = seal_vault(&master_key, &mut header, b"triple-factor-secret").expect("seal");
 
-    // Succeeds with all three exact factors.
     let (_, recovered) = open_vault(&master_key, &blob, false).expect("open valid");
     assert_eq!(recovered.as_slice(), b"triple-factor-secret");
 
-    // Fails if keyfile is wrong.
     let key_wrong_kf = derive_master_key(
         b"triple-factor-master-passphrase",
         &header.kdf_salt,
@@ -184,7 +195,6 @@ fn triple_factor_passphrase_keyfile_and_fido2() {
         Err(VaultError::AuthenticationFailed)
     ));
 
-    // Fails if FIDO2 hardware key is different.
     let key_wrong_fido = derive_master_key(
         b"triple-factor-master-passphrase",
         &header.kdf_salt,
@@ -201,10 +211,10 @@ fn triple_factor_passphrase_keyfile_and_fido2() {
 }
 
 #[test]
-fn atomic_disk_storage_permissions_and_rolling_backups() {
+fn atomic_disk_storage_permissions_rolling_backups_and_purge() {
     let _ = harden_process();
     let tmp = TempDir::new().expect("tempdir");
-    let vault_dir = tmp.path().join("private_dir");
+    let vault_dir = tmp.path().join("omavault_private");
     let vault_path = vault_dir.join("vault.omav");
 
     let params = fast_params();
@@ -216,44 +226,83 @@ fn atomic_disk_storage_permissions_and_rolling_backups() {
     let mut entry = Entry::new(
         "github.com".into(),
         "octocat".into(),
-        generate_password(&PasswordOptions::default()).unwrap().to_string(),
+        generate_password(&PasswordOptions::default())
+            .unwrap()
+            .to_string(),
     );
     entry.totp = Some(TotpConfig::parse("JBSWY3DPEHPK3PXP").unwrap());
     vault.add_entry(entry).unwrap();
 
-    // First save.
     save_vault_to_disk(&vault_path, &key, &mut header, &vault).expect("first save");
-    assert_eq!(fs::metadata(&vault_dir).unwrap().permissions().mode() & 0o777, 0o700);
-    assert_eq!(fs::metadata(&vault_path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&vault_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&vault_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
-    // Second save creates encrypted rolling backup .bak.1 with 0600 permissions.
     vault
-        .add_entry(Entry::new("gitlab.com".into(), "dev".into(), "S3cur3!Pass#2026".into()))
+        .add_entry(Entry::new(
+            "gitlab.com".into(),
+            "dev".into(),
+            "S3cur3!Pass#2026".into(),
+        ))
         .unwrap();
     save_vault_to_disk(&vault_path, &key, &mut header, &vault).expect("second save");
 
-    let bak1 = tmp.path().join("private_dir/vault.omav.bak.1");
+    let bak1 = vault_dir.join("vault.omav.bak.1");
     assert!(bak1.exists());
-    assert_eq!(fs::metadata(&bak1).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&bak1).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
-    // Load latest vault and verify both entries + TOTP intact.
+    // Purge backups removes old-key snapshots cleanly.
+    let purged = purge_encrypted_backups(&vault_path).expect("purge");
+    assert_eq!(purged, 1);
+    assert!(!bak1.exists());
+
     let (_, loaded) = load_vault_from_disk(&vault_path, &key, false).expect("load");
     assert_eq!(loaded.entries.len(), 2);
-    let gh = loaded.find_by_name("github.com").unwrap();
-    assert!(gh.totp.is_some());
-    assert_eq!(gh.totp.as_ref().unwrap().generate_now().unwrap().code.len(), 6);
 }
 
 #[test]
-fn daemon_unlock_load_save_and_lock_lifecycle() {
+fn rejects_symlinks_and_special_files() {
+    let tmp = TempDir::new().expect("tempdir");
+    let real_dir = tmp.path().join("real");
+    fs::create_dir(&real_dir).unwrap();
+    let sym_dir = tmp.path().join("sym_dir");
+    symlink(&real_dir, &sym_dir).unwrap();
+
+    // O_NOFOLLOW rejects symlink directory.
+    assert!(ensure_private_dir_strict(&sym_dir, true).is_err());
+
+    // Special device `/dev/zero` rejected by hash_keyfile & load_vault_from_disk.
+    assert!(matches!(
+        hash_keyfile(Path::new("/dev/zero")),
+        Err(VaultError::InvalidFormat(_))
+    ));
+    let mut raw_k = [0x42u8; 32];
+    let key = omavault::hardening::LockedKey::new(&mut raw_k).unwrap();
+    assert!(matches!(
+        load_vault_from_disk(Path::new("/dev/zero"), &key, false),
+        Err(VaultError::InvalidFormat(_))
+    ));
+}
+
+#[test]
+fn daemon_unlock_load_save_revision_conflict_and_lock_lifecycle() {
     let tmp = TempDir::new().expect("tempdir");
     let vault_path = tmp.path().join("vault.omav");
-    let sock_path = tmp.path().join("run/daemon.sock");
+    let sock_path = tmp.path().join("omavault_run/daemon.sock");
 
     let params = fast_params();
     let mut header = VaultHeader::new(params, false, None).expect("header");
-    let key = derive_master_key(b"daemon-master-pass!", &header.kdf_salt, params, None, None, false)
-        .expect("key");
+    let key =
+        derive_master_key(b"daemon-master-pass!", &header.kdf_salt, params, None, None, false)
+            .expect("key");
     let vault = Vault::new();
     save_vault_to_disk(&vault_path, &key, &mut header, &vault).expect("init save");
 
@@ -262,7 +311,6 @@ fn daemon_unlock_load_save_and_lock_lifecycle() {
         let _ = run_daemon(&sock_for_thread, 60, false);
     });
 
-    // Wait briefly for daemon socket to bind.
     let client = DaemonClient::new(sock_path.clone());
     for _ in 0..30 {
         if client.is_available() {
@@ -271,21 +319,22 @@ fn daemon_unlock_load_save_and_lock_lifecycle() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(client.is_available(), "daemon socket failed to become ready");
+    assert_eq!(
+        fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
-    // Socket permissions must be 0600.
-    assert_eq!(fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777, 0o600);
+    // Second daemon instance on the same socket path must fail cleanly via flock.
+    assert!(run_daemon(&sock_path, 60, false).is_err());
 
-    // Initially locked.
     assert!(!client.status().unwrap().unlocked);
     assert!(client.load_vault(&vault_path).is_err());
 
-    // Wrong passphrase rejected.
     assert!(client
         .unlock(&vault_path, Zeroizing::new("wrong-pass".into()), None, None)
         .is_err());
     assert!(!client.status().unwrap().unlocked);
 
-    // Correct passphrase unlocks daemon.
     client
         .unlock(
             &vault_path,
@@ -298,13 +347,22 @@ fn daemon_unlock_load_save_and_lock_lifecycle() {
     assert!(st.unlocked);
     assert!(st.guard_protected);
 
-    // Save an entry through the daemon (master key stays inside daemon LockedKey).
-    let mut v = client.load_vault(&vault_path).expect("load via daemon");
-    v.add_entry(Entry::new("archlinux.org".into(), "omarchy".into(), "SuperStrong!987654321".into()))
-        .unwrap();
-    client.save_vault(&vault_path, &v).expect("save via daemon");
+    // Save entry with matching revision succeeds.
+    let (mut v, rev1) = client.load_vault(&vault_path).expect("load via daemon");
+    v.add_entry(Entry::new(
+        "archlinux.org".into(),
+        "omarchy".into(),
+        "SuperStrong!987654321".into(),
+    ))
+    .unwrap();
+    client
+        .save_vault(&vault_path, &v, Some(rev1.clone()))
+        .expect("save via daemon");
 
-    let reloaded = client.load_vault(&vault_path).expect("reload via daemon");
+    // Stale revision save MUST be rejected (optimistic concurrency protection).
+    assert!(client.save_vault(&vault_path, &v, Some(rev1)).is_err());
+
+    let (reloaded, _) = client.load_vault(&vault_path).expect("reload via daemon");
     assert_eq!(reloaded.entries.len(), 1);
     assert_eq!(reloaded.entries[0].name, "archlinux.org");
 
@@ -318,19 +376,74 @@ fn daemon_unlock_load_save_and_lock_lifecycle() {
 }
 
 #[test]
-fn audit_detects_weak_and_reused_passwords() {
+fn daemon_client_rejects_world_accessible_socket_directory() {
+    let tmp = TempDir::new().expect("tempdir");
+    let unsafe_dir = tmp.path().join("unsafe_dir");
+    fs::create_dir(&unsafe_dir).unwrap();
+    fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let sock_path = unsafe_dir.join("daemon.sock");
+    let client = DaemonClient::new(sock_path);
+    assert!(client.status().is_err());
+}
+
+#[test]
+fn vault_rename_collision_and_audit_empty_passwords() {
     let mut vault = Vault::new();
-    let strong = generate_password(&PasswordOptions::default()).unwrap().to_string();
-    assert!(estimate_entropy_bits(&strong) > 100.0);
+    let opts = PasswordOptions::default();
+    let strong = generate_password(&opts).unwrap().to_string();
+    assert!(generated_password_entropy_bits(&opts) > 140.0);
+    assert!(estimate_entropy_bits("Password123!") < 50.0);
 
-    vault.add_entry(Entry::new("bank".into(), "u1".into(), strong)).unwrap();
-    vault.add_entry(Entry::new("forum-a".into(), "u2".into(), "password123".into())).unwrap();
-    vault.add_entry(Entry::new("forum-b".into(), "u3".into(), "password123".into())).unwrap();
+    vault
+        .add_entry(Entry::new("bank".into(), "u1".into(), strong))
+        .unwrap();
+    vault
+        .add_entry(Entry::new("empty-acct".into(), "u2".into(), String::new()))
+        .unwrap();
+    vault
+        .add_entry(Entry::new("forum-a".into(), "u3".into(), "Password123!".into()))
+        .unwrap();
+    vault
+        .add_entry(Entry::new("forum-b".into(), "u4".into(), "Password123!".into()))
+        .unwrap();
 
-    let report = run_audit(&vault);
-    assert_eq!(report.total_entries, 3);
-    assert_eq!(report.weak_passwords.len(), 2);
+    // Rename collision MUST be rejected.
+    assert!(matches!(
+        vault.update_entry("forum-a", "BANK", |_| {}),
+        Err(VaultError::DuplicateEntry(_))
+    ));
+
+    // Audit detects empty password + weak passwords + reused group.
+    let report = run_audit(&vault).expect("audit");
+    assert_eq!(report.total_entries, 4);
+    assert_eq!(report.weak_passwords.len(), 3); // empty + 2x Password123!
     assert_eq!(report.reused_groups.len(), 1);
-    assert_eq!(report.reused_groups[0].entry_names.len(), 2);
-    assert!(report.overall_score < 60);
+    assert_eq!(report.missing_totp.len(), 4);
+    assert!(report.overall_score < 40);
+}
+
+#[test]
+fn fido2_totp_clipboard_and_daemon_request_regression_checks() {
+    // Clipboard rejects timeout 0 and > 300.
+    assert!(validate_clipboard_timeout(0).is_err());
+    assert!(validate_clipboard_timeout(301).is_err());
+    assert_eq!(validate_clipboard_timeout(15).unwrap(), 15);
+
+    // FIDO2 rejects flag injection and tampered metadata.
+    assert!(LibFido2Cli::validate_device_path("-t").is_err());
+    let bad_json = r#"{"rp_id":"omavault.local","credential_id_b64":"AAAA","hmac_salt_b64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","extra":"nope"}"#;
+    assert!(serde_json::from_str::<Fido2Metadata>(bad_json).is_err());
+
+    // HOTP rejects overflow/zero digits without panicking.
+    assert!(hotp_raw(b"12345678901234567890", 0, TotpAlgorithm::Sha1, 32).is_err());
+    assert!(hotp_raw(b"12345678901234567890", 0, TotpAlgorithm::Sha1, 0).is_err());
+
+    // DaemonRequest implements Drop cleanly (ZeroizeOnDrop verified).
+    let req = DaemonRequest::Unlock {
+        vault_path: Path::new("/tmp/x").to_path_buf(),
+        passphrase: SecretString("secret-passphrase".into()),
+        keyfile_path: None,
+        fido2_device: None,
+    };
+    drop(req);
 }

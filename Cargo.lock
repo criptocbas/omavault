@@ -87,6 +87,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.2.17",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -94,6 +95,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "autocfg"
@@ -133,6 +137,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -783,12 +788,14 @@ dependencies = [
  "hkdf",
  "hmac",
  "libc",
+ "omavault",
  "ratatui",
  "rpassword",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
+ "signal-hook",
  "tempfile",
  "thiserror",
  "uuid",

@@ -1,32 +1,32 @@
 [Unit]
 Description=omavault auto-locking hardened password vault daemon
-Documentation=https://github.com/omarchy/omavault
+Documentation=https://github.com/criptocbas/omavault
+PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/omavault daemon --timeout 300
-ExecStop=%h/.local/bin/omavault lock
+ExecStop=%h/.local/bin/omavault stop-daemon
 Restart=on-failure
 RestartSec=2
 
-# Systemd sandboxing & defense-in-depth hardening
+# User-unit-effective seccomp & process hardening
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectControlGroups=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_UNIX
-ReadWritePaths=%h/.local/share/omavault %t
-# Allow sufficient locked memory (mlock) for master key pages + Argon2id
-LimitMEMLOCK=infinity
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+KeyringMode=private
+# AF_UNIX for local IPC socket + AF_NETLINK for libudev FIDO2 HID device discovery
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 LimitCORE=0
 UMask=0077
+# Note: unprivileged `systemd --user` cannot raise RLIMIT_MEMLOCK above the session
+# hard limit. If `omavault status` reports mlock=false, configure
+# `/etc/security/limits.d/99-omavault.conf` with `@wheel - memlock unlimited`.
 
 [Install]
 WantedBy=graphical-session.target

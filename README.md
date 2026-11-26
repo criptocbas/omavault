@@ -89,8 +89,8 @@ omavault
 ### 3. Scriptable CLI
 
 ```bash
-# Add an entry with generated 28-char password + 2FA TOTP
-omavault add github.com -u octocat --url https://github.com --totp "otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP" --generate --length 28 --copy
+# Add an entry with generated 28-char password + hidden 2FA TOTP prompt (never leaks to shell history)
+omavault add github.com -u octocat --url https://github.com --totp --generate --length 28 --copy
 
 # Copy password with paste-once mode (auto-wipes after 1 paste!)
 omavault get github.com --copy --paste-once
@@ -104,8 +104,8 @@ omavault gen --passphrase --words 10 --copy
 # Run local security audit
 omavault audit
 
-# Rotate master passphrase / upgrade Argon2id memory to 256 MiB / enroll FIDO2
-omavault rekey --mem-mib 256 --enable-fido2
+# Rotate master passphrase / upgrade Argon2id memory to 256 MiB / enroll FIDO2 & purge old-key backups
+omavault rekey --mem-mib 256 --enable-fido2 --purge-old-backups
 
 # Check hardening, crypto parameters, and daemon status
 omavault status

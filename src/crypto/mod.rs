@@ -23,8 +23,15 @@ const FIXED_HEADER_LEN: usize = 4 + 2 + 2 + 4 + 4 + 4 + 32 + 32 + 24 + 2; // 110
 const MAX_FIDO2_META_LEN: usize = 4096;
 /// Length-hiding padding block size (4 KiB).
 const PADDING_BLOCK_SIZE: usize = 4096;
+const AEAD_TAG_LEN: usize = 16;
 /// Upper bound on decrypted payload size (64 MiB) to guard against malformed inputs.
-const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+/// Maximum legal ciphertext size corresponding to `MAX_PAYLOAD_SIZE` padded + Poly1305 tag.
+pub const MAX_CIPHERTEXT_SIZE: usize =
+    (MAX_PAYLOAD_SIZE + 4).div_ceil(PADDING_BLOCK_SIZE) * PADDING_BLOCK_SIZE + AEAD_TAG_LEN;
+/// Maximum legal full vault file size (header + ciphertext).
+pub const MAX_VAULT_FILE_BYTES: u64 =
+    (FIXED_HEADER_LEN + MAX_FIDO2_META_LEN + MAX_CIPHERTEXT_SIZE) as u64;
 
 /// Authenticated header of an `OMAV` v1 encrypted vault file.
 ///
@@ -48,6 +55,9 @@ impl VaultHeader {
         use_keyfile: bool,
         fido2: Option<Fido2Metadata>,
     ) -> Result<Self> {
+        if let Some(meta) = &fido2 {
+            meta.validate()?;
+        }
         let mut kdf_salt = [0u8; 32];
         let mut save_salt = [0u8; 32];
         let mut nonce = [0u8; 24];
@@ -91,9 +101,27 @@ impl VaultHeader {
 
     /// Serialize header bytes (which also serve verbatim as AEAD AAD).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        if self.version != VAULT_VERSION {
+            return Err(VaultError::UnsupportedVersion(self.version));
+        }
+        if (self.flags & !KNOWN_FLAGS_MASK) != 0 {
+            return Err(VaultError::InvalidFormat(format!(
+                "unknown vault header flags: 0x{:04x}",
+                self.flags
+            )));
+        }
+        if self.requires_fido2() != self.fido2.is_some() {
+            return Err(VaultError::InvalidFormat(
+                "header FIDO2 flag does not match FIDO2 metadata presence".into(),
+            ));
+        }
+
         let fido2_bytes = match &self.fido2 {
-            Some(meta) => serde_json::to_vec(meta)
-                .map_err(|e| VaultError::Serialization(e.to_string()))?,
+            Some(meta) => {
+                meta.validate()?;
+                serde_json::to_vec(meta)
+                    .map_err(|e| VaultError::Serialization(e.to_string()))?
+            }
             None => Vec::new(),
         };
         if fido2_bytes.len() > MAX_FIDO2_META_LEN {
@@ -118,8 +146,11 @@ impl VaultHeader {
     }
 
     /// Parse header from a full vault blob and return `(header, header_byte_len)`.
+    ///
+    /// Enforces pre-authentication size bounds and validates FIDO2 metadata before
+    /// any expensive KDF or hardware authenticator interaction runs.
     pub fn parse(data: &[u8], enforce_kdf_policy: bool) -> Result<(Self, usize)> {
-        if data.len() < FIXED_HEADER_LEN + 16 {
+        if data.len() < FIXED_HEADER_LEN + PADDING_BLOCK_SIZE + AEAD_TAG_LEN {
             return Err(VaultError::InvalidFormat(
                 "vault file truncated or too small".into(),
             ));
@@ -149,6 +180,8 @@ impl VaultHeader {
         };
         if enforce_kdf_policy {
             kdf_params.validate()?;
+        } else {
+            kdf_params.validate_upper_bounds()?;
         }
 
         let mut kdf_salt = [0u8; 32];
@@ -166,9 +199,15 @@ impl VaultHeader {
         }
 
         let header_len = FIXED_HEADER_LEN + fido2_len;
-        if data.len() < header_len + 16 {
+        if data.len() < header_len + PADDING_BLOCK_SIZE + AEAD_TAG_LEN {
             return Err(VaultError::InvalidFormat(
                 "vault file truncated inside header/ciphertext".into(),
+            ));
+        }
+        let ct_len = data.len() - header_len;
+        if ct_len > MAX_CIPHERTEXT_SIZE || (ct_len - AEAD_TAG_LEN) % PADDING_BLOCK_SIZE != 0 {
+            return Err(VaultError::InvalidFormat(
+                "invalid vault ciphertext length or alignment".into(),
             ));
         }
 
@@ -180,7 +219,8 @@ impl VaultHeader {
                 ));
             }
             let meta: Fido2Metadata = serde_json::from_slice(&data[FIXED_HEADER_LEN..header_len])
-                .map_err(|e| VaultError::InvalidFormat(format!("corrupt FIDO2 metadata: {e}")))?;
+                .map_err(|_| VaultError::InvalidFormat("corrupt FIDO2 metadata".into()))?;
+            meta.validate()?;
             Some(meta)
         } else {
             if fido2_len != 0 {
@@ -221,12 +261,9 @@ pub fn seal_vault(
         ));
     }
 
-    // Rotate per-save salt and nonce before serializing AAD.
     header.rotate_save_material()?;
     let aad = header.to_bytes()?;
 
-    // Construct length-hiding random-padded frame:
-    // [4-byte LE real length][plaintext][random padding to 4096-byte boundary]
     let min_frame = 4 + plaintext.len();
     let padded_len = min_frame.div_ceil(PADDING_BLOCK_SIZE) * PADDING_BLOCK_SIZE;
     let mut frame = Zeroizing::new(vec![0u8; padded_len]);
@@ -282,13 +319,19 @@ pub fn open_vault(
             .map_err(|_| VaultError::AuthenticationFailed)?,
     );
 
-    if frame.len() < 4 {
-        return Err(VaultError::InvalidFormat("decrypted frame too short".into()));
+    if frame.len() < 4 || frame.len() % PADDING_BLOCK_SIZE != 0 {
+        return Err(VaultError::InvalidFormat("decrypted frame invalid alignment".into()));
     }
     let payload_len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
     if payload_len > MAX_PAYLOAD_SIZE || 4 + payload_len > frame.len() {
         return Err(VaultError::InvalidFormat(
             "invalid decrypted frame payload length".into(),
+        ));
+    }
+    let padding_len = frame.len() - (4 + payload_len);
+    if padding_len >= PADDING_BLOCK_SIZE {
+        return Err(VaultError::InvalidFormat(
+            "invalid decrypted frame padding length".into(),
         ));
     }
 

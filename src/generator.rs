@@ -11,8 +11,14 @@ const SYMBOLS: &[u8] = b"!@#$%^&*()-_=+[]{};:,.?/";
 /// Ambiguous characters excluded when `exclude_ambiguous` is set.
 const AMBIGUOUS: &[u8] = b"Il1O0|`'\"";
 
-/// Curated 256-word high-clarity Diceware wordlist (8 bits of entropy per word).
-/// 6 words = 48 bits, 8 words = 64 bits, 10 words = 80 bits (+ separator/digits).
+/// Common weak substrings penalized during offline password strength estimation.
+const COMMON_WEAK_PATTERNS: &[&str] = &[
+    "password", "passw0rd", "qwerty", "letmein", "admin", "welcome", "iloveyou",
+    "monkey", "dragon", "baseball", "football", "shadow", "master", "trustno1",
+    "abc123", "123456", "654321", "000000", "111111", "correct", "horse", "battery", "staple",
+];
+
+/// Curated 256-word high-clarity Diceware wordlist (8.0 bits of entropy per word).
 const WORDLIST: &[&str] = &[
     "abacus", "acorn", "admiral", "agate", "albatross", "alchemy", "alder", "almond",
     "alpine", "amber", "anchor", "anemone", "antler", "anvil", "apricot", "archway",
@@ -91,7 +97,7 @@ impl Default for PassphraseOptions {
 }
 
 /// Draw a uniform random `usize` in `0..upper` using CSPRNG rejection sampling
-/// (strictly zero modulo bias).
+/// (strictly zero modulo bias) with zeroized stack RNG buffer.
 fn csprng_index(upper: usize) -> Result<usize> {
     if upper == 0 {
         return Err(VaultError::Crypto("empty alphabet for generator".into()));
@@ -101,19 +107,21 @@ fn csprng_index(upper: usize) -> Result<usize> {
     }
     let upper_u64 = upper as u64;
     let zone = u64::MAX - (u64::MAX % upper_u64);
-    let mut buf = [0u8; 8];
+    let mut buf = Zeroizing::new([0u8; 8]);
     loop {
-        fill_random(&mut buf)?;
-        let candidate = u64::from_le_bytes(buf);
+        fill_random(&mut *buf)?;
+        let candidate = u64::from_le_bytes(*buf);
         if candidate < zone {
             return Ok((candidate % upper_u64) as usize);
         }
     }
 }
 
-/// Generate a high-entropy random password using OS CSPRNG + unbiased rejection sampling.
-/// Guarantees at least one character from each enabled character class, then performs a
-/// CSPRNG Fisher-Yates shuffle.
+/// Generate a high-entropy random password using unbiased uniform rejection sampling over
+/// the full enabled alphabet until every enabled character class is represented.
+///
+/// Unlike forced-first-char + shuffle, pure rejection sampling produces an exact uniform
+/// distribution over all valid passwords with zero class-frequency bias.
 pub fn generate_password(opts: &PasswordOptions) -> Result<Zeroizing<String>> {
     if opts.length < 8 || opts.length > 256 {
         return Err(VaultError::InvalidFormat(
@@ -156,44 +164,65 @@ pub fn generate_password(opts: &PasswordOptions) -> Result<Zeroizing<String>> {
     }
 
     let mut chars: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(opts.length));
-
-    // Guarantee at least one character from each enabled class.
-    for class in &classes {
-        if chars.len() < opts.length {
-            let idx = csprng_index(class.len())?;
-            chars.push(class[idx]);
+    loop {
+        chars.clear();
+        for _ in 0..opts.length {
+            let idx = csprng_index(full_alphabet.len())?;
+            chars.push(full_alphabet[idx]);
+        }
+        let all_present = classes
+            .iter()
+            .all(|class| chars.iter().any(|ch| class.contains(ch)));
+        if all_present {
+            break;
         }
     }
 
-    // Fill remainder uniformly from full alphabet.
-    while chars.len() < opts.length {
-        let idx = csprng_index(full_alphabet.len())?;
-        chars.push(full_alphabet[idx]);
-    }
-
-    // CSPRNG Fisher-Yates shuffle so guaranteed class positions are unpredictable.
-    for i in (1..chars.len()).rev() {
-        let j = csprng_index(i + 1)?;
-        chars.swap(i, j);
-    }
-
-    let password = String::from_utf8(chars.to_vec())
+    let owned = std::mem::take(&mut *chars);
+    let password = String::from_utf8(owned)
         .map_err(|_| VaultError::Crypto("non-UTF8 generated password".into()))?;
     Ok(Zeroizing::new(password))
 }
 
-/// Generate a Diceware-style memorable passphrase using OS CSPRNG.
+/// Exact mathematical entropy (in bits) of a password generated with `opts`.
+pub fn generated_password_entropy_bits(opts: &PasswordOptions) -> f64 {
+    let count_class = |class: &[u8]| -> usize {
+        class
+            .iter()
+            .filter(|c| !opts.exclude_ambiguous || !AMBIGUOUS.contains(c))
+            .count()
+    };
+    let mut pool = 0usize;
+    if opts.lowercase {
+        pool += count_class(LOWER);
+    }
+    if opts.uppercase {
+        pool += count_class(UPPER);
+    }
+    if opts.digits {
+        pool += count_class(DIGITS);
+    }
+    if opts.symbols {
+        pool += count_class(SYMBOLS);
+    }
+    if pool <= 1 {
+        return 0.0;
+    }
+    (opts.length as f64) * (pool as f64).log2()
+}
+
+/// Generate a Diceware-style memorable passphrase using OS CSPRNG with zeroized intermediates.
 pub fn generate_passphrase(opts: &PassphraseOptions) -> Result<Zeroizing<String>> {
-    if opts.words < 4 || opts.words > 24 {
+    if opts.words < 6 || opts.words > 24 {
         return Err(VaultError::InvalidFormat(
-            "passphrase word count must be between 4 and 24".into(),
+            "passphrase word count must be between 6 and 24 (recommend >= 8)".into(),
         ));
     }
 
-    let mut parts: Vec<String> = Vec::with_capacity(opts.words);
+    let mut parts: Vec<Zeroizing<String>> = Vec::with_capacity(opts.words);
     for _ in 0..opts.words {
         let idx = csprng_index(WORDLIST.len())?;
-        let mut word = WORDLIST[idx].to_string();
+        let mut word = Zeroizing::new(WORDLIST[idx].to_string());
         if opts.capitalize {
             if let Some(first) = word.get_mut(0..1) {
                 first.make_ascii_uppercase();
@@ -205,10 +234,20 @@ pub fn generate_passphrase(opts: &PassphraseOptions) -> Result<Zeroizing<String>
     if opts.include_number {
         let target = csprng_index(parts.len())?;
         let num = csprng_index(100)?;
-        parts[target].push_str(&format!("{num:02}"));
+        let suffix = Zeroizing::new(format!("{num:02}"));
+        parts[target].push_str(&suffix);
     }
 
-    Ok(Zeroizing::new(parts.join(&opts.separator)))
+    let total_len: usize = parts.iter().map(|p| p.len()).sum::<usize>()
+        + opts.separator.len() * opts.words.saturating_sub(1);
+    let mut joined = Zeroizing::new(String::with_capacity(total_len));
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            joined.push_str(&opts.separator);
+        }
+        joined.push_str(part);
+    }
+    Ok(joined)
 }
 
 /// Exact mathematical Shannon entropy (in bits) of a Diceware passphrase generated
@@ -221,11 +260,13 @@ pub fn passphrase_entropy_bits(opts: &PassphraseOptions) -> f64 {
     bits
 }
 
-/// Estimate password entropy in bits based on observed character pool size and length.
+/// Estimate password entropy in bits with conservative penalties for common patterns,
+/// sequential runs, years, and low character diversity (zeroizes temporary char buffers).
 pub fn estimate_entropy_bits(password: &str) -> f64 {
     if password.is_empty() {
         return 0.0;
     }
+
     let mut has_lower = false;
     let mut has_upper = false;
     let mut has_digit = false;
@@ -257,7 +298,7 @@ pub fn estimate_entropy_bits(password: &str) -> f64 {
         pool += 10.0;
     }
     if has_symbol {
-        pool += 32.0;
+        pool += SYMBOLS.len() as f64; // accurate 24-symbol pool
     }
     if has_non_ascii {
         pool += 64.0;
@@ -266,21 +307,61 @@ pub fn estimate_entropy_bits(password: &str) -> f64 {
         return 0.0;
     }
 
-    // Penalize obvious repetition (e.g., "aaaaaaaaaaaa").
-    let unique_chars = {
-        let mut chars: Vec<char> = password.chars().collect();
-        chars.sort_unstable();
-        chars.dedup();
-        chars.len()
-    };
-    let effective_len = (password.chars().count() as f64)
-        .min((unique_chars as f64) * 2.5);
+    let mut chars = Zeroizing::new(password.chars().collect::<Vec<char>>());
+    let char_len = chars.len();
 
-    effective_len * pool.log2()
+    // Count sequential/repeated transitions (e.g. "abcd", "1234", "aaaa").
+    let mut non_sequential_transitions = 1usize;
+    for win in chars.windows(2) {
+        let a = win[0] as i32;
+        let b = win[1] as i32;
+        let diff = (b - a).abs();
+        if diff > 1 {
+            non_sequential_transitions += 1;
+        }
+    }
+
+    chars.sort_unstable();
+    chars.dedup();
+    let unique_chars = chars.len();
+    drop(chars);
+
+    let effective_len = (char_len as f64)
+        .min((unique_chars as f64) * 2.0)
+        .min((non_sequential_transitions as f64) * 1.5);
+
+    let mut bits = effective_len * pool.log2();
+
+    // Penalize common dictionary/keyboard patterns (case-insensitive & basic leetspeak).
+    let normalized = Zeroizing::new(
+        password
+            .chars()
+            .map(|c| match c.to_ascii_lowercase() {
+                '@' => 'a',
+                '0' => 'o',
+                '1' | '!' => 'i',
+                '3' => 'e',
+                '$' | '5' => 's',
+                '7' => 't',
+                other => other,
+            })
+            .collect::<String>(),
+    );
+    let lower = Zeroizing::new(password.to_ascii_lowercase());
+    for pat in COMMON_WEAK_PATTERNS {
+        if lower.contains(pat) || normalized.contains(pat) {
+            bits *= 0.45;
+            break;
+        }
+    }
+
+    bits
 }
 
 pub fn strength_label(bits: f64) -> &'static str {
-    if bits < 40.0 {
+    if bits <= 0.0 {
+        "EMPTY"
+    } else if bits < 40.0 {
         "WEAK"
     } else if bits < 60.0 {
         "FAIR"
@@ -306,13 +387,27 @@ mod tests {
         assert!(pw.chars().any(|c| c.is_ascii_uppercase()));
         assert!(pw.chars().any(|c| c.is_ascii_digit()));
         assert!(pw.chars().any(|c| SYMBOLS.contains(&(c as u8))));
-        assert!(estimate_entropy_bits(&pw) >= 100.0);
+        assert!(generated_password_entropy_bits(&opts) >= 140.0);
     }
 
     #[test]
-    fn generates_diceware_passphrase() {
+    fn generates_diceware_passphrase_and_rejects_short() {
         assert_eq!(WORDLIST.len(), 256);
         let phrase = generate_passphrase(&PassphraseOptions::default()).expect("passphrase");
         assert_eq!(phrase.split('-').count(), 8);
+
+        assert!(generate_passphrase(&PassphraseOptions {
+            words: 4,
+            ..PassphraseOptions::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn penalizes_common_weak_passwords_accurately() {
+        assert!(estimate_entropy_bits("Password123!") < 50.0);
+        assert!(estimate_entropy_bits("P@ssw0rd2024!") < 50.0);
+        assert!(estimate_entropy_bits("1234567890Ab!") < 50.0);
+        assert_eq!(strength_label(estimate_entropy_bits("")), "EMPTY");
     }
 }
