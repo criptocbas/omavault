@@ -1,0 +1,54 @@
+[package]
+name = "omavault"
+version = "0.1.0"
+edition = "2021"
+description = "Bulletproof, memory-hardened password manager crafted for Omarchy Linux (Arch + Hyprland + Wayland)"
+license = "MIT"
+rust-version = "1.80"
+
+[[bin]]
+name = "omavault"
+path = "src/main.rs"
+
+[dependencies]
+# Audited cryptography (RustCrypto + BLAKE3)
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+blake3 = "1.8"
+zeroize = { version = "1.8", features = ["derive"] }
+getrandom = "0.2"
+
+# Encoding & Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+data-encoding = "2.6"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI & TUI
+clap = { version = "4.5", features = ["derive", "env"] }
+ratatui = "0.29"
+crossterm = "0.28"
+rpassword = "7.3"
+
+# OS & Wayland integration
+libc = "0.2"
+wl-clipboard-rs = "0.9.5"
+directories = "6.0"
+
+# Errors
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

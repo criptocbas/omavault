@@ -1,0 +1,32 @@
+[Unit]
+Description=omavault auto-locking hardened password vault daemon
+Documentation=https://github.com/omarchy/omavault
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omavault daemon --timeout 300
+ExecStop=%h/.local/bin/omavault lock
+Restart=on-failure
+RestartSec=2
+
+# Systemd sandboxing & defense-in-depth hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=%h/.local/share/omavault %t
+# Allow sufficient locked memory (mlock) for master key pages + Argon2id
+LimitMEMLOCK=infinity
+LimitCORE=0
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

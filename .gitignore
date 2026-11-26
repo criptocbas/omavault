@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.omav
+*.omav.bak.*
+*.key
+.env
