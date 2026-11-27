@@ -40,8 +40,9 @@ use crate::tui::{run_tui, TuiConfig};
 use crate::vault::audit::run_audit;
 use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault};
 use crate::vault::storage::{
-    create_new_vault_on_disk, default_vault_path, generate_keyfile, load_vault_from_disk,
-    purge_encrypted_backups, read_header_from_disk, save_vault_to_disk_checked, verify_saved_vault,
+    create_new_vault_on_disk, default_vault_path, ensure_private_dir, generate_keyfile,
+    load_vault_from_disk, purge_encrypted_backups, read_header_from_disk,
+    save_vault_to_disk_checked, verify_saved_vault,
 };
 use crate::vault::{Entry, Vault};
 
@@ -1165,6 +1166,18 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     vault_path.display().to_string(),
                 ));
             }
+            // Same parent rule as `create_new_vault_on_disk`, checked before any
+            // prompt so a bad destination fails without a passphrase or YubiKey touch.
+            let parent = match vault_path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                Some(_) => Path::new("."),
+                None => {
+                    return Err(VaultError::InvalidFormat(
+                        "path has no parent directory".into(),
+                    ));
+                }
+            };
+            ensure_private_dir(parent)?;
             if fido2 {
                 validate_slot_label(&fido2_label)?;
             }

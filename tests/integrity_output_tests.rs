@@ -315,6 +315,32 @@ fn omavault(home: &Path, vault: &Path, args: &[&str], stdin: &str) -> std::proce
 
 const E2E_PASS: &str = "phase3-e2e-passphrase";
 
+/// `init` must refuse a world-writable parent before it reads a passphrase.
+/// Empty stdin would otherwise surface as "unexpected EOF", which does not name the directory.
+#[test]
+fn e2e_init_refuses_world_writable_parent_before_reading_stdin() {
+    let home = TempDir::new().unwrap();
+    let parent = TempDir::new().unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    let vault = parent.path().join("vault.omav");
+    let out = omavault(home.path(), &vault, &["init"], "");
+    assert!(
+        !out.status.success(),
+        "init into a world-writable directory must fail"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    let dir = parent.path().display().to_string();
+    assert!(
+        err.contains(&dir),
+        "error must name the directory before any prompt: {err}"
+    );
+    assert!(
+        !err.contains("unexpected EOF") && !err.contains("at least 10"),
+        "init must not read the passphrase first: {err}"
+    );
+    assert!(!vault.exists(), "refused init must not create a vault");
+}
+
 fn e2e_init(home: &Path, vault: &Path) {
     let out = omavault(
         home,
