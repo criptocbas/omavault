@@ -8,13 +8,14 @@ cd "${REPO_ROOT}"
 echo "==> Building omavault (release, locked, LTO, hardened)..."
 cargo build --release --locked
 
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
 HYPR_DIR="${HOME}/.config/hypr"
 
 mkdir -p "${BIN_DIR}" "${SYSTEMD_DIR}" "${HYPR_DIR}"
 
-install -m 0700 target/release/omavault "${BIN_DIR}/omavault"
+install -m 0700 "${TARGET_DIR}/release/omavault" "${BIN_DIR}/omavault"
 echo "==> Installed binary to ${BIN_DIR}/omavault (0700)"
 
 install -m 0600 omarchy/omavaultd.service "${SYSTEMD_DIR}/omavaultd.service"

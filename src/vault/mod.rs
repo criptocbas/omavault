@@ -139,20 +139,48 @@ impl Entry {
         // When unchanged, `new_password` (Zeroizing<String>) is automatically zeroized on drop.
     }
 
-    /// Case-insensitive fuzzy/substring match across name, username, URL, and tags.
+    /// Zeroize previous sensitive notes in place before replacing them.
+    pub fn set_notes(&mut self, mut new_notes: Zeroizing<String>) {
+        self.notes.zeroize();
+        self.notes = std::mem::take(&mut *new_notes);
+    }
+
+    /// Zeroize previous username before replacing.
+    pub fn set_username(&mut self, new_username: String) {
+        self.username.zeroize();
+        self.username = new_username;
+    }
+
+    /// Zeroize previous URL before replacing.
+    pub fn set_url(&mut self, new_url: String) {
+        self.url.zeroize();
+        self.url = new_url;
+    }
+
+    /// Allocation-free ASCII case-insensitive substring match across name, username, URL, and tags.
     pub fn matches_query(&self, query: &str) -> bool {
-        let q = query.trim().to_ascii_lowercase();
+        let q = query.trim();
         if q.is_empty() {
             return true;
         }
-        self.name.to_ascii_lowercase().contains(&q)
-            || self.username.to_ascii_lowercase().contains(&q)
-            || self.url.to_ascii_lowercase().contains(&q)
-            || self
-                .tags
-                .iter()
-                .any(|t| t.to_ascii_lowercase().contains(&q))
+        contains_ascii_icase(&self.name, q)
+            || contains_ascii_icase(&self.username, q)
+            || contains_ascii_icase(&self.url, q)
+            || self.tags.iter().any(|t| contains_ascii_icase(t, q))
     }
+}
+
+fn contains_ascii_icase(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if n.len() > h.len() {
+        return false;
+    }
+    h.windows(n.len())
+        .any(|win| win.iter().zip(n.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)))
 }
 
 /// Top-level decrypted vault structure. Automatically zeroizes all secrets on Drop.

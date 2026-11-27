@@ -12,7 +12,7 @@ use omavault::crypto::kdf::{
     derive_master_key, derive_passphrase_hash, hash_keyfile, KdfParams,
 };
 use omavault::crypto::{
-    generate_random_master_key, open_vault, resolve_master_key, seal_vault,
+    generate_random_master_key, header_revision, open_vault, resolve_master_key, seal_vault,
     wrap_master_key_for_slot, VaultHeader, VAULT_VERSION_V2,
 };
 use omavault::daemon::{run_daemon, DaemonClient, DaemonRequest, SecretString};
@@ -20,12 +20,12 @@ use omavault::error::VaultError;
 use omavault::generator::{
     estimate_entropy_bits, generate_password, generated_password_entropy_bits, PasswordOptions,
 };
-use omavault::hardening::harden_process;
+use omavault::hardening::{harden_process, sanitize_multiline, sanitize_single_line};
 use omavault::totp::{hotp_raw, TotpAlgorithm, TotpConfig};
 use omavault::vault::audit::run_audit;
 use omavault::vault::storage::{
     ensure_private_dir_strict, generate_keyfile, load_vault_from_disk, purge_encrypted_backups,
-    save_vault_to_disk,
+    save_vault_to_disk, save_vault_to_disk_checked,
 };
 use omavault::vault::{Entry, Vault};
 use tempfile::TempDir;
@@ -550,4 +550,64 @@ fn omav_v2_multi_yubikey_slots_unlock_tamper_and_revocation() {
 
     let err_revoked = resolve_master_key(&parsed_revoked, passphrase, None, &key2, None, false);
     assert!(matches!(err_revoked, Err(VaultError::Fido2NoMatchingCredential)));
+}
+
+#[test]
+fn v03_audit_regressions_utf8_totp_keyfile_eexist_sanitizer_and_checked_save() {
+    // M-3: Multi-byte UTF-8 input where byte 10 is inside a char must return Err, never panic.
+    assert!(TotpConfig::parse("aéééééééé").is_err());
+    assert!(TotpConfig::parse("🔐🔐🔐🔐").is_err());
+
+    // M-5: Display sanitizers strip ANSI/OSC-52 escapes, BiDi overrides, and zero-width chars.
+    let hostile = "bank\x1b]52;c;cHdu\x07\u{202E}moc.live\u{200B}\nline2";
+    let single = sanitize_single_line(hostile);
+    assert!(!single.contains('\x1b'));
+    assert!(!single.contains('\u{202E}'));
+    assert!(!single.contains('\u{200B}'));
+    assert!(!single.contains('\n'));
+    let multi = sanitize_multiline(hostile);
+    assert!(!multi.contains('\x1b'));
+    assert!(!multi.contains('\u{202E}'));
+    assert!(multi.contains('\n'));
+
+    // M-10: generate_keyfile on EEXIST MUST NOT delete the pre-existing keyfile.
+    let tmp = TempDir::new().expect("tempdir");
+    let kf = tmp.path().join("omavault_private").join("existing.key");
+    generate_keyfile(&kf).expect("first keyfile");
+    let original_bytes = fs::read(&kf).expect("read original");
+    let err = generate_keyfile(&kf).unwrap_err();
+    assert!(matches!(err, VaultError::VaultAlreadyExists(_)));
+    assert_eq!(fs::read(&kf).expect("must still exist"), original_bytes);
+
+    // M-10: hash_keyfile rejects group/world-readable keyfiles.
+    fs::set_permissions(&kf, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(hash_keyfile(&kf), Err(VaultError::Hardening(_))));
+    fs::set_permissions(&kf, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(hash_keyfile(&kf).is_ok());
+
+    // H-5: save_vault_to_disk_checked rejects stale revision under FileLockGuard.
+    let vault_path = tmp.path().join("omavault_private").join("checked.omav");
+    let params = fast_params();
+    let mut hdr = VaultHeader::new(params, false, None).expect("hdr");
+    let mk = derive_master_key(b"checked-save-pass!", &hdr.kdf_salt, params, None, None, false)
+        .expect("mk");
+    let v1 = Vault::new();
+    save_vault_to_disk(&vault_path, &mk, &mut hdr, &v1).expect("save 1");
+    let stale_rev = header_revision(&hdr);
+    save_vault_to_disk_checked(&vault_path, &mk, &mut hdr, &v1, Some(&stale_rev), false, true)
+        .expect("save 2 with matching revision");
+    // Re-using stale_rev MUST fail.
+    assert!(save_vault_to_disk_checked(
+        &vault_path,
+        &mk,
+        &mut hdr,
+        &v1,
+        Some(&stale_rev),
+        false,
+        true
+    )
+    .is_err());
+
+    // L-2: validate_device_path rejects non-hidraw /dev devices like /dev/null.
+    assert!(LibFido2Cli::validate_device_path("/dev/null").is_err());
 }

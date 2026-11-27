@@ -10,9 +10,9 @@ Offset   Size   Field            Notes
 0        4      magic            ASCII "OMAV"
 4        2      version          u16 LE (1 = direct KDF, 2 = multi-YubiKey FIDO2 key slots)
 6        2      flags            u16 LE (bit 0 = keyfile, bit 1 = FIDO2)
-8        4      argon2_mem_kib   u32 LE (default 131072 = 128 MiB, floor 65536)
-12       4      argon2_time      u32 LE (default 4, floor 3, max 64)
-16       4      argon2_lanes     u32 LE (default 4, floor 1, max 64)
+8        4      argon2_mem_kib   u32 LE (default 131072 = 128 MiB, floor 65536, max 1048576)
+12       4      argon2_time      u32 LE (default 4, floor 3, max 16)
+16       4      argon2_lanes     u32 LE (default 4, floor 1, max 16)
 20       32     kdf_salt         OS CSPRNG (rotated on init & rekey)
 52       32     save_salt        OS CSPRNG (freshly rotated on EVERY save)
 84       24     nonce            OS CSPRNG 192-bit XChaCha20-Poly1305 nonce (fresh per save)

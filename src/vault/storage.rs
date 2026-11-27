@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use zeroize::Zeroizing;
 
-use crate::crypto::{open_vault, seal_vault, VaultHeader, MAX_VAULT_FILE_BYTES};
+use crate::crypto::{header_revision, open_vault, seal_vault, VaultHeader, MAX_VAULT_FILE_BYTES};
 use crate::error::{Result, VaultError};
-use crate::hardening::{fill_random, LockedKey};
+use crate::hardening::{fill_random, CountingWriter, LockedKey};
 use crate::vault::Vault;
 
 const MAX_BACKUPS: usize = 5;
@@ -48,10 +48,8 @@ fn resolve_parent(path: &Path) -> Result<&Path> {
 }
 
 /// Ensure a dedicated private directory exists without following symlinks (`O_NOFOLLOW`),
-/// verifying ownership by current `euid`, and applying `fchmod(0o700)` on the open fd.
-///
-/// If `chmod_existing` is `false`, pre-existing generic directories (like `$HOME`) are verified
-/// to be real non-symlink directories owned by `euid` without mutating their permissions.
+/// verifying ownership by current `euid`, rejecting group/world-writable directories,
+/// and applying `fchmod(0o700)` on the open fd when creating or enforcing dedicated dirs.
 pub fn ensure_private_dir_strict(dir: &Path, chmod_existing: bool) -> Result<()> {
     let created = if !dir.exists() {
         fs::DirBuilder::new()
@@ -71,7 +69,10 @@ pub fn ensure_private_dir_strict(dir: &Path, chmod_existing: bool) -> Result<()>
         .map_err(|e| {
             VaultError::Io(std::io::Error::new(
                 e.kind(),
-                format!("private directory '{}' rejected (symlink or inaccessible): {e}", dir.display()),
+                format!(
+                    "private directory '{}' rejected (symlink or inaccessible): {e}",
+                    dir.display()
+                ),
             ))
         })?;
 
@@ -89,6 +90,12 @@ pub fn ensure_private_dir_strict(dir: &Path, chmod_existing: bool) -> Result<()>
         if rc != 0 {
             return Err(VaultError::Io(std::io::Error::last_os_error()));
         }
+    } else if (meta.mode() & 0o022) != 0 {
+        return Err(VaultError::Hardening(format!(
+            "directory '{}' is group/world-writable (mode {:04o})",
+            dir.display(),
+            meta.mode() & 0o7777
+        )));
     }
 
     Ok(())
@@ -96,8 +103,6 @@ pub fn ensure_private_dir_strict(dir: &Path, chmod_existing: bool) -> Result<()>
 
 /// Ensure a dedicated `omavault` directory exists with strict `0o700` owner-only permissions.
 pub fn ensure_private_dir(dir: &Path) -> Result<()> {
-    // Only enforce chmod 0700 on newly created dirs or dirs explicitly named/containing omavault;
-    // never unexpectedly chmod a user's $HOME or /tmp mount root.
     let is_dedicated = dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -118,8 +123,20 @@ impl FileLockGuard {
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&lock_path)?;
+        let meta = file.metadata()?;
+        let my_uid = unsafe { libc::geteuid() };
+        if !meta.file_type().is_file() || meta.uid() != my_uid {
+            return Err(VaultError::Hardening(format!(
+                "lock file '{}' is not a regular file owned by current user",
+                lock_path.display()
+            )));
+        }
+        let rc_chmod = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+        if rc_chmod != 0 {
+            return Err(VaultError::Io(std::io::Error::last_os_error()));
+        }
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
             return Err(VaultError::Io(std::io::Error::last_os_error()));
@@ -132,6 +149,29 @@ impl Drop for FileLockGuard {
     fn drop(&mut self) {
         unsafe {
             let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// RAII temp-file guard that unlinks the temporary path on any error or unwind unless disarmed.
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = fs::remove_file(p);
         }
     }
 }
@@ -162,35 +202,38 @@ fn atomic_write_unlocked(
     let hex_suffix: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
 
     let mut tmp_name = OsString::from(".");
-    tmp_name.push(path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("vault.omav")));
+    tmp_name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("vault.omav")),
+    );
     tmp_name.push(format!(".tmp.{hex_suffix}"));
     let tmp_path = parent.join(tmp_name);
 
-    let write_result = (|| -> Result<()> {
-        let mut tmp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp_path)?;
-        tmp_file.write_all(data)?;
-        tmp_file.sync_all()?;
-        Ok(())
-    })();
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp_path)?;
+    let mut tmp_guard = TempFileGuard::new(tmp_path.clone());
 
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
+    tmp_file.write_all(data)?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+
+    if create_backup {
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if !meta.file_type().is_file() {
+                return Err(VaultError::InvalidFormat(
+                    "refusing to back up symlink or non-regular vault path".into(),
+                ));
+            }
+            rotate_encrypted_backup(path, parent)?;
+        }
     }
 
-    if create_backup && path.exists() {
-        rotate_encrypted_backup(path, parent)?;
-    }
-
-    if let Err(e) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(VaultError::Io(e));
-    }
+    fs::rename(&tmp_path, path)?;
+    tmp_guard.disarm();
 
     if let Ok(dir_file) = OpenOptions::new()
         .read(true)
@@ -205,7 +248,11 @@ fn atomic_write_unlocked(
 
 /// Keep up to `MAX_BACKUPS` encrypted rolling backups (`vault.omav.bak.1`..`.5`) atomically
 /// with `0o600` permissions and UTF-8-safe `OsString` paths (never follows symlinks).
+///
+/// Reads `path` FIRST so a read error can never shift/destroy `.bak.5`.
 fn rotate_encrypted_backup(path: &Path, parent: &Path) -> Result<()> {
+    let existing = read_bounded_regular_file(path, MAX_VAULT_FILE_BYTES)?;
+
     for i in (1..MAX_BACKUPS).rev() {
         let src = append_os_suffix(path, &format!(".bak.{i}"));
         let dst = append_os_suffix(path, &format!(".bak.{}", i + 1));
@@ -214,15 +261,17 @@ fn rotate_encrypted_backup(path: &Path, parent: &Path) -> Result<()> {
         }
     }
 
-    let existing = read_bounded_regular_file(path, MAX_VAULT_FILE_BYTES)?;
     let bak1 = append_os_suffix(path, ".bak.1");
     atomic_write_unlocked(&bak1, parent, &existing, false)?;
     Ok(())
 }
 
-/// Remove all encrypted rolling backup files (`vault.omav.bak.1`..`.5`) — used during `rekey`
+/// Remove all encrypted rolling backup files (`vault.omav.bak.1`..`.5`) under exclusive `flock`
 /// so vaults encrypted under a compromised old master key do not linger on disk.
 pub fn purge_encrypted_backups(path: &Path) -> Result<usize> {
+    let parent = resolve_parent(path)?;
+    ensure_private_dir(parent)?;
+    let _lock = FileLockGuard::acquire(path)?;
     let mut removed = 0usize;
     for i in 1..=MAX_BACKUPS {
         let bak = append_os_suffix(path, &format!(".bak.{i}"));
@@ -234,16 +283,20 @@ pub fn purge_encrypted_backups(path: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-/// Read a regular file with strict `is_file()` verification and an upper byte cap
-/// (prevents infinite hangs/OOM on `/dev/zero`, FIFOs, or sockets).
+/// Read a regular file with `O_NONBLOCK | O_NOFOLLOW`, strict `is_file()` verification, and
+/// an upper byte cap (prevents infinite blocking on FIFOs, symlink following, and OOM).
 fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    let file = File::open(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            VaultError::VaultNotFound(path.display().to_string())
-        } else {
-            VaultError::Io(e)
-        }
-    })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                VaultError::VaultNotFound(path.display().to_string())
+            } else {
+                VaultError::Io(e)
+            }
+        })?;
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(VaultError::InvalidFormat(
@@ -273,21 +326,56 @@ pub fn read_header_from_disk(path: &Path, enforce_kdf_policy: bool) -> Result<Va
     Ok(header)
 }
 
-/// Serialize into a pre-allocated zeroizing buffer, encrypt (rotating `save_salt` + `nonce`),
-/// and atomically save the vault.
+/// Serialize `vault` into an exact-size `Zeroizing<Vec<u8>>` without intermediate `Vec` reallocations.
+fn serialize_vault_exact(vault: &Vault) -> Result<Zeroizing<Vec<u8>>> {
+    let mut counter = CountingWriter::default();
+    serde_json::to_writer(&mut counter, vault)
+        .map_err(|_| VaultError::Serialization("failed measuring vault payload".into()))?;
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(counter.bytes));
+    serde_json::to_writer(&mut *plaintext, vault)
+        .map_err(|_| VaultError::Serialization("failed serializing vault".into()))?;
+    Ok(plaintext)
+}
+
+/// Atomically verify `expected_revision` (when provided), serialize without realloc copies,
+/// seal (rotating `save_salt` + `nonce`), and write to disk under ONE exclusive `flock(LOCK_EX)`.
+pub fn save_vault_to_disk_checked(
+    path: &Path,
+    master_key: &LockedKey<32>,
+    header: &mut VaultHeader,
+    vault: &Vault,
+    expected_revision: Option<&str>,
+    enforce_kdf_policy: bool,
+    create_backup: bool,
+) -> Result<()> {
+    let parent = resolve_parent(path)?;
+    ensure_private_dir(parent)?;
+    let _lock = FileLockGuard::acquire(path)?;
+
+    if let Some(expected) = expected_revision {
+        let disk_hdr = read_header_from_disk(path, enforce_kdf_policy)?;
+        if header_revision(&disk_hdr) != expected {
+            return Err(VaultError::Daemon(
+                "vault was modified concurrently on disk; reload and retry".into(),
+            ));
+        }
+        *header = disk_hdr;
+    }
+
+    let plaintext = serialize_vault_exact(vault)?;
+    let blob = seal_vault(master_key, header, &plaintext)?;
+    atomic_write_unlocked(path, parent, &blob, create_backup)
+}
+
+/// Serialize into an exact-size zeroizing buffer, encrypt (rotating `save_salt` + `nonce`),
+/// and atomically save the vault with rolling backups.
 pub fn save_vault_to_disk(
     path: &Path,
     master_key: &LockedKey<32>,
     header: &mut VaultHeader,
     vault: &Vault,
 ) -> Result<()> {
-    // Pre-allocate generous capacity to minimize heap reallocations of plaintext JSON.
-    let estimated = 4096usize.saturating_add(vault.entries.len().saturating_mul(512));
-    let mut plaintext = Zeroizing::new(Vec::with_capacity(estimated));
-    serde_json::to_writer(&mut *plaintext, vault)
-        .map_err(|_| VaultError::Serialization("failed serializing vault".into()))?;
-    let blob = seal_vault(master_key, header, &plaintext)?;
-    atomic_write_private(path, &blob)
+    save_vault_to_disk_checked(path, master_key, header, vault, None, false, true)
 }
 
 /// Read, authenticate, decrypt, and deserialize a vault from disk.
@@ -304,36 +392,37 @@ pub fn load_vault_from_disk(
 }
 
 /// Generate a high-entropy 64-byte (512-bit) cryptographic keyfile with `0o600` permissions,
-/// cleaning up partial files on error and syncing the parent directory.
+/// atomically refusing to overwrite (or delete!) any pre-existing keyfile on `EEXIST`.
 pub fn generate_keyfile(path: &Path) -> Result<()> {
-    if fs::symlink_metadata(path).is_ok() {
-        return Err(VaultError::VaultAlreadyExists(format!(
-            "refusing to overwrite existing keyfile at {}",
-            path.display()
-        )));
-    }
     let mut secret = Zeroizing::new([0u8; 64]);
     fill_random(&mut *secret)?;
 
     let parent = resolve_parent(path)?;
     ensure_private_dir(parent)?;
 
-    let write_res = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        file.write_all(&*secret)?;
-        file.sync_all()?;
-        Ok(())
-    })();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                VaultError::VaultAlreadyExists(format!(
+                    "refusing to overwrite existing keyfile at {}",
+                    path.display()
+                ))
+            } else {
+                VaultError::Io(e)
+            }
+        })?;
 
-    if let Err(e) = write_res {
-        let _ = fs::remove_file(path);
-        return Err(e);
-    }
+    // Only register cleanup guard AFTER `create_new` succeeded so a pre-existing file is never deleted.
+    let mut guard = TempFileGuard::new(path.to_path_buf());
+    file.write_all(&*secret)?;
+    file.sync_all()?;
+    drop(file);
+    guard.disarm();
 
     if let Ok(dir_file) = OpenOptions::new()
         .read(true)

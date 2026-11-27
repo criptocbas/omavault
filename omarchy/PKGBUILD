@@ -28,6 +28,7 @@ package() {
     cd "$startdir/.."
     install -Dm755 "target/release/omavault" "$pkgdir/usr/bin/omavault"
     install -Dm644 "omarchy/omavaultd.service" "$pkgdir/usr/lib/systemd/user/omavaultd.service"
+    sed -i 's|%h/.local/bin/omavault|/usr/bin/omavault|g' "$pkgdir/usr/lib/systemd/user/omavaultd.service"
     install -Dm644 "omarchy/omavault.lua" "$pkgdir/usr/share/doc/$pkgname/omavault.lua"
     install -Dm644 "omarchy/hypr-omavault.conf" "$pkgdir/usr/share/doc/$pkgname/hypr-omavault.conf"
     install -Dm644 "omarchy/hypridle-hook.conf" "$pkgdir/usr/share/doc/$pkgname/hypridle-hook.conf"

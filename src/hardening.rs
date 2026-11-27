@@ -1,12 +1,80 @@
 use std::fmt;
 use std::fs;
+use std::io;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use zeroize::Zeroize;
 
 use crate::error::{Result, VaultError};
+
+/// Zero-allocation `io::Write` counter used to compute exact serialized JSON byte lengths
+/// before allocating a single fixed-capacity `Zeroizing<Vec<u8>>` (eliminating unzeroized `realloc` copies).
+#[derive(Default)]
+pub struct CountingWriter {
+    pub bytes: usize,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::other("serialized payload size overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn is_dangerous_display_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
+/// Sanitize untrusted text for single-line terminal/TUI display:
+/// strips C0/C1 control characters (ANSI/OSC/CSI escapes), Unicode BiDi overrides/isolates,
+/// zero-width/tag characters, and normalizes newlines/tabs to spaces.
+pub fn sanitize_single_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\n' || c == '\r' || c == '\t' {
+            out.push(' ');
+        } else if !is_dangerous_display_char(c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Sanitize untrusted text for multi-line terminal/TUI display:
+/// strips C0/C1 controls (except `\n`), Unicode BiDi overrides/isolates, zero-width/tag chars,
+/// and Unicode line/paragraph separators.
+pub fn sanitize_multiline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\n' {
+            out.push('\n');
+        } else if c == '\t' {
+            out.push_str("    ");
+        } else if !is_dangerous_display_char(c) {
+            out.push(c);
+        }
+    }
+    out
+}
 
 /// Process names recognized as Wayland/X11 screen lockers (including 15-byte comm truncations).
 const SCREEN_LOCKERS: &[&str] = &[
@@ -95,6 +163,8 @@ pub struct LockedKey<const N: usize> {
     mlocked: bool,
     dontdump: bool,
     wipeonfork: bool,
+    /// Tracks whether the secret page is actually sealed (`PROT_NONE`) when idle.
+    sealed: AtomicBool,
     /// Active concurrent/re-entrant exposures protecting `mprotect(PROT_READ/PROT_NONE)`.
     exposure_count: Mutex<usize>,
 }
@@ -154,6 +224,7 @@ impl<const N: usize> LockedKey<N> {
             mlocked,
             dontdump,
             wipeonfork,
+            sealed: AtomicBool::new(true),
             exposure_count: Mutex::new(0),
         })
     }
@@ -238,9 +309,9 @@ impl<const N: usize> LockedKey<N> {
         self.mlocked
     }
 
-    /// Returns true if the page is sealed with `PROT_NONE` + flanking guard pages while idle.
+    /// Returns true if the page is currently sealed with `PROT_NONE` + flanking guard pages.
     pub fn is_guard_protected(&self) -> bool {
-        true
+        self.sealed.load(Ordering::Acquire)
     }
 
     /// Returns true if `MADV_DONTDUMP` and `MADV_WIPEONFORK` succeeded.
@@ -268,11 +339,19 @@ impl<const N: usize> LockedKey<N> {
                     .unwrap_or_else(|e| e.into_inner());
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    unsafe {
-                        let _ = libc::mprotect(
+                    let rc = unsafe {
+                        libc::mprotect(
                             self.key.secret_ptr as *mut libc::c_void,
                             self.key.secret_len,
                             libc::PROT_NONE,
+                        )
+                    };
+                    if rc == 0 {
+                        self.key.sealed.store(true, Ordering::Release);
+                    } else {
+                        self.key.sealed.store(false, Ordering::Release);
+                        eprintln!(
+                            "omavault security warning: mprotect(PROT_NONE) re-seal failed"
                         );
                     }
                 }
@@ -297,6 +376,7 @@ impl<const N: usize> LockedKey<N> {
                         "mprotect(PROT_READ) failed on LockedKey".into(),
                     ));
                 }
+                self.sealed.store(false, Ordering::Release);
             }
             *count = count
                 .checked_add(1)
@@ -360,6 +440,7 @@ impl<const N: usize> LockedKey<N> {
             mlocked,
             dontdump,
             wipeonfork,
+            sealed: AtomicBool::new(true),
             exposure_count: Mutex::new(0),
         })
     }
@@ -369,13 +450,18 @@ impl<const N: usize> Drop for LockedKey<N> {
     fn drop(&mut self) {
         if !self.base_ptr.is_null() {
             unsafe {
-                // Only write/zeroize if mprotect(PROT_READ|PROT_WRITE) succeeds;
-                // never trigger UB/SIGSEGV on a PROT_NONE page.
+                // Attempt targeted unseal first; if VMA splitting fails (e.g. vm.max_map_count),
+                // fall back to unsealing the entire 3-segment mmap so volatile zeroize STILL runs.
                 let writable = libc::mprotect(
                     self.secret_ptr as *mut libc::c_void,
                     self.secret_len,
                     libc::PROT_READ | libc::PROT_WRITE,
-                ) == 0;
+                ) == 0
+                    || libc::mprotect(
+                        self.base_ptr as *mut libc::c_void,
+                        self.total_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    ) == 0;
                 if writable {
                     let slice = slice::from_raw_parts_mut(self.secret_ptr, self.secret_len);
                     slice.zeroize();
@@ -517,7 +603,6 @@ fn is_hyprland_session_locked(target_uid: u32) -> bool {
     use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
@@ -563,7 +648,7 @@ fn is_hyprland_session_locked(target_uid: u32) -> bool {
         if meta.uid() != target_uid || !meta.file_type().is_socket() {
             return None;
         }
-        let mut stream = UnixStream::connect(sock_path).ok()?;
+        let mut stream = connect_unix_with_timeout(sock_path, 250)?;
         let _ = stream.set_read_timeout(Some(IPC_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IPC_TIMEOUT));
         stream.write_all(b"j/monitors").ok()?;
@@ -578,12 +663,106 @@ fn is_hyprland_session_locked(target_uid: u32) -> bool {
     };
 
     for sock in candidates {
-        if let Some(locked) = query_socket(&sock) {
-            return locked;
+        if query_socket(&sock) == Some(true) {
+            return true;
         }
     }
 
     false
+}
+
+/// Non-blocking `AF_UNIX` connect with a strict `poll(2)` deadline so a wedged compositor
+/// socket can never stall the daemon watchdog thread.
+#[cfg(target_os = "linux")]
+fn connect_unix_with_timeout(
+    path: &std::path::Path,
+    timeout_ms: i32,
+) -> Option<std::os::unix::net::UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let bytes = path.as_os_str().as_bytes();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return None;
+    }
+    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes.iter()) {
+        *dst = src as libc::c_char;
+    }
+
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+
+    let addr_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
+        as libc::socklen_t;
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            addr_len,
+        )
+    };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINPROGRESS)
+            && err.raw_os_error() != Some(libc::EAGAIN)
+        {
+            unsafe {
+                libc::close(fd);
+            }
+            return None;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let poll_rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if poll_rc <= 0 || (pfd.revents & libc::POLLOUT) == 0 {
+            unsafe {
+                libc::close(fd);
+            }
+            return None;
+        }
+        let mut so_err: libc::c_int = 0;
+        let mut so_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let opt_rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_err as *mut libc::c_int as *mut libc::c_void,
+                &mut so_len,
+            )
+        };
+        if opt_rc != 0 || so_err != 0 {
+            unsafe {
+                libc::close(fd);
+            }
+            return None;
+        }
+    }
+
+    // Clear O_NONBLOCK so subsequent read/write calls honor SO_RCVTIMEO / SO_SNDTIMEO.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return None;
+    }
+
+    Some(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 #[cfg(not(target_os = "linux"))]

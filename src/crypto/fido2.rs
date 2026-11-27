@@ -1,13 +1,15 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::crypto::Fido2KeySlot;
@@ -178,21 +180,30 @@ impl LibFido2Cli {
         let canonical_str = canonical.to_str().ok_or_else(|| {
             VaultError::Fido2Error("FIDO2 device path is not valid UTF-8".into())
         })?;
+        let is_hidraw = canonical_str
+            .strip_prefix("/dev/hidraw")
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+        if !is_hidraw {
+            return Err(VaultError::Fido2Error(
+                "FIDO2 device path must canonicalize to a /dev/hidraw<N> HID character device"
+                    .into(),
+            ));
+        }
         Ok(canonical_str.to_string())
     }
 
     /// Auto-detect all connected FIDO2 HID devices via `fido2-token -L`.
     pub fn discover_devices() -> Result<Vec<String>> {
         let bin = Self::resolve_tool("fido2-token")?;
-        let child = Command::new(bin)
-            .arg("-L")
+        let mut cmd = Command::new(bin);
+        cmd.arg("-L")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                VaultError::Fido2Error(format!("failed to execute `fido2-token`: {e}"))
-            })?;
+            .stderr(Stdio::null());
+        apply_pdeathsig(&mut cmd);
+        let child = cmd.spawn().map_err(|e| {
+            VaultError::Fido2Error(format!("failed to execute `fido2-token`: {e}"))
+        })?;
 
         let output = wait_with_timeout(child, Duration::from_secs(10), "fido2-token")?;
         if !output.status.success() {
@@ -285,6 +296,7 @@ impl LibFido2Cli {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        apply_pdeathsig(&mut cmd);
 
         if print_prompt {
             eprintln!(
@@ -299,8 +311,8 @@ impl LibFido2Cli {
 
         write_stdin_or_reap(&mut child, stdin_payload.as_bytes(), "fido2-assert")?;
         let output = wait_with_timeout(child, FIDO2_CMD_TIMEOUT, "fido2-assert")?;
-        // Wrap stdout in Zeroizing BEFORE inspecting status so partial outputs are always wiped.
-        let stdout_bytes = Zeroizing::new(output.stdout);
+        // stdout is already wrapped in Zeroizing BEFORE inspecting status.
+        let stdout_bytes = output.stdout;
 
         if !output.status.success() {
             let stderr_text = String::from_utf8_lossy(&output.stderr);
@@ -333,7 +345,7 @@ impl LibFido2Cli {
                 "FIDO2 assertion failed challenge/RP verification".into(),
             ));
         }
-        verify_authdata_flags(lines[2].trim(), meta.require_uv)?;
+        verify_authdata_flags(lines[2].trim(), &meta.rp_id, meta.require_uv, false, true)?;
 
         let decoded = Zeroizing::new(
             BASE64
@@ -351,13 +363,34 @@ impl LibFido2Cli {
         secret.copy_from_slice(&decoded);
         Ok(secret)
     }
+    /// Probe all connected FIDO2 devices (or an explicit device) for a specific credential.
+    pub fn assert_on_any_device(
+        &self,
+        meta: &Fido2Metadata,
+        device: Option<&str>,
+    ) -> Result<Zeroizing<[u8; 32]>> {
+        let devices = Self::resolve_devices(device)?;
+        let mut last_err = VaultError::Fido2NoMatchingCredential;
+        for dev in &devices {
+            match self.assert_on_device(meta, dev, false) {
+                Ok(secret) => return Ok(secret),
+                Err(VaultError::Fido2NoMatchingCredential) => continue,
+                Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
 }
 
 fn is_no_credentials_stderr(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
-    lower.contains("fido_err_no_credentials")
-        || lower.contains("no credentials")
-        || lower.contains("0x2e")
+    if lower.contains("fido_err_no_credentials") || lower.contains("no credentials") {
+        return true;
+    }
+    // Match `0x2e` only as a standalone hex token (never prefixes like `0x2e8a`).
+    lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| tok == "0x2e")
 }
 
 fn sanitize_stderr_snippet(stderr: &str) -> String {
@@ -404,6 +437,7 @@ impl Fido2Provider for LibFido2Cli {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        apply_pdeathsig(&mut cmd);
 
         eprintln!(
             "Touch your FIDO2 security key to enroll it with omavault (RP: {DEFAULT_RP_ID}, UV: {require_uv})..."
@@ -415,7 +449,7 @@ impl Fido2Provider for LibFido2Cli {
 
         write_stdin_or_reap(&mut child, stdin_payload.as_bytes(), "fido2-cred")?;
         let output = wait_with_timeout(child, FIDO2_CMD_TIMEOUT, "fido2-cred")?;
-        let stdout_bytes = Zeroizing::new(output.stdout);
+        let stdout_bytes = output.stdout;
 
         if !output.status.success() {
             return Err(VaultError::Fido2Error(format!(
@@ -440,7 +474,7 @@ impl Fido2Provider for LibFido2Cli {
                 "FIDO2 enrollment response failed challenge/RP verification".into(),
             ));
         }
-        verify_authdata_flags(lines[3].trim(), require_uv)?;
+        verify_authdata_flags(lines[3].trim(), DEFAULT_RP_ID, require_uv, true, true)?;
 
         let cred_id_b64 = lines[4].trim().to_string();
         let meta = Fido2Metadata {
@@ -471,36 +505,58 @@ impl Fido2Provider for LibFido2Cli {
             return Err(VaultError::Fido2Required);
         }
         let devices = Self::resolve_devices(device)?;
+        let mut last_err = VaultError::Fido2NoMatchingCredential;
         for dev in &devices {
             for (idx, slot) in slots.iter().enumerate() {
                 match self.assert_on_device(&slot.fido2, dev, false) {
                     Ok(secret) => return Ok((idx, secret)),
                     Err(VaultError::Fido2NoMatchingCredential) => continue,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        // Record non-matching error for this device and keep probing remaining
+                        // connected devices rather than aborting multi-device fallback prematurely.
+                        last_err = e;
+                        break;
+                    }
                 }
             }
         }
-        Err(VaultError::Fido2NoMatchingCredential)
+        Err(last_err)
     }
 }
 
-/// Verify CTAP2 authenticator data flags (`UP` bit `0x01`, and `UV` bit `0x04` when required).
-///
-/// `libfido2` outputs CBOR-encoded byte string `authdata` (major type 2 header + >=37 raw bytes:
-/// 32-byte `rpIdHash` + 1-byte `flags` + 4-byte `signCount`).
-fn verify_authdata_flags(authdata_b64: &str, require_uv: bool) -> Result<()> {
+/// Strictly verify CBOR-encoded CTAP2 authenticator data:
+/// - Must be valid CBOR major-type-2 byte string (fail closed, no raw fallback)
+/// - `authdata[0..32]` must equal `SHA-256(expected_rp_id)`
+/// - `UP` (0x01) required; `UV` (0x04), `AT` (0x40), `ED` (0x80) verified as requested.
+fn verify_authdata_flags(
+    authdata_b64: &str,
+    expected_rp_id: &str,
+    require_uv: bool,
+    require_at: bool,
+    require_ed: bool,
+) -> Result<()> {
     let raw = BASE64
         .decode(authdata_b64.as_bytes())
         .map_err(|_| VaultError::Fido2Error("invalid Base64 FIDO2 authdata".into()))?;
-    let authdata = unwrap_cbor_bstr(&raw).unwrap_or(&raw);
+    let authdata = unwrap_cbor_bstr(&raw).ok_or_else(|| {
+        VaultError::Fido2Error("FIDO2 authdata is not a valid CBOR byte string".into())
+    })?;
     if authdata.len() < 37 {
         return Err(VaultError::Fido2Error(
             "FIDO2 authdata truncated (expected >= 37 bytes)".into(),
         ));
     }
+    let expected_rp_hash = Sha256::digest(expected_rp_id.as_bytes());
+    if authdata[0..32] != expected_rp_hash[..] {
+        return Err(VaultError::Fido2Error(
+            "FIDO2 authdata rpIdHash does not match expected relying party".into(),
+        ));
+    }
     let flags = authdata[32];
     let up = (flags & 0x01) != 0;
     let uv = (flags & 0x04) != 0;
+    let at = (flags & 0x40) != 0;
+    let ed = (flags & 0x80) != 0;
     if !up {
         return Err(VaultError::Fido2Error(
             "FIDO2 authenticator did not confirm User Presence (UP)".into(),
@@ -511,8 +567,39 @@ fn verify_authdata_flags(authdata_b64: &str, require_uv: bool) -> Result<()> {
             "FIDO2 authenticator did not confirm User Verification (UV)".into(),
         ));
     }
+    if require_at && !at {
+        return Err(VaultError::Fido2Error(
+            "FIDO2 enrollment authdata missing Attested Credential Data (AT) flag".into(),
+        ));
+    }
+    if require_ed && !ed {
+        return Err(VaultError::Fido2Error(
+            "FIDO2 authdata missing Extension Data (ED) flag for hmac-secret".into(),
+        ));
+    }
     Ok(())
 }
+
+fn apply_pdeathsig(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+            Ok(())
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
+struct BoundedOutput {
+    status: ExitStatus,
+    stdout: Zeroizing<Vec<u8>>,
+    stderr: Vec<u8>,
+}
+
+const MAX_FIDO2_STDOUT_BYTES: u64 = 64 * 1024;
+const MAX_FIDO2_STDERR_BYTES: u64 = 8 * 1024;
 
 /// Decode a CBOR major-type-2 byte string wrapper if present.
 fn unwrap_cbor_bstr(data: &[u8]) -> Option<&[u8]> {
@@ -559,19 +646,38 @@ fn write_stdin_or_reap(child: &mut Child, data: &[u8], tool: &str) -> Result<()>
     Ok(())
 }
 
-fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<Output> {
+fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<BoundedOutput> {
+    // Drain piped stdout/stderr concurrently on bounded reader threads so >64 KiB child output
+    // can never deadlock the pipe while we poll `try_wait()`.
+    let stdout_handle = child.stdout.take().map(|out| {
+        thread::spawn(move || {
+            let mut buf = Zeroizing::new(Vec::new());
+            let _ = out.take(MAX_FIDO2_STDOUT_BYTES).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|err| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err.take(MAX_FIDO2_STDERR_BYTES).read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| VaultError::Fido2Error(format!("`{tool}` failed: {e}")));
-            }
+            Ok(Some(st)) => break st,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    if let Some(h) = stdout_handle {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = stderr_handle {
+                        let _ = h.join();
+                    }
                     return Err(VaultError::Fido2Error(format!(
                         "`{tool}` timed out after {}s",
                         timeout.as_secs()
@@ -582,12 +688,31 @@ fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(h) = stdout_handle {
+                    let _ = h.join();
+                }
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
                 return Err(VaultError::Fido2Error(format!(
                     "failed waiting on `{tool}`: {e}"
                 )));
             }
         }
-    }
+    };
+
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_else(|| Zeroizing::new(Vec::new()));
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    Ok(BoundedOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Deterministic software mock FIDO2 authenticator compiled ONLY for tests (`test-utils`).
@@ -743,20 +868,29 @@ mod tests {
 
     #[test]
     fn verifies_cbor_authdata_up_and_uv_flags() {
-        // Construct CBOR byte string (0x58 0x25 = 37 bytes) with flags at byte 32.
+        let rp_hash = Sha256::digest(DEFAULT_RP_ID.as_bytes());
+        // Construct valid CBOR byte string (0x58 0x25 = 37 bytes) with rpIdHash + flags + signCount.
         let mut raw = vec![0x58, 37];
-        raw.extend_from_slice(&[0u8; 32]); // rpIdHash
-        raw.push(0x05); // UP | UV
+        raw.extend_from_slice(&rp_hash);
+        raw.push(0x01 | 0x04 | 0x40 | 0x80); // UP | UV | AT | ED
         raw.extend_from_slice(&[0u8; 4]); // signCount
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), true).is_ok());
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, true, true, true).is_ok());
 
         // Clear UV bit: passes when require_uv=false, fails when require_uv=true.
-        raw[2 + 32] = 0x01; // UP only
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), false).is_ok());
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), true).is_err());
+        raw[2 + 32] = 0x01 | 0x80; // UP | ED
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, false, true).is_ok());
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, true, false, true).is_err());
 
-        // Clear UP bit: always fails.
-        raw[2 + 32] = 0x00;
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), false).is_err());
+        // Missing AT on enrollment fails; missing ED fails.
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, true, true).is_err());
+        raw[2 + 32] = 0x01; // UP only, missing ED
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, false, true).is_err());
+
+        // Wrong rpIdHash fails.
+        raw[2 + 32] = 0x01 | 0x80;
+        assert!(verify_authdata_flags(&BASE64.encode(&raw), "other.local", false, false, true).is_err());
+
+        // Non-CBOR raw authdata (without major type 2 header) MUST fail closed.
+        assert!(verify_authdata_flags(&BASE64.encode(&raw[2..]), DEFAULT_RP_ID, false, false, true).is_err());
     }
 }

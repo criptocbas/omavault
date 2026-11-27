@@ -1,5 +1,6 @@
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -129,21 +130,32 @@ impl KdfParams {
 
 /// Hash a regular keyfile using streaming BLAKE3 into a 32-byte digest.
 ///
-/// Rejects special files (FIFOs, `/dev/zero`, sockets, directories) on the opened file
-/// descriptor and caps reads at 64 MiB to prevent infinite-read DoS. Zeroizes BLAKE3
-/// internal state on exit.
+/// Opens with `O_NONBLOCK | O_NOFOLLOW` so FIFOs never hang and symlinks are rejected,
+/// verifies regular file + owner-only permissions (`0600`), caps reads at 64 MiB, and
+/// wraps `blake3::Hasher` in `Zeroizing` so I/O errors still wipe internal state.
 pub fn hash_keyfile(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
-    let file = File::open(path).map_err(|e| {
-        VaultError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to open keyfile '{}': {e}", path.display()),
-        ))
-    })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            VaultError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to open keyfile '{}': {e}", path.display()),
+            ))
+        })?;
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(VaultError::InvalidFormat(
             "keyfile path must be a regular file (special files/FIFOs/devices are rejected)".into(),
         ));
+    }
+    if (meta.mode() & 0o077) != 0 {
+        return Err(VaultError::Hardening(format!(
+            "keyfile '{}' has unsafe permissions {:04o} (must be owner-only 0600)",
+            path.display(),
+            meta.mode() & 0o7777
+        )));
     }
     if meta.len() > MAX_KEYFILE_BYTES {
         return Err(VaultError::InvalidFormat(format!(
@@ -152,7 +164,7 @@ pub fn hash_keyfile(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
     }
 
     let mut reader = file.take(MAX_KEYFILE_BYTES.saturating_add(1));
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = Zeroizing::new(blake3::Hasher::new());
     let mut buf = Zeroizing::new([0u8; 8192]);
     let mut total_bytes = 0u64;
     loop {
@@ -162,7 +174,6 @@ pub fn hash_keyfile(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
         }
         total_bytes = total_bytes.saturating_add(n as u64);
         if total_bytes > MAX_KEYFILE_BYTES {
-            hasher.zeroize();
             return Err(VaultError::InvalidFormat(format!(
                 "keyfile exceeds maximum allowed size ({MAX_KEYFILE_BYTES} bytes)"
             )));
@@ -170,12 +181,10 @@ pub fn hash_keyfile(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
         hasher.update(&buf[..n]);
     }
     if total_bytes == 0 {
-        hasher.zeroize();
         return Err(VaultError::InvalidFormat("keyfile is empty".into()));
     }
     let mut digest = hasher.finalize();
     let out = Zeroizing::new(*digest.as_bytes());
-    hasher.zeroize();
     digest.zeroize();
     Ok(out)
 }

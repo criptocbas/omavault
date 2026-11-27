@@ -7,7 +7,8 @@ After=graphical-session.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/omavault daemon --timeout 300
-ExecStop=%h/.local/bin/omavault stop-daemon
+KillSignal=SIGTERM
+TimeoutStopSec=5
 Restart=on-failure
 RestartSec=2
 
@@ -19,10 +20,14 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 SystemCallArchitectures=native
+SystemCallFilter=@system-service ~@privileged ~@mount ~@module ~@raw-io ~@reboot ~@swap ~@clock ~@cpu-emulation ~@debug ~@obsolete
+SystemCallErrorNumber=EPERM
 KeyringMode=private
-# AF_UNIX for local IPC socket + AF_NETLINK for libudev FIDO2 HID device discovery
+# AF_UNIX for local IPC socket, Hyprland IPC, and logind busctl + AF_NETLINK for libudev FIDO2 HID discovery
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
+StandardInput=null
 LimitCORE=0
+LimitNOFILE=1024
 UMask=0077
 # Note: unprivileged `systemd --user` cannot raise RLIMIT_MEMLOCK above the session
 # hard limit. If `omavault status` reports mlock=false, configure

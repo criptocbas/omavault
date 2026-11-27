@@ -450,6 +450,11 @@ impl VaultHeader {
     }
 }
 
+/// Compute the hex revision token for a vault header (derived from its per-save `save_salt`).
+pub fn header_revision(header: &VaultHeader) -> String {
+    header.save_salt.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Generate a fresh CSPRNG 256-bit vault master key inside `mlock`ed `PROT_NONE` memory.
 pub fn generate_random_master_key() -> Result<LockedKey<32>> {
     let mut raw = [0u8; 32];
@@ -489,9 +494,14 @@ pub fn wrap_master_key_for_slot(
     fido2: Fido2Metadata,
     fido2_secret: &[u8; 32],
 ) -> Result<Fido2KeySlot> {
-    if header.version != VAULT_VERSION_V2 {
+    if header.version != VAULT_VERSION_V2 || !header.requires_fido2() {
         return Err(VaultError::InvalidFormat(
-            "key-slot wrapping requires an OMAV v2 header".into(),
+            "key-slot wrapping requires an OMAV v2 FIDO2 header".into(),
+        ));
+    }
+    if header.requires_keyfile() != keyfile_digest.is_some() {
+        return Err(VaultError::InvalidFormat(
+            "keyfile presence does not match vault header FLAG_KEYFILE".into(),
         ));
     }
     validate_slot_label(label)?;
@@ -533,9 +543,14 @@ pub fn unwrap_master_key_from_slot(
     keyfile_digest: Option<&[u8; 32]>,
     fido2_secret: &[u8; 32],
 ) -> Result<LockedKey<32>> {
-    if header.version != VAULT_VERSION_V2 {
+    if header.version != VAULT_VERSION_V2 || !header.requires_fido2() {
         return Err(VaultError::InvalidFormat(
-            "key-slot unwrapping requires an OMAV v2 header".into(),
+            "key-slot unwrapping requires an OMAV v2 FIDO2 header".into(),
+        ));
+    }
+    if header.requires_keyfile() != keyfile_digest.is_some() {
+        return Err(VaultError::InvalidFormat(
+            "keyfile presence does not match vault header FLAG_KEYFILE".into(),
         ));
     }
     slot.validate()?;
@@ -592,6 +607,11 @@ pub fn resolve_master_key<P: Fido2Provider>(
 ) -> Result<UnlockResolution> {
     if header.requires_keyfile() && keyfile_digest.is_none() {
         return Err(VaultError::KeyfileRequired);
+    }
+    if !header.requires_keyfile() && keyfile_digest.is_some() {
+        return Err(VaultError::InvalidFormat(
+            "keyfile supplied for a vault that does not use a keyfile".into(),
+        ));
     }
 
     let pw_hash = derive_passphrase_hash(

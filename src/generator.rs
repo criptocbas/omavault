@@ -88,7 +88,7 @@ pub struct PassphraseOptions {
 impl Default for PassphraseOptions {
     fn default() -> Self {
         Self {
-            words: 8,
+            words: 12,
             separator: "-".to_string(),
             capitalize: true,
             include_number: true,
@@ -213,16 +213,19 @@ pub fn generated_password_entropy_bits(opts: &PasswordOptions) -> f64 {
 
 /// Generate a Diceware-style memorable passphrase using OS CSPRNG with zeroized intermediates.
 pub fn generate_passphrase(opts: &PassphraseOptions) -> Result<Zeroizing<String>> {
-    if opts.words < 6 || opts.words > 24 {
+    if opts.words < 10 || opts.words > 24 {
         return Err(VaultError::InvalidFormat(
-            "passphrase word count must be between 6 and 24 (recommend >= 8)".into(),
+            "passphrase word count must be between 10 and 24 (256-word list = 8 bits/word; recommend >= 12)".into(),
         ));
     }
 
     let mut parts: Vec<Zeroizing<String>> = Vec::with_capacity(opts.words);
     for _ in 0..opts.words {
         let idx = csprng_index(WORDLIST.len())?;
-        let mut word = Zeroizing::new(WORDLIST[idx].to_string());
+        let raw_word = WORDLIST[idx];
+        // Pre-allocate +2 bytes so optional 2-digit suffix never reallocates/frees an unzeroized prefix.
+        let mut word = Zeroizing::new(String::with_capacity(raw_word.len() + 2));
+        word.push_str(raw_word);
         if opts.capitalize {
             if let Some(first) = word.get_mut(0..1) {
                 first.make_ascii_uppercase();
@@ -307,7 +310,9 @@ pub fn estimate_entropy_bits(password: &str) -> f64 {
         return 0.0;
     }
 
-    let mut chars = Zeroizing::new(password.chars().collect::<Vec<char>>());
+    // Pre-allocate exact upper-bound capacity before filling so Vec/String never reallocs unzeroized prefixes.
+    let mut chars = Zeroizing::new(Vec::with_capacity(password.len()));
+    chars.extend(password.chars());
     let char_len = chars.len();
 
     // Count sequential/repeated transitions (e.g. "abcd", "1234", "aaaa").
@@ -333,21 +338,22 @@ pub fn estimate_entropy_bits(password: &str) -> f64 {
     let mut bits = effective_len * pool.log2();
 
     // Penalize common dictionary/keyboard patterns (case-insensitive & basic leetspeak).
-    let normalized = Zeroizing::new(
-        password
-            .chars()
-            .map(|c| match c.to_ascii_lowercase() {
-                '@' => 'a',
-                '0' => 'o',
-                '1' | '!' => 'i',
-                '3' => 'e',
-                '$' | '5' => 's',
-                '7' => 't',
-                other => other,
-            })
-            .collect::<String>(),
-    );
-    let lower = Zeroizing::new(password.to_ascii_lowercase());
+    let mut normalized = Zeroizing::new(String::with_capacity(password.len()));
+    for c in password.chars() {
+        normalized.push(match c.to_ascii_lowercase() {
+            '@' => 'a',
+            '0' => 'o',
+            '1' | '!' => 'i',
+            '3' => 'e',
+            '$' | '5' => 's',
+            '7' => 't',
+            other => other,
+        });
+    }
+    let mut lower = Zeroizing::new(String::with_capacity(password.len()));
+    for c in password.chars() {
+        lower.push(c.to_ascii_lowercase());
+    }
     for pat in COMMON_WEAK_PATTERNS {
         if lower.contains(pat) || normalized.contains(pat) {
             bits *= 0.45;
@@ -394,10 +400,10 @@ mod tests {
     fn generates_diceware_passphrase_and_rejects_short() {
         assert_eq!(WORDLIST.len(), 256);
         let phrase = generate_passphrase(&PassphraseOptions::default()).expect("passphrase");
-        assert_eq!(phrase.split('-').count(), 8);
+        assert_eq!(phrase.split('-').count(), 12);
 
         assert!(generate_passphrase(&PassphraseOptions {
-            words: 4,
+            words: 8,
             ..PassphraseOptions::default()
         })
         .is_err());

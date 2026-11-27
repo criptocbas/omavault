@@ -27,7 +27,7 @@ use crate::clipboard::{
 };
 use crate::crypto::fido2::LibFido2Cli;
 use crate::crypto::kdf::hash_keyfile;
-use crate::crypto::{resolve_master_key, VaultHeader, VAULT_VERSION_V2};
+use crate::crypto::{header_revision, resolve_master_key, VaultHeader, VAULT_VERSION_V2};
 use crate::daemon::{DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS};
 use crate::error::{Result, VaultError};
 use crate::generator::{
@@ -35,11 +35,14 @@ use crate::generator::{
     passphrase_entropy_bits, strength_label, PassphraseOptions, PasswordOptions,
 };
 use crate::hardening::{
-    boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, HardeningStatus, LockedKey,
+    boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, sanitize_multiline,
+    sanitize_single_line, HardeningStatus, LockedKey,
 };
 use crate::totp::TotpConfig;
 use crate::vault::audit::{run_audit, AuditReport};
-use crate::vault::storage::{load_vault_from_disk, read_header_from_disk, save_vault_to_disk};
+use crate::vault::storage::{
+    load_vault_from_disk, read_header_from_disk, save_vault_to_disk_checked,
+};
 use crate::vault::{Entry, Vault};
 
 const SUSPEND_SKEW_THRESHOLD_MS: u64 = 2000;
@@ -108,11 +111,15 @@ enum Mode {
     Help,
 }
 
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct EntryForm {
     editing_original_name: Option<String>,
     original_totp: Option<TotpConfig>,
+    #[zeroize(skip)]
     totp_modified: bool,
+    #[zeroize(skip)]
     reveal_secrets: bool,
+    #[zeroize(skip)]
     active_field: usize,
     name: String,
     username: String,
@@ -238,6 +245,7 @@ struct App {
     reveal_password: bool,
     status_toast: Option<(ToastLevel, String, Instant)>,
     last_activity_boot_secs: u64,
+    daemon_remaining_secs: Option<u64>,
     last_sleep_skew_ms: Option<u64>,
     last_watchdog_check: Instant,
     my_uid: u32,
@@ -271,6 +279,7 @@ impl App {
             reveal_password: false,
             status_toast: None,
             last_activity_boot_secs: current_boot_secs(),
+            daemon_remaining_secs: None,
             last_sleep_skew_ms: boottime_monotonic_skew_ms(),
             last_watchdog_check: Instant::now(),
             my_uid,
@@ -287,6 +296,7 @@ impl App {
                         revision: Some(rev),
                         mlocked: st.mlocked,
                     });
+                    app.daemon_remaining_secs = Some(st.remaining_secs);
                     app.vault = Some(vault);
                     app.mode = Mode::Normal;
                     if app.vault.as_ref().is_some_and(|v| !v.entries.is_empty()) {
@@ -313,21 +323,27 @@ impl App {
 
     /// Lock vault locally (and optionally tell daemon to lock as well).
     fn lock_vault(&mut self, reason: &str, notify_daemon: bool) {
+        let mut daemon_warn: Option<String> = None;
         if notify_daemon && matches!(self.backend, Some(SessionBackend::Daemon { .. })) {
             let client = DaemonClient::new(self.cfg.socket_path.clone());
-            let _ = client.lock();
+            if let Err(e) = client.lock() {
+                daemon_warn = Some(format!(
+                    "Local TUI locked ({reason}), WARNING: failed to lock daemon: {e}"
+                ));
+            }
         }
         // Dropping `vault` and `backend` triggers `ZeroizeOnDrop` on all passwords and
         // volatile-zeroize + munlock + munmap on `LockedKey<32>`.
         self.vault = None;
         self.backend = None;
+        self.daemon_remaining_secs = None;
         self.reveal_password = false;
         self.search_query.zeroize();
         self.status_toast = None;
         clear_clipboard_best_effort();
         self.mode = Mode::Locked {
             passphrase_input: Zeroizing::new(String::with_capacity(256)),
-            error_msg: Some(format!("Vault locked ({reason})")),
+            error_msg: Some(daemon_warn.unwrap_or_else(|| format!("Vault locked ({reason})"))),
         };
     }
 
@@ -467,7 +483,16 @@ impl App {
                 }
             }
             Some(SessionBackend::Standalone { master_key, header }) => {
-                save_vault_to_disk(&self.cfg.vault_path, master_key, header, &staged)?;
+                let expected_rev = header_revision(header);
+                save_vault_to_disk_checked(
+                    &self.cfg.vault_path,
+                    master_key,
+                    header,
+                    &staged,
+                    Some(&expected_rev),
+                    true,
+                    true,
+                )?;
             }
             None => return Err(VaultError::Daemon("vault not unlocked".into())),
         }
@@ -542,12 +567,16 @@ impl App {
     fn remaining_lock_secs(&self) -> u64 {
         let timeout = self.cfg.idle_timeout_secs.max(10);
         let elapsed = current_boot_secs().saturating_sub(self.last_activity_boot_secs);
-        timeout.saturating_sub(elapsed)
+        let local = timeout.saturating_sub(elapsed);
+        match self.daemon_remaining_secs {
+            Some(d) => local.min(d),
+            None => local,
+        }
     }
 
     /// Periodic security watchdog executed every tick:
     /// 1. Suspend/lid-close detection (`CLOCK_BOOTTIME - CLOCK_MONOTONIC` skew >= 2s)
-    /// 2. Hyprlock / Wayland screen-locker detection (`/proc/<pid>/status`)
+    /// 2. Omarchy / Hyprland / Wayland screen-lock detection (active even during `Mode::Unlocking`)
     /// 3. `CLOCK_BOOTTIME` inactivity timeout (counts suspend time!)
     /// 4. Daemon lock synchronization (immediately wipes TUI RAM if `omavaultd` locked!)
     fn on_tick(&mut self) {
@@ -557,21 +586,43 @@ impl App {
             }
         }
 
-        if let Mode::Unlocking { rx, .. } = &self.mode {
-            match rx.try_recv() {
-                Ok(outcome) => {
-                    self.finish_unlock(outcome);
-                    return;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.last_sleep_skew_ms = boottime_monotonic_skew_ms();
-                    return;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.finish_unlock(UnlockOutcome::Error(
-                        "unlock worker exited unexpectedly".into(),
-                    ));
-                    return;
+        if matches!(self.mode, Mode::Unlocking { .. }) {
+            // Check suspend & screen lock even while an unlock is in flight so a lid close
+            // or lock screen during YubiKey wait cancels the unlock cleanly!
+            let current_skew = boottime_monotonic_skew_ms();
+            let slept = match (self.last_sleep_skew_ms, current_skew) {
+                (Some(prev), Some(curr)) => curr.saturating_sub(prev) >= SUSPEND_SKEW_THRESHOLD_MS,
+                _ => false,
+            };
+            self.last_sleep_skew_ms = current_skew;
+            if slept || is_screen_locker_active(self.my_uid) {
+                let reason = if slept {
+                    "unlock cancelled: system suspend/resume detected"
+                } else {
+                    "unlock cancelled: screen lock detected"
+                };
+                let client = DaemonClient::new(self.cfg.socket_path.clone());
+                let _ = client.lock();
+                self.mode = Mode::Locked {
+                    passphrase_input: Zeroizing::new(String::with_capacity(256)),
+                    error_msg: Some(reason.into()),
+                };
+                return;
+            }
+
+            if let Mode::Unlocking { rx, .. } = &self.mode {
+                match rx.try_recv() {
+                    Ok(outcome) => {
+                        self.finish_unlock(outcome);
+                        return;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.finish_unlock(UnlockOutcome::Error(
+                            "unlock worker exited unexpectedly".into(),
+                        ));
+                        return;
+                    }
                 }
             }
         }
@@ -616,6 +667,7 @@ impl App {
             match client.status() {
                 Ok(st) if st.unlocked => {
                     *mlocked = st.mlocked;
+                    self.daemon_remaining_secs = Some(st.remaining_secs);
                 }
                 Ok(st) => {
                     let reason = st
@@ -953,19 +1005,19 @@ impl App {
 
         let mutate_res = if let Some(orig) = editing {
             staged.update_entry(&orig, &name, |entry| {
-                entry.username = username;
+                entry.set_username(username);
                 entry.set_password(password);
-                entry.url = url;
+                entry.set_url(url);
                 entry.tags = tags;
                 entry.totp = totp_cfg;
-                entry.notes = notes.to_string();
+                entry.set_notes(notes);
             })
         } else {
             let mut entry = Entry::new(name.clone(), username, password.to_string());
-            entry.url = url;
+            entry.set_url(url);
             entry.tags = tags;
             entry.totp = totp_cfg;
-            entry.notes = notes.to_string();
+            entry.set_notes(notes);
             staged.add_entry(entry)
         };
 
@@ -994,14 +1046,28 @@ impl App {
     }
 }
 
+/// RAII terminal + clipboard guard guaranteeing panic-safe cleanup on unwind, error, or signal.
+struct TuiGuard;
+
+impl Drop for TuiGuard {
+    fn drop(&mut self) {
+        clear_clipboard_best_effort();
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show);
+    }
+}
+
 /// Launch the interactive Omarchy Ratatui password manager.
 pub fn run_tui(cfg: TuiConfig) -> Result<()> {
     let mut app = App::new(cfg)?;
     let signal_quit = Arc::new(AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&signal_quit));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&signal_quit));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&signal_quit));
 
     enable_raw_mode().map_err(VaultError::Io)?;
+    let _tui_guard = TuiGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(VaultError::Io)?;
     let backend = CrosstermBackend::new(stdout);
@@ -1032,24 +1098,25 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
         Ok(())
     })();
 
-    // Cleanly wipe RAM and clear any active secret clipboard on exit.
-    clear_clipboard_best_effort();
+    // If the user cancelled/quit while an unlock was still in flight, immediately signal `omavaultd`
+    // to bump `lock_epoch` so the background unlock cannot silently leave the daemon unlocked!
+    if matches!(app.mode, Mode::Unlocking { .. }) {
+        let client = DaemonClient::new(app.cfg.socket_path.clone());
+        let _ = client.lock();
+    }
+
+    // Overwrite ratatui screen buffer and wipe RAM before TuiGuard restores terminal & clears clipboard.
+    let _ = terminal.clear();
     app.vault = None;
     app.backend = None;
     app.search_query.zeroize();
 
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-
     run_res
 }
 
-/// Strip C0/C1 control characters & ANSI escapes before rendering untrusted entry strings.
+/// Sanitize untrusted entry strings for single-line TUI display (strips ANSI/OSC/BiDi/zero-width).
 fn sanitize_display(s: &str) -> String {
-    s.chars()
-        .filter(|&c| !c.is_control() || c == '\n' || c == '\t')
-        .collect()
+    sanitize_single_line(s)
 }
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
@@ -1166,7 +1233,7 @@ fn draw_locked_screen(
         Line::from(""),
         Line::from(vec![
             Span::styled("  Vault:   ", theme::muted_style()),
-            Span::raw(vault_path.display().to_string()),
+            Span::raw(sanitize_display(&vault_path.display().to_string())),
         ]),
         Line::from(vec![
             Span::styled("  Crypto:  ", theme::muted_style()),
@@ -1439,8 +1506,10 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
             " {}",
             if entry.notes.is_empty() {
                 "(none)".to_string()
+            } else if app.reveal_password {
+                sanitize_multiline(&entry.notes)
             } else {
-                sanitize_display(&entry.notes)
+                "•••••••••••• (press [r] to reveal)".to_string()
             }
         )),
     ];
@@ -1538,6 +1607,12 @@ fn draw_editor_modal(f: &mut Frame, area: Rect, form: &EntryForm) {
         "•".repeat(form.totp.chars().count().min(32))
     };
 
+    let masked_notes = if form.reveal_secrets || form.notes.is_empty() {
+        sanitize_display(&form.notes)
+    } else {
+        "•".repeat(form.notes.chars().count().min(32))
+    };
+
     let fields: [(&str, String); EntryForm::FIELD_COUNT] = [
         ("Name", sanitize_display(&form.name)),
         ("Username", sanitize_display(&form.username)),
@@ -1545,7 +1620,7 @@ fn draw_editor_modal(f: &mut Frame, area: Rect, form: &EntryForm) {
         ("URL", sanitize_display(&form.url)),
         ("Tags (comma)", sanitize_display(&form.tags)),
         ("TOTP (Base32 / otpauth://)", masked_totp),
-        ("Notes", sanitize_display(&form.notes)),
+        ("Notes", masked_notes),
     ];
 
     let mut lines = Vec::new();

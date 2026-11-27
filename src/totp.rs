@@ -122,7 +122,11 @@ impl TotpConfig {
         if trimmed.is_empty() {
             return Err(VaultError::InvalidTotp("TOTP secret cannot be empty".into()));
         }
-        let cfg = if trimmed.len() >= 10 && trimmed[..10].eq_ignore_ascii_case("otpauth://") {
+        let cfg = if trimmed
+            .as_bytes()
+            .get(..10)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"otpauth://"))
+        {
             Self::parse_otpauth_uri(trimmed)?
         } else {
             let normalized = normalize_base32(trimmed)?;
@@ -302,19 +306,28 @@ pub fn hotp_raw(
             let mut mac = HmacSha1::new_from_slice(key)
                 .map_err(|_| VaultError::InvalidTotp("HMAC-SHA1 initialization failed".into()))?;
             mac.update(&counter_be);
-            Zeroizing::new(mac.finalize().into_bytes().to_vec())
+            let mut raw = mac.finalize().into_bytes();
+            let out = Zeroizing::new(raw.to_vec());
+            raw.as_mut_slice().zeroize();
+            out
         }
         TotpAlgorithm::Sha256 => {
             let mut mac = HmacSha256::new_from_slice(key)
                 .map_err(|_| VaultError::InvalidTotp("HMAC-SHA256 initialization failed".into()))?;
             mac.update(&counter_be);
-            Zeroizing::new(mac.finalize().into_bytes().to_vec())
+            let mut raw = mac.finalize().into_bytes();
+            let out = Zeroizing::new(raw.to_vec());
+            raw.as_mut_slice().zeroize();
+            out
         }
         TotpAlgorithm::Sha512 => {
             let mut mac = HmacSha512::new_from_slice(key)
                 .map_err(|_| VaultError::InvalidTotp("HMAC-SHA512 initialization failed".into()))?;
             mac.update(&counter_be);
-            Zeroizing::new(mac.finalize().into_bytes().to_vec())
+            let mut raw = mac.finalize().into_bytes();
+            let out = Zeroizing::new(raw.to_vec());
+            raw.as_mut_slice().zeroize();
+            out
         }
     };
 
