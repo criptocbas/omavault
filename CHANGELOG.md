@@ -36,6 +36,24 @@
 - Client connect helper retries `EAGAIN` (full backlog) and `EINTR` within its deadline.
 - Hyprland `.conf` and hypridle snippets prefer root-owned `/usr/bin/omavault` over `~/.local/bin`.
 
+### Phase 5: clipboard races
+- **H-3:** `copy_secret` holds `clip.lock` across spawn, readiness, state publish, and the signal
+  to the previous helper. The new generation is written to `clip.state` before the old helper is
+  signalled, and a helper globally clears the clipboard only when that lock still shows its own
+  generation (or the state file is missing). A fast second copy is no longer wiped by the helper
+  it replaced, and a failed copy leaves the previous secret in place.
+- **M-9:** reads, writes, and unlinks of `clip.state` happen under the same owner-only `flock`,
+  so a helper exiting cannot delete a newer helper's state and leave that helper untracked
+  across lock.
+- **L-11:** the helper registers `SIGTERM`/`SIGINT` before it claims the Wayland selection and
+  before it prints `OK`.
+- The parent waits at most 2 s for the helper's readiness line (the lock is held while it waits)
+  and kills the helper if it does not become ready. This is enforced at compile time to stay
+  below the 3 s lock wait, so neither a superseded helper nor an emergency clear can time out on
+  the lock and clear a copy that is still being set up.
+- Tests: `may_clear` truth table, state round-trip, `clip.lock` mode/symlink/hard-link refusal,
+  bounded lock timeout, and stress regressions for H-3 and M-9.
+
 ### Phase 4: memory hygiene
 - **Zeroizing global allocator** (`src/alloc.rs`, registered in the binary): every heap block is
   wiped with `explicit_bzero(3)` before it is freed, and on every reallocation. Closes the
