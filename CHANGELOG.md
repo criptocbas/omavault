@@ -136,7 +136,7 @@ Phase 1 shipped as **v0.3.1** (see below). Header-changing saves (`rekey`, `fido
 
 ### Phase 7: packaging, supply chain, and docs
 
-- `ratatui` 0.30 and `crossterm` 0.29. MSRV is Rust 1.88. `chrono` stays; `RUSTSEC-2026-0543` (unmaintained) is the only accepted advisory, because `DateTime<Utc>` is part of the serialized vault.
+- `ratatui` 0.30 and `crossterm` 0.29. MSRV is Rust 1.88. `uuid` is pinned to 1.26.1 because 1.27+ requires rustc 1.89. `chrono` stays; `RUSTSEC-2026-0543` (unmaintained) is the only accepted advisory, because `DateTime<Utc>` is part of the serialized vault.
 - `cargo deny` allows only the licenses in this lockfile (including MPL-2.0 via `option-ext`) and crates.io. CI checks fmt, clippy `-D warnings`, `cargo test --locked`, the 1.88 MSRV, `cargo audit`, `cargo deny`, and `systemd-analyze verify` on the user unit. Namespace `Protect*` options stay off that unit: in a user service they imply `PrivateUsers=yes` and break FIDO2.
 - cargo-fuzz targets for `VaultHeader::parse`, `TotpConfig::parse`, and vault JSON. A weekly nightly workflow runs each for 60 seconds.
 - The local PKGBUILD fetches with `--locked` and builds with `--frozen`. `omarchy/PKGBUILD.aur` is a signed-tag stub; the PGP fingerprint is still a placeholder. `install.sh` warns when a user unit or `~/.local/bin/omavault` would shadow the packaged files.
