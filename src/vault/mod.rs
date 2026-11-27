@@ -224,9 +224,9 @@ fn validate_entry_text(entry: &Entry) -> Result<()> {
     for tag in &entry.tags {
         line("tag", tag)?;
     }
-    if entry.password.chars().any(char::is_control) {
+    if entry.password.chars().any(dangerous) {
         return Err(VaultError::InvalidFormat(
-            "password contains control characters (escape sequences are not allowed)".into(),
+            "password contains terminal control or invisible characters".into(),
         ));
     }
     if entry
@@ -240,12 +240,20 @@ fn validate_entry_text(entry: &Entry) -> Result<()> {
     }
     for cf in &entry.custom_fields {
         line("custom field label", &cf.label)?;
-        if cf.value.chars().any(char::is_control) {
+        if cf.value.chars().any(dangerous) {
             return Err(VaultError::InvalidFormat(format!(
-                "custom field '{}' contains control characters",
+                "custom field '{}' contains terminal control or invisible characters",
                 crate::hardening::sanitize_single_line(&cf.label)
             )));
         }
+    }
+    Ok(())
+}
+
+/// Reject any entry a raw `SaveVault` client could seal without going through `add_entry`.
+pub(crate) fn validate_entries(vault: &Vault) -> Result<()> {
+    for entry in &vault.entries {
+        validate_entry_text(entry)?;
     }
     Ok(())
 }

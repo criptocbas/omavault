@@ -50,6 +50,16 @@ const CONTROL_FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(250);
 const IPC_FRAME_DEADLINE: Duration = Duration::from_secs(10);
 /// Overall deadline for writing one response frame (a slow reader cannot pin plaintext).
 const IPC_WRITE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Write deadline for one accepted connection. Control slots must not stay blocked
+/// on a slow reader for the full IPC write budget.
+pub fn ipc_write_deadline(control_only: bool) -> Duration {
+    if control_only {
+        CONTROL_FIRST_FRAME_DEADLINE
+    } else {
+        IPC_WRITE_DEADLINE
+    }
+}
 /// Initial receive buffer; grown once to the exact frame size after this much has arrived.
 const IPC_INITIAL_RECV_CAPACITY: usize = 64 * 1024;
 /// Extended client-side wait window for `DaemonRequest::Unlock` to accommodate
@@ -338,9 +348,10 @@ impl DaemonInstanceLock {
             .open(&lock_path)?;
         let meta = file.metadata()?;
         let my_uid = unsafe { libc::geteuid() };
-        if !meta.file_type().is_file() || meta.uid() != my_uid {
+        // nlink == 1 before fchmod: a hard link would otherwise change the other name.
+        if !meta.file_type().is_file() || meta.uid() != my_uid || meta.nlink() != 1 {
             return Err(VaultError::Daemon(
-                "daemon.lock is not a regular file owned by current user".into(),
+                "daemon.lock is not a regular, unlinked file owned by the current user".into(),
             ));
         }
         let _ = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
@@ -657,6 +668,7 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
                         return;
                     }
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                    let mut load_auth = None;
                     let response = handle_connection(
                         &mut stream,
                         &st,
@@ -665,8 +677,19 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
                         my_uid,
                         enforce_kdf_policy,
                         control_only,
+                        &mut load_auth,
                     );
-                    let _ = write_frame(&mut stream, &response);
+                    let response = match load_auth {
+                        Some((epoch, path)) => {
+                            gate_vault_response(response, session_still_current(&st, epoch, &path))
+                        }
+                        None => response,
+                    };
+                    let _ = write_frame_with_deadline(
+                        &mut stream,
+                        &response,
+                        ipc_write_deadline(control_only),
+                    );
                 });
                 if spawn_res.is_err() {
                     pool.fetch_sub(1, Ordering::AcqRel);
@@ -721,6 +744,7 @@ fn reject_busy(stream: &mut UnixStream) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // existing connection context, plus the load-epoch out-parameter
 fn handle_connection(
     stream: &mut UnixStream,
     state: &Arc<Mutex<DaemonState>>,
@@ -729,6 +753,7 @@ fn handle_connection(
     my_uid: u32,
     enforce_kdf_policy: bool,
     control_only: bool,
+    load_auth: &mut Option<(u64, PathBuf)>,
 ) -> DaemonResponse {
     let (header_deadline, frame_deadline) = if control_only {
         (CONTROL_FIRST_FRAME_DEADLINE, CONTROL_FIRST_FRAME_DEADLINE)
@@ -795,7 +820,14 @@ fn handle_connection(
                 }
             }
             let _hg = HeavyGuard(heavy_workers);
-            handle_heavy_request(heavy_req, state, io_lock, my_uid, enforce_kdf_policy)
+            handle_heavy_request(
+                heavy_req,
+                state,
+                io_lock,
+                my_uid,
+                enforce_kdf_policy,
+                load_auth,
+            )
         }
     }
 }
@@ -824,6 +856,7 @@ fn handle_heavy_request(
     io_lock: &Arc<Mutex<()>>,
     my_uid: u32,
     enforce_kdf_policy: bool,
+    load_auth: &mut Option<(u64, PathBuf)>,
 ) -> DaemonResponse {
     match &mut req {
         DaemonRequest::Unlock {
@@ -1021,6 +1054,7 @@ fn handle_heavy_request(
                         }
                     }
                     drop(guard);
+                    *load_auth = Some((start_epoch, canonical));
                     DaemonResponse::Vault {
                         vault,
                         revision: rev,
@@ -1036,6 +1070,11 @@ fn handle_heavy_request(
             vault,
             expected_revision,
         } => {
+            if let Err(e) = crate::vault::validate_entries(vault) {
+                return DaemonResponse::Error {
+                    message: e.to_string(),
+                };
+            }
             let canonical = canonical_or_owned(vault_path);
             let (key_clone, mut header_copy, start_epoch, session_generation) = {
                 let Ok(mut guard) = state.lock() else {
@@ -1416,9 +1455,29 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Drop a loaded vault instead of writing it if the session was locked after `LoadVault`
+/// built the response and before the socket write.
+fn gate_vault_response(response: DaemonResponse, still_current: bool) -> DaemonResponse {
+    match response {
+        DaemonResponse::Vault { .. } if !still_current => DaemonResponse::Error {
+            message: "load cancelled: vault was locked concurrently".into(),
+        },
+        other => other,
+    }
+}
+
 /// Two-pass exact-size frame serializer so `Zeroizing<Vec<u8>>` NEVER reallocates and leaks
 /// unzeroized plaintext JSON into freed heap chunks.
 fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+    write_frame_with_deadline(stream, value, IPC_WRITE_DEADLINE)
+}
+
+/// Write one IPC frame, giving up at `timeout` so a slow reader cannot pin the worker.
+pub fn write_frame_with_deadline<T: Serialize>(
+    stream: &mut UnixStream,
+    value: &T,
+    timeout: Duration,
+) -> Result<()> {
     let mut counter = CountingWriter::default();
     serde_json::to_writer(&mut counter, value)
         .map_err(|_| VaultError::Serialization("failed measuring IPC frame".into()))?;
@@ -1431,7 +1490,7 @@ fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     serde_json::to_writer(&mut *payload, value)
         .map_err(|_| VaultError::Serialization("failed serializing IPC frame".into()))?;
     let len = (payload.len() as u32).to_le_bytes();
-    let deadline = Instant::now() + IPC_WRITE_DEADLINE;
+    let deadline = Instant::now() + timeout;
     write_all_with_deadline(stream, &len, deadline)?;
     write_all_with_deadline(stream, &payload, deadline)?;
     Ok(())
@@ -1555,5 +1614,35 @@ fn read_some_with_deadline(
             }
             Err(e) => return Err(VaultError::Io(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vault::Vault;
+
+    #[test]
+    fn vault_response_is_withheld_when_the_lock_epoch_moved() {
+        let fresh = DaemonResponse::Vault {
+            vault: Vault::new(),
+            revision: "rev".into(),
+        };
+        assert!(matches!(
+            gate_vault_response(fresh, false),
+            DaemonResponse::Error { .. }
+        ));
+        let fresh = DaemonResponse::Vault {
+            vault: Vault::new(),
+            revision: "rev".into(),
+        };
+        assert!(matches!(
+            gate_vault_response(fresh, true),
+            DaemonResponse::Vault { .. }
+        ));
+        assert!(matches!(
+            gate_vault_response(DaemonResponse::Ok, false),
+            DaemonResponse::Ok
+        ));
     }
 }

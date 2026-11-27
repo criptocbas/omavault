@@ -334,6 +334,20 @@ fn entries_with_terminal_control_characters_are_rejected() {
     assert!(v
         .add_entry(Entry::new("site".into(), "u".into(), "pw\x1b[31m".into()))
         .is_err());
+    assert!(v
+        .add_entry(Entry::new(
+            "site".into(),
+            "u".into(),
+            "bidi\u{202E}secret".into()
+        ))
+        .is_err());
+    let mut hidden = Entry::new("site".into(), "u".into(), "pw-12345678".into());
+    hidden.custom_fields.push(omavault::vault::CustomField {
+        label: "pin".into(),
+        value: "12\u{200B}34".into(),
+        secret: true,
+    });
+    assert!(v.add_entry(hidden).is_err());
 
     // Newlines/tabs in notes are fine; CRLF is normalized.
     let mut ok = Entry::new("site".into(), "user".into(), "pw-12345678".into());

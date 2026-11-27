@@ -299,6 +299,118 @@ fn save_vault_returns_new_revision() {
 }
 
 #[test]
+fn control_write_deadline_unblocks_a_full_socket() {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    assert_eq!(
+        omavault::daemon::ipc_write_deadline(true),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        omavault::daemon::ipc_write_deadline(false),
+        Duration::from_secs(10)
+    );
+
+    let (mut writer, _reader) = UnixStream::pair().unwrap();
+    unsafe {
+        let sz: libc::c_int = 1024;
+        let rc = libc::setsockopt(
+            writer.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sz as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        assert_eq!(rc, 0, "setsockopt SO_SNDBUF");
+    }
+    writer.set_nonblocking(true).unwrap();
+    let junk = vec![0u8; 64 * 1024];
+    loop {
+        match writer.write(&junk) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("filling the socket: {e}"),
+        }
+    }
+    writer.set_nonblocking(false).unwrap();
+
+    let payload = "x".repeat(64 * 1024);
+    let started = Instant::now();
+    let err = omavault::daemon::write_frame_with_deadline(
+        &mut writer,
+        &payload,
+        Duration::from_millis(250),
+    )
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "a full control-slot write must not wait out the 10s IPC budget ({elapsed:?}: {err})"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "write returned in {elapsed:?} without applying the deadline: {err}"
+    );
+}
+
+#[test]
+fn hardlinked_daemon_lock_is_refused() {
+    let tmp = private_tempdir();
+    let victim = tmp.path().join("victim");
+    fs::write(&victim, b"not-a-lock").unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::hard_link(&victim, tmp.path().join("daemon.lock")).unwrap();
+    let sock = tmp.path().join("daemon.sock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let res = run_daemon_with_config(&sock, DaemonConfig::new(60, false));
+        let _ = tx.send(res.err().map(|e| e.to_string()));
+    });
+    let err = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("hard-linked daemon.lock must fail before the accept loop");
+    let msg = err.expect("daemon start error");
+    assert!(msg.contains("daemon.lock"), "{msg}");
+    assert_eq!(
+        fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "fchmod must not follow the hard link onto the victim"
+    );
+}
+
+#[test]
+fn save_vault_rejects_invisible_or_control_characters() {
+    let h = Harness::start(600, 3600);
+    h.unlock();
+    let (mut v, rev) = h.client.load_vault(&h.vault_path).unwrap();
+    let mut evil = Entry::new("site".into(), "user".into(), "pw-123456".into());
+    evil.password = "pw\u{202E}hidden".into();
+    v.entries.push(evil);
+    let err = h
+        .client
+        .save_vault(&h.vault_path, &v, Some(rev))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invisible") || msg.contains("control"),
+        "{msg}"
+    );
+    let (loaded, rev) = h.client.load_vault(&h.vault_path).unwrap();
+    assert!(
+        loaded.entries.is_empty(),
+        "a rejected save must not seal the entry"
+    );
+
+    let mut v = loaded;
+    let mut evil = Entry::new("site".into(), "user".into(), "pw-123456".into());
+    evil.password = "pw\u{001b}[31m".into();
+    v.entries.push(evil);
+    assert!(h.client.save_vault(&h.vault_path, &v, Some(rev)).is_err());
+}
+
+#[test]
 fn library_daemon_does_not_clear_the_live_clipboard() {
     let cfg = DaemonConfig::new(60, false);
     assert!(

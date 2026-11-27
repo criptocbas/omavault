@@ -97,6 +97,11 @@ fn private_dir_ok(dir: &Path) -> bool {
 }
 
 fn read_pid_file(path: &Path) -> Option<u32> {
+    read_pid_file_meta(path, false).map(|(pid, _, _)| pid)
+}
+
+/// Read a pid file. `require_single_link` is for `daemon.lock`, which must not be a hard link.
+fn read_pid_file_meta(path: &Path, require_single_link: bool) -> Option<(u32, u64, u64)> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -106,9 +111,39 @@ fn read_pid_file(path: &Path) -> Option<u32> {
     if !meta.file_type().is_file() || meta.uid() != my_euid() || meta.len() > MAX_PID_FILE_BYTES {
         return None;
     }
+    if require_single_link && meta.nlink() != 1 {
+        return None;
+    }
     let mut s = String::new();
     file.take(MAX_PID_FILE_BYTES).read_to_string(&mut s).ok()?;
-    s.trim().parse().ok()
+    let pid = s.trim().parse().ok()?;
+    Some((pid, meta.dev(), meta.ino()))
+}
+
+/// True when `pid` currently holds an advisory `FLOCK` `WRITE` lock on `(dev, ino)`.
+///
+/// `/proc/locks` prints the device as `major:minor` in hex and the inode in decimal, for example
+/// `00:39:193891`. A PID written into `daemon.lock` that does not hold that lock is a decoy.
+fn process_holds_flock_write(pid: u32, dev: u64, ino: u64) -> bool {
+    let Ok(text) = fs::read_to_string("/proc/locks") else {
+        return false;
+    };
+    let device = format!("{:02x}:{:02x}:{}", libc::major(dev), libc::minor(dev), ino);
+    let pid_s = pid.to_string();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Holder lines are `N: FLOCK ADVISORY WRITE <pid> <maj>:<min>:<ino> ...`.
+        // Waiters are prefixed with `->` and must not count.
+        if parts.len() >= 6
+            && parts[1] == "FLOCK"
+            && parts[3] == "WRITE"
+            && parts[4] == pid_s
+            && parts[5] == device
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Write our PID into an already-`flock`ed daemon lock file.
@@ -127,7 +162,11 @@ pub fn signal_daemon_lock(socket_path: &Path) -> Option<u32> {
     if !private_dir_ok(dir) {
         return None;
     }
-    let pid = read_pid_file(&dir.join("daemon.lock"))?;
+    let lock_path = dir.join("daemon.lock");
+    let (pid, dev, ino) = read_pid_file_meta(&lock_path, true)?;
+    if !process_holds_flock_write(pid, dev, ino) {
+        return None;
+    }
     if verify_omavault_process(pid, OmavaultRole::Daemon) && send_sigusr1(pid) {
         Some(pid)
     } else {
@@ -241,5 +280,47 @@ mod tests {
         assert_eq!(signal_registered_tuis(&sock), 0);
         drop(reg);
         assert!(!entry.exists());
+    }
+
+    #[test]
+    fn decoy_pid_in_daemon_lock_is_not_signalled() {
+        use std::fs::{self, File};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path().join("omavault");
+        fs::create_dir(&rt).unwrap();
+        fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
+        let sock = rt.join("daemon.sock");
+        let lock = rt.join("daemon.lock");
+        fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (_pid, dev, ino) = read_pid_file_meta(&lock, true).expect("pid file");
+        assert!(
+            !process_holds_flock_write(std::process::id(), dev, ino),
+            "a pid sitting in daemon.lock does not own the lock"
+        );
+        assert!(signal_daemon_lock(&sock).is_none());
+
+        let held = File::open(&lock).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(
+            process_holds_flock_write(std::process::id(), dev, ino),
+            "the process that flocked daemon.lock must be visible in /proc/locks"
+        );
+        // This test process is not an omavault daemon, so no signal is sent.
+        assert!(signal_daemon_lock(&sock).is_none());
+
+        fs::hard_link(&lock, rt.join("daemon.lock.alias")).unwrap();
+        assert!(
+            read_pid_file_meta(&lock, true).is_none(),
+            "a hard-linked daemon.lock must be ignored"
+        );
+        assert!(signal_daemon_lock(&sock).is_none());
     }
 }
