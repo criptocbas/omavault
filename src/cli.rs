@@ -59,7 +59,7 @@ fn parse_clip_timeout(s: &str) -> std::result::Result<u64, String> {
 #[derive(Parser, Debug)]
 #[command(
     name = "omavault",
-    version,
+    version = crate::VERSION,
     about = "Bulletproof, memory-hardened password manager for Omarchy Linux (Arch + Hyprland + Wayland)",
     long_about = "Encrypted with Argon2id + HKDF-SHA512 + XChaCha20-Poly1305.\n\
                   Hardened with mlock/PROT_NONE/anti-ptrace, Wayland secret clipboard tagging, \
@@ -1075,6 +1075,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
         }
 
         Commands::Status => {
+            println!("omavault version:  {}", crate::VERSION);
             println!("Process hardening: {}", hardening.summary());
             println!("Vault path:        {}", vault_path.display());
             if vault_path.exists() {

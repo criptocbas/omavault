@@ -1338,10 +1338,10 @@ fn draw_locked_screen(
         "•".repeat(input_len.min(32))
     };
     let mut lines = vec![
-        Line::from(Span::styled(
-            "  OMAVAULT  ·  HARDENED PASSWORD VAULT",
-            theme::title_style(),
-        )),
+        Line::from(vec![
+            Span::styled("  OMAVAULT  ·  HARDENED PASSWORD VAULT", theme::title_style()),
+            Span::styled(format!("   v{}", crate::VERSION), theme::muted_style()),
+        ]),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Vault:   ", theme::muted_style()),
@@ -1454,6 +1454,7 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
 
     let line = Line::from(vec![
         Span::styled(" OMAVAULT ", theme::title_style()),
+        Span::styled(format!("v{} ", crate::VERSION), theme::muted_style()),
         Span::styled("│ ", theme::muted_style()),
         Span::styled(
             format!("Search: {search_text}  "),
@@ -1995,6 +1996,11 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         Line::from("   A               Run local Password Security Audit"),
         Line::from("   L / Ctrl+L      Lock vault & wipe keys from RAM immediately"),
         Line::from("   q / Ctrl+C      Quit & clear clipboard"),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  omavault v{}", crate::VERSION),
+            theme::muted_style(),
+        )),
     ];
     let p = Paragraph::new(lines)
         .block(

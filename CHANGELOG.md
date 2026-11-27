@@ -33,6 +33,12 @@
 - Client connect helper retries `EAGAIN` (full backlog) and `EINTR` within its deadline.
 - Hyprland `.conf` and hypridle snippets prefer root-owned `/usr/bin/omavault` over `~/.local/bin`.
 
+### Added
+- The build version (`<crate version> (<git commit>)`) is shown on the TUI unlock screen, the
+  TUI top bar, the help screen, `omavault --version`, and `omavault status`, so unreleased builds
+  from `main` can be told apart. Embedded by a small `build.rs` (falls back to the plain version
+  without git; override with `OMAVAULT_GIT_COMMIT`).
+
 ### Phase 3: integrity & output safety
 - **Rollback / file-swap protection**: authenticated `vault_id` + monotonic `generation` inside the
   encrypted payload; a per-path record in `~/.local/state/omavault/seen/` refuses older copies,
