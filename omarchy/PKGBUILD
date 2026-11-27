@@ -19,12 +19,16 @@ prepare() {
 }
 
 build() {
+    # makepkg creates ./pkg as mode 0111 for the duration of build(). Cargo's
+    # build-script fingerprint walks this repo and fails on that unreadable dir.
+    chmod u+r "$startdir/pkg"
     cd "$startdir/.."
     export CARGO_TARGET_DIR=target
     cargo build --frozen --release
 }
 
 check() {
+    chmod u+r "$startdir/pkg"
     cd "$startdir/.."
     cargo test --frozen
 }
