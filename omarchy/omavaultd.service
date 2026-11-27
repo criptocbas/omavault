@@ -25,18 +25,13 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @mount @module @raw-io @reboot @swap @clock @cpu-emulation @debug @obsolete
 SystemCallErrorNumber=EPERM
-# Kernel / host surface the daemon never needs (verified to keep the daemon, the logind
-# pre-sleep inhibitor and /sys/class/hidraw discovery working in a sandboxed test run).
-ProtectSystem=full
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-PrivateIPC=yes
 IPAddressDeny=any
 # Not enabled, by design:
+# - ProtectSystem=, ProtectKernelTunables/Modules/Logs=, ProtectControlGroups=, ProtectClock=,
+#   ProtectHostname=, PrivateIPC=: in a *user* unit each of these silently implies
+#   PrivateUsers=yes. Inside that user namespace root-owned files appear owned by uid 65534,
+#   which (correctly) makes omavault refuse to execute /usr/bin/fido2-token / fido2-assert
+#   ("trusted root-owned fido2-token not found") and breaks FIDO2 unlock via the daemon.
 # - ProtectProc=invisible / ProcSubset=pid: break the /proc screen-locker (hyprlock) detector.
 # - ProtectSystem=strict: would make vaults outside ~/.local/share (OMAVAULT_PATH) unsaveable.
 # - PrivateNetwork=yes: blocks AF_NETLINK, which libudev FIDO2 HID discovery needs.

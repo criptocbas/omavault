@@ -21,9 +21,12 @@
   `omavault lock` signals all of them. Daemon-not-running detection is now a typed error instead
   of English `strerror` matching.
 - **`SystemCallFilter=` deny-list was silently ignored** (mixed `~` tokens on one line); split into
-  allow/deny lines. Added `ProtectSystem=full`, `ProtectKernel{Tunables,Modules,Logs}`,
-  `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `PrivateIPC`, `IPAddressDeny=any`
-  (`systemd-analyze security`: 5.6 → 3.8).
+  allow/deny lines and added `IPAddressDeny=any` (`systemd-analyze security`: 5.6 → 5.3).
+  *Correction:* an earlier commit also added `ProtectSystem=full`, `ProtectKernel*`,
+  `ProtectControlGroups`, `ProtectClock`, `ProtectHostname` and `PrivateIPC`. In a user unit each
+  implies `PrivateUsers=yes`, under which root-owned files appear owned by uid 65534, so the daemon
+  refused to run `/usr/bin/fido2-*` ("trusted root-owned fido2-token not found") and FIDO2 unlock
+  via the daemon failed. Those options were removed; the unit now documents why.
 - Daemon races: `LoadVault` re-checks the lock epoch before releasing plaintext; the screen-locker
   probe no longer runs under the state mutex; session switches bump the epoch; `SaveVault`
   re-verifies the session and returns the new revision (`Saved { revision }`), removing the TUI's
