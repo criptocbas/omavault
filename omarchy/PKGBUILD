@@ -1,6 +1,6 @@
 # Maintainer: CBas
 pkgname=omavault
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Bulletproof, memory-hardened Rust password manager for Omarchy Linux (Arch + Hyprland + Wayland)"
 arch=('x86_64' 'aarch64')

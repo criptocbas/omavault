@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use zeroize::Zeroizing;
 
-use crate::crypto::{header_revision, open_vault, seal_vault, VaultHeader, MAX_VAULT_FILE_BYTES};
+use crate::crypto::kdf::{derive_master_key_from_pw_hash, derive_passphrase_hash};
+use crate::crypto::{
+    header_revision, open_vault, seal_vault, unwrap_master_key_from_slot, VaultHeader,
+    MAX_VAULT_FILE_BYTES, VAULT_VERSION_V1, VAULT_VERSION_V2,
+};
 use crate::error::{Result, VaultError};
 use crate::hardening::{fill_random, CountingWriter, LockedKey};
 use crate::vault::Vault;
@@ -188,14 +192,19 @@ pub fn atomic_write_private(path: &Path, data: &[u8]) -> Result<()> {
     ensure_private_dir(parent)?;
 
     let _lock = FileLockGuard::acquire(path)?;
-    atomic_write_unlocked(path, parent, data, true)
+    atomic_write_unlocked(path, parent, data, true, false)
 }
 
+/// Write `data` to `path` via a fsynced `0600` temp file.
+///
+/// With `no_replace`, the temp file is published with `link(2)` (fails atomically with
+/// `EEXIST`) instead of `rename(2)`, so an existing vault can never be overwritten.
 fn atomic_write_unlocked(
     path: &Path,
     parent: &Path,
     data: &[u8],
     create_backup: bool,
+    no_replace: bool,
 ) -> Result<()> {
     let mut suffix = [0u8; 8];
     fill_random(&mut suffix)?;
@@ -232,8 +241,19 @@ fn atomic_write_unlocked(
         }
     }
 
-    fs::rename(&tmp_path, path)?;
-    tmp_guard.disarm();
+    if no_replace {
+        // TempFileGuard removes the temp name on every path (success or EEXIST).
+        fs::hard_link(&tmp_path, path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                VaultError::VaultAlreadyExists(path.display().to_string())
+            } else {
+                VaultError::Io(e)
+            }
+        })?;
+    } else {
+        fs::rename(&tmp_path, path)?;
+        tmp_guard.disarm();
+    }
 
     if let Ok(dir_file) = OpenOptions::new()
         .read(true)
@@ -262,7 +282,7 @@ fn rotate_encrypted_backup(path: &Path, parent: &Path) -> Result<()> {
     }
 
     let bak1 = append_os_suffix(path, ".bak.1");
-    atomic_write_unlocked(&bak1, parent, &existing, false)?;
+    atomic_write_unlocked(&bak1, parent, &existing, false, false)?;
     Ok(())
 }
 
@@ -339,6 +359,11 @@ fn serialize_vault_exact(vault: &Vault) -> Result<Zeroizing<Vec<u8>>> {
 
 /// Atomically verify `expected_revision` (when provided), serialize without realloc copies,
 /// seal (rotating `save_salt` + `nonce`), and write to disk under ONE exclusive `flock(LOCK_EX)`.
+///
+/// The caller's `header` is authoritative and is NEVER replaced by the on-disk header: callers
+/// such as `rekey` and `fido2 add/remove` intentionally write a different header (new KDF salt,
+/// key slots, or version). `header` is only updated (with the rotated `save_salt`/`nonce`) after
+/// the new file has been durably committed, so a failed write leaves it in sync with disk.
 pub fn save_vault_to_disk_checked(
     path: &Path,
     master_key: &LockedKey<32>,
@@ -359,12 +384,14 @@ pub fn save_vault_to_disk_checked(
                 "vault was modified concurrently on disk; reload and retry".into(),
             ));
         }
-        *header = disk_hdr;
     }
 
     let plaintext = serialize_vault_exact(vault)?;
-    let blob = seal_vault(master_key, header, &plaintext)?;
-    atomic_write_unlocked(path, parent, &blob, create_backup)
+    let mut next_header = header.clone();
+    let blob = seal_vault(master_key, &mut next_header, &plaintext)?;
+    atomic_write_unlocked(path, parent, &blob, create_backup, false)?;
+    *header = next_header;
+    Ok(())
 }
 
 /// Serialize into an exact-size zeroizing buffer, encrypt (rotating `save_salt` + `nonce`),
@@ -376,6 +403,103 @@ pub fn save_vault_to_disk(
     vault: &Vault,
 ) -> Result<()> {
     save_vault_to_disk_checked(path, master_key, header, vault, None, false, true)
+}
+
+/// Create a brand-new vault file, failing with `VaultAlreadyExists` (never overwriting) if any
+/// file already exists at `path` — checked under the vault `flock` and enforced atomically by
+/// publishing with `link(2)`.
+pub fn create_new_vault_on_disk(
+    path: &Path,
+    master_key: &LockedKey<32>,
+    header: &mut VaultHeader,
+    vault: &Vault,
+) -> Result<()> {
+    let parent = resolve_parent(path)?;
+    ensure_private_dir(parent)?;
+    let _lock = FileLockGuard::acquire(path)?;
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(VaultError::VaultAlreadyExists(path.display().to_string()));
+    }
+
+    let plaintext = serialize_vault_exact(vault)?;
+    let mut next_header = header.clone();
+    let blob = seal_vault(master_key, &mut next_header, &plaintext)?;
+    atomic_write_unlocked(path, parent, &blob, false, true)?;
+    *header = next_header;
+    Ok(())
+}
+
+/// Independently re-open a freshly written vault from disk using ONLY user credentials,
+/// before any old-key backups are purged.
+///
+/// This deliberately does not trust the in-memory master key: it
+/// 1. requires the on-disk header to be byte-identical to `expected_header` (the header that
+///    was just written: version, flags, KDF params, `kdf_salt`, key slots),
+/// 2. re-runs Argon2id against the ON-DISK `kdf_salt` / KDF params,
+/// 3. re-derives (v1) or unwraps (v2, via the slot labelled `fido2_slot_secret.0`) the master
+///    key from the on-disk header, and
+/// 4. authenticates + decrypts the payload with that re-derived key and checks the entry count.
+pub fn verify_saved_vault(
+    path: &Path,
+    expected_header: &VaultHeader,
+    passphrase: &[u8],
+    keyfile_digest: Option<&[u8; 32]>,
+    fido2_slot_secret: Option<(&str, &[u8; 32])>,
+    expected_entries: usize,
+    enforce_kdf_policy: bool,
+) -> Result<()> {
+    let fail = |what: &str| {
+        VaultError::InvalidFormat(format!(
+            "post-save verification failed: {what}; old backups were NOT purged"
+        ))
+    };
+
+    let disk_hdr = read_header_from_disk(path, enforce_kdf_policy)?;
+    if disk_hdr.to_bytes()? != expected_header.to_bytes()? {
+        return Err(fail(
+            "on-disk header does not match the header that was written",
+        ));
+    }
+
+    let pw_hash = derive_passphrase_hash(
+        passphrase,
+        &disk_hdr.kdf_salt,
+        disk_hdr.kdf_params,
+        enforce_kdf_policy,
+    )?;
+    let key = match disk_hdr.version {
+        VAULT_VERSION_V1 => {
+            let fido2 = if disk_hdr.requires_fido2() {
+                Some(
+                    fido2_slot_secret
+                        .map(|(_, s)| s)
+                        .ok_or_else(|| fail("missing FIDO2 secret for v1 vault"))?,
+                )
+            } else {
+                None
+            };
+            derive_master_key_from_pw_hash(&pw_hash, &disk_hdr.kdf_salt, keyfile_digest, fido2)?
+        }
+        VAULT_VERSION_V2 => {
+            let (label, secret) =
+                fido2_slot_secret.ok_or_else(|| fail("missing FIDO2 secret for v2 vault"))?;
+            let slot = disk_hdr
+                .fido2_slots
+                .iter()
+                .find(|s| s.label.eq_ignore_ascii_case(label))
+                .ok_or_else(|| fail("expected FIDO2 key slot is missing from disk header"))?;
+            unwrap_master_key_from_slot(&disk_hdr, slot, &pw_hash, keyfile_digest, secret)
+                .map_err(|_| fail("could not unwrap master key from on-disk key slot"))?
+        }
+        other => return Err(VaultError::UnsupportedVersion(other)),
+    };
+
+    let (_, vault) = load_vault_from_disk(path, &key, enforce_kdf_policy)
+        .map_err(|_| fail("vault does not decrypt with re-derived credentials"))?;
+    if vault.entries.len() != expected_entries {
+        return Err(fail("entry count mismatch after save"));
+    }
+    Ok(())
 }
 
 /// Read, authenticate, decrypt, and deserialize a vault from disk.

@@ -34,7 +34,8 @@ use crate::tui::{run_tui, TuiConfig};
 use crate::vault::audit::run_audit;
 use crate::vault::storage::{
     default_vault_path, generate_keyfile, load_vault_from_disk, purge_encrypted_backups,
-    read_header_from_disk, save_vault_to_disk, save_vault_to_disk_checked,
+    create_new_vault_on_disk, read_header_from_disk, save_vault_to_disk_checked,
+    verify_saved_vault,
 };
 use crate::vault::{Entry, Vault};
 
@@ -564,7 +565,6 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     true,
                 )?;
                 let (_, vault) = load_vault_from_disk(&vault_path, &res.master_key, true)?;
-                drop(passphrase);
 
                 wait_for_yubikey_swap(&format!(
                     "Now plug in ONLY the NEW YubiKey to enroll as '{label}', then press Enter..."
@@ -608,7 +608,17 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         true,
                         true,
                     )?;
-                    let _ = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                    // Prove the NEW key's slot actually unlocks the vault as written on disk.
+                    verify_saved_vault(
+                        &vault_path,
+                        &updated_header,
+                        passphrase.as_bytes(),
+                        kf_digest.as_deref(),
+                        Some((label.as_str(), &*new_secret)),
+                        vault.entries.len(),
+                        true,
+                    )?;
+                    drop(passphrase);
                     println!(
                         "Enrolled FIDO2 key '{}' ({}/{} slots). You can now unlock with any enrolled key: {}",
                         tty_safe(&label),
@@ -660,8 +670,27 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     v2_header.fido2_slots.push(slot1);
                     v2_header.fido2_slots.push(slot2);
 
-                    save_vault_to_disk(&vault_path, &new_master_key, &mut v2_header, &vault)?;
-                    let _ = load_vault_from_disk(&vault_path, &new_master_key, true)?;
+                    let expected_rev = header_revision(&old_header);
+                    save_vault_to_disk_checked(
+                        &vault_path,
+                        &new_master_key,
+                        &mut v2_header,
+                        &vault,
+                        Some(&expected_rev),
+                        true,
+                        true,
+                    )?;
+                    drop(new_master_key);
+                    verify_saved_vault(
+                        &vault_path,
+                        &v2_header,
+                        passphrase.as_bytes(),
+                        kf_digest.as_deref(),
+                        Some((label.as_str(), &*new_secret)),
+                        vault.entries.len(),
+                        true,
+                    )?;
+                    drop(passphrase);
                     println!(
                         "Upgraded vault to OMAV v2 and enrolled '{label}' ({}/{} slots: {}).",
                         v2_header.fido2_slots.len(),
@@ -745,7 +774,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     .map(|(i, s)| (i, s.clone()))
                     .collect();
 
-                let mut updated_header = if !no_rotate {
+                let updated_header = if !no_rotate {
                     // Cryptographically revoke the removed key by rotating BOTH `kdf_salt` and
                     // `vault_master_key`, and re-wrapping every remaining key slot!
                     let mut hdr = VaultHeader::new_v2_fido2_shell(
@@ -792,7 +821,6 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         )?;
                         hdr.fido2_slots.push(wrapped);
                     }
-                    drop(passphrase);
                     save_vault_to_disk_checked(
                         &vault_path,
                         &new_mk,
@@ -800,12 +828,10 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         &vault,
                         Some(&expected_rev),
                         true,
-                        !should_purge,
+                        true,
                     )?;
-                    let _ = load_vault_from_disk(&vault_path, &new_mk, true)?;
                     hdr
                 } else {
-                    drop(passphrase);
                     let mut hdr = old_header.clone();
                     hdr.fido2_slots = remaining_slots.into_iter().map(|(_, s)| s).collect();
                     save_vault_to_disk_checked(
@@ -815,13 +841,34 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         &vault,
                         Some(&expected_rev),
                         true,
-                        !should_purge,
+                        true,
                     )?;
-                    let _ = load_vault_from_disk(&vault_path, &res.master_key, true)?;
                     hdr
                 };
 
-                let _ = &mut updated_header;
+                // Re-open from disk with the passphrase + the key that authorized removal,
+                // which also proves the removed slot is gone from the written header.
+                let matched_label = old_header.fido2_slots[matched_idx].label.clone();
+                let matched_secret = res
+                    .matched_fido2_secret
+                    .as_ref()
+                    .ok_or(VaultError::Fido2Required)?;
+                verify_saved_vault(
+                    &vault_path,
+                    &updated_header,
+                    passphrase.as_bytes(),
+                    kf_digest.as_deref(),
+                    Some((matched_label.as_str(), &**matched_secret)),
+                    vault.entries.len(),
+                    true,
+                )?;
+                drop(passphrase);
+                if updated_header.has_fido2_label(&label) {
+                    return Err(VaultError::Fido2Error(format!(
+                        "post-save verification failed: slot '{label}' is still present; old backups were NOT purged"
+                    )));
+                }
+
                 if should_purge {
                     let removed = purge_encrypted_backups(&vault_path)?;
                     println!(
@@ -1082,7 +1129,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
             };
 
             let vault = Vault::new();
-            save_vault_to_disk(&vault_path, &master_key, &mut header, &vault)?;
+            create_new_vault_on_disk(&vault_path, &master_key, &mut header, &vault)?;
 
             println!(
                 "Initialized encrypted OMAV v{} vault at '{}'",
@@ -1577,7 +1624,9 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 old_kf
             };
 
-            let (mut new_header, new_master_key) = if remove_fido2
+            // Each branch also returns one (slot label, hmac-secret) pair so the saved vault can
+            // be independently re-opened from disk before old-key backups are purged.
+            let (mut new_header, new_master_key, verify_secret) = if remove_fido2
                 || (!enable_fido2 && !old_header.requires_fido2())
             {
                 let hdr = VaultHeader::new(new_params, new_kf.is_some(), None)?;
@@ -1589,7 +1638,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     None,
                     true,
                 )?;
-                (hdr, mk)
+                (hdr, mk, None)
             } else if enable_fido2 {
                 let provider = LibFido2Cli;
                 let meta = provider.enroll(cli.fido2_device.as_deref(), fido2_uv)?;
@@ -1612,7 +1661,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     &sec,
                 )?;
                 hdr.fido2_slots.push(slot);
-                (hdr, mk)
+                (hdr, mk, Some((fido2_label.clone(), sec)))
             } else if old_header.version == VAULT_VERSION_V1 {
                 // Keep existing legacy single FIDO2 key while upgrading to OMAV v2 slots.
                 let old_meta = old_header.fido2.clone().ok_or(VaultError::Fido2Required)?;
@@ -1631,7 +1680,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     &sec,
                 )?;
                 hdr.fido2_slots.push(slot);
-                (hdr, mk)
+                (hdr, mk, Some(("primary".to_string(), sec)))
             } else {
                 // Re-key existing OMAV v2 multi-slot vault: rotate vault_master_key and re-wrap
                 // the active YubiKey (reusing its secret) plus any other enrolled YubiKeys.
@@ -1640,12 +1689,14 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     derive_passphrase_hash(new_pass.as_bytes(), &hdr.kdf_salt, new_params, true)?;
                 let mk = generate_random_master_key()?;
                 let provider = LibFido2Cli;
+                let mut verify_secret = None;
 
                 for (idx, old_slot) in old_header.fido2_slots.iter().enumerate() {
                     if Some(idx) == old_matched_idx {
                         let sec = old_fido2_secret
                             .as_ref()
                             .ok_or(VaultError::Fido2Required)?;
+                        verify_secret = Some((old_slot.label.clone(), sec.clone()));
                         let wrapped = wrap_master_key_for_slot(
                             &hdr,
                             &mk,
@@ -1679,10 +1730,11 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         }
                     }
                 }
-                (hdr, mk)
+                let verify_secret = verify_secret.ok_or(VaultError::Fido2Required)?;
+                (hdr, mk, Some(verify_secret))
             };
-            drop(new_pass);
 
+            // Always keep a rolling backup of the old-key vault until the new one is verified.
             save_vault_to_disk_checked(
                 &vault_path,
                 &new_master_key,
@@ -1690,10 +1742,22 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 &vault,
                 Some(&expected_rev),
                 true,
-                !should_purge,
+                true,
             )?;
-            // Verify new vault decrypts cleanly before purging old-key backups.
-            let _ = load_vault_from_disk(&vault_path, &new_master_key, true)?;
+            drop(new_master_key);
+            // Re-open from disk with ONLY the new credentials before purging old-key backups.
+            verify_saved_vault(
+                &vault_path,
+                &new_header,
+                new_pass.as_bytes(),
+                new_kf.as_deref(),
+                verify_secret
+                    .as_ref()
+                    .map(|(label, sec)| (label.as_str(), &**sec)),
+                vault.entries.len(),
+                true,
+            )?;
+            drop(new_pass);
 
             if should_purge {
                 let removed = purge_encrypted_backups(&vault_path)?;
