@@ -1,9 +1,10 @@
-# Maintainer: Omarchy User
+# Maintainer: CBas
 pkgname=omavault
-pkgver=0.1.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Bulletproof, memory-hardened Rust password manager for Omarchy Linux (Arch + Hyprland + Wayland)"
 arch=('x86_64' 'aarch64')
+url="https://github.com/criptocbas/omavault"
 license=('MIT')
 depends=('glibc' 'gcc-libs')
 optdepends=(
@@ -14,14 +15,13 @@ makedepends=('cargo')
 
 build() {
     cd "$startdir/.."
-    export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
-    cargo build --frozen --release
+    cargo build --locked --release
 }
 
 check() {
     cd "$startdir/.."
-    cargo test --frozen
+    cargo test --locked
 }
 
 package() {
@@ -32,4 +32,5 @@ package() {
     install -Dm644 "omarchy/omavault.lua" "$pkgdir/usr/share/doc/$pkgname/omavault.lua"
     install -Dm644 "omarchy/hypr-omavault.conf" "$pkgdir/usr/share/doc/$pkgname/hypr-omavault.conf"
     install -Dm644 "omarchy/hypridle-hook.conf" "$pkgdir/usr/share/doc/$pkgname/hypridle-hook.conf"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

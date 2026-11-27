@@ -1,8 +1,9 @@
 [package]
 name = "omavault"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Bulletproof, memory-hardened password manager crafted for Omarchy Linux (Arch + Hyprland + Wayland)"
+repository = "https://github.com/criptocbas/omavault"
 license = "MIT"
 rust-version = "1.80"
 

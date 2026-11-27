@@ -22,7 +22,10 @@ A bulletproof, memory-hardened, keyboard-first password manager crafted in Rust 
 
 ## Quick Installation on Omarchy
 
+Make sure Rust is installed (`sudo pacman -S rust`), then clone and install:
+
 ```bash
+git clone https://github.com/criptocbas/omavault.git
 cd omavault
 chmod +x omarchy/install.sh
 ./omarchy/install.sh
@@ -147,3 +150,13 @@ omavault lock
 ```
 
 See [SECURITY.md](SECURITY.md) for the complete binary specification, key hierarchy, FIDO2 verification model, and threat model.
+
+---
+
+## Security Status & Contributing
+
+`omavault` uses zero custom cryptography (relying exclusively on audited RustCrypto and BLAKE3 crates) and has undergone extensive internal security review and automated regression testing. However, it is an early open-source project and has **not yet undergone a formal independent third-party cryptographic audit**.
+
+Security researchers, Rust developers, and Omarchy users are warmly invited to inspect the code, try to break it, open issues, or submit pull requests.
+
+Licensed under the [MIT License](LICENSE).
