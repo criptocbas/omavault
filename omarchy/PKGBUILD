@@ -6,7 +6,7 @@ pkgdesc="Bulletproof, memory-hardened Rust password manager for Omarchy Linux (A
 arch=('x86_64' 'aarch64')
 url="https://github.com/criptocbas/omavault"
 license=('MIT')
-depends=('glibc' 'gcc-libs')
+depends=('glibc' 'gcc-libs' 'dbus')
 optdepends=(
     'libfido2: FIDO2 / YubiKey hmac-secret hardware 2FA support'
     'foot: zero-scrollback TUI terminal launcher on Omarchy 4.5+'

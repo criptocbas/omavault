@@ -6,7 +6,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/omavault daemon --timeout 300
+ExecStart=%h/.local/bin/omavault daemon --timeout 300 --max-session 3600
 KillSignal=SIGTERM
 TimeoutStopSec=5
 Restart=on-failure
@@ -20,10 +20,29 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 SystemCallArchitectures=native
-SystemCallFilter=@system-service ~@privileged ~@mount ~@module ~@raw-io ~@reboot ~@swap ~@clock ~@cpu-emulation ~@debug ~@obsolete
+# NOTE: `~` only inverts when it is the FIRST character of an assignment, so the allow-list and
+# the deny-list MUST be separate lines (a single mixed line silently ignores every `~@group`).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @module @raw-io @reboot @swap @clock @cpu-emulation @debug @obsolete
 SystemCallErrorNumber=EPERM
+# Kernel / host surface the daemon never needs (verified to keep the daemon, the logind
+# pre-sleep inhibitor and /sys/class/hidraw discovery working in a sandboxed test run).
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateIPC=yes
+IPAddressDeny=any
+# Not enabled, by design:
+# - ProtectProc=invisible / ProcSubset=pid: break the /proc screen-locker (hyprlock) detector.
+# - ProtectSystem=strict: would make vaults outside ~/.local/share (OMAVAULT_PATH) unsaveable.
+# - PrivateNetwork=yes: blocks AF_NETLINK, which libudev FIDO2 HID discovery needs.
+# - CapabilityBoundingSet=: no effect in user units (the user manager holds no capabilities).
 KeyringMode=private
-# AF_UNIX for local IPC socket, Hyprland IPC, and logind busctl + AF_NETLINK for libudev FIDO2 HID discovery
+# AF_UNIX for local IPC socket, Hyprland IPC, and the system D-Bus (logind pre-sleep) + AF_NETLINK for libudev FIDO2 HID discovery
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 StandardInput=null
 LimitCORE=0

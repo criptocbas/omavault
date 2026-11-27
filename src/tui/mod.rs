@@ -29,6 +29,8 @@ use crate::crypto::fido2::LibFido2Cli;
 use crate::crypto::kdf::hash_keyfile;
 use crate::crypto::{header_revision, resolve_master_key, VaultHeader, VAULT_VERSION_V2};
 use crate::daemon::{DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS};
+use crate::procsig::TuiRegistration;
+use crate::sleep::SleepMonitor;
 use crate::error::{Result, VaultError};
 use crate::generator::{
     estimate_entropy_bits, generate_passphrase, generate_password, generated_password_entropy_bits,
@@ -99,6 +101,10 @@ enum Mode {
         started_at: Instant,
         requires_fido2: bool,
         rx: mpsc::Receiver<UnlockOutcome>,
+        /// Set (via `Drop`) the moment the TUI leaves `Unlocking` for any reason — cancel,
+        /// lock, quit, or panic unwind — so the worker re-locks the daemon if its unlock lands
+        /// after the user cancelled.
+        _cancel: CancelOnDrop,
     },
     Normal,
     Search,
@@ -109,6 +115,15 @@ enum Mode {
         entry_name: String,
     },
     Help,
+}
+
+/// Sets the shared cancellation flag when dropped.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 #[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
@@ -321,6 +336,27 @@ impl App {
         self.status_toast = Some((level, msg.into(), Instant::now()));
     }
 
+    /// Abort an in-flight unlock. Order matters: leaving `Mode::Unlocking` sets the worker's
+    /// cancel flag FIRST, then we tell the daemon to lock (see `start_unlock`).
+    fn cancel_unlock(&mut self, reason: &str) {
+        self.mode = Mode::Locked {
+            passphrase_input: Zeroizing::new(String::with_capacity(256)),
+            error_msg: Some(reason.into()),
+        };
+        let client = DaemonClient::new(self.cfg.socket_path.clone());
+        let _ = client.lock();
+        clear_clipboard_best_effort();
+    }
+
+    /// Out-of-band lock request (SIGUSR1 from `omavault lock`, or logind pre-sleep).
+    fn emergency_lock(&mut self, reason: &str) {
+        match self.mode {
+            Mode::Unlocking { .. } => self.cancel_unlock(reason),
+            Mode::Locked { .. } => clear_clipboard_best_effort(),
+            _ => self.lock_vault(reason, true),
+        }
+    }
+
     /// Lock vault locally (and optionally tell daemon to lock as well).
     fn lock_vault(&mut self, reason: &str, notify_daemon: bool) {
         let mut daemon_warn: Option<String> = None;
@@ -355,10 +391,12 @@ impl App {
         let requires_fido2 = self.header_preview.requires_fido2();
 
         let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         self.mode = Mode::Unlocking {
             started_at: Instant::now(),
             requires_fido2,
             rx,
+            _cancel: CancelOnDrop(Arc::clone(&cancelled)),
         };
 
         thread::spawn(move || {
@@ -366,6 +404,12 @@ impl App {
             if client.status().is_ok() {
                 let outcome = match client.unlock(&vault_path, passphrase, keyfile_path, fido2_device)
                 {
+                    // The TUI sets `cancelled` BEFORE it sends its own Lock, so either we observe
+                    // the flag here, or our unlock committed before that Lock (which then wins).
+                    Ok(()) if cancelled.load(Ordering::SeqCst) => {
+                        let _ = client.lock();
+                        return;
+                    }
                     Ok(()) => {
                         let mlocked = client.status().map(|s| s.mlocked).unwrap_or(false);
                         match client.load_vault(&vault_path) {
@@ -379,7 +423,11 @@ impl App {
                     }
                     Err(e) => UnlockOutcome::Error(e.to_string()),
                 };
-                let _ = tx.send(outcome);
+                let unlocked = !matches!(outcome, UnlockOutcome::Error(_));
+                if (tx.send(outcome).is_err() || cancelled.load(Ordering::SeqCst)) && unlocked {
+                    // Nobody is waiting for this session any more: never leave the daemon open.
+                    let _ = client.lock();
+                }
                 return;
             }
 
@@ -400,6 +448,9 @@ impl App {
                     fido2_device.as_deref(),
                     true,
                 )?;
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(VaultError::Daemon("unlock cancelled".into()));
+                }
                 let (verified_header, vault) =
                     load_vault_from_disk(&vault_path, &res.master_key, true)?;
                 Ok((res.master_key, verified_header, vault))
@@ -476,10 +527,14 @@ impl App {
         match self.backend.as_mut() {
             Some(SessionBackend::Daemon { revision, .. }) => {
                 let client = DaemonClient::new(self.cfg.socket_path.clone());
-                client.save_vault(&self.cfg.vault_path, &staged, revision.clone())?;
-                // Refresh latest revision token after save.
-                if let Ok((_, new_rev)) = client.load_vault(&self.cfg.vault_path) {
-                    *revision = Some(new_rev);
+                match client.save_vault(&self.cfg.vault_path, &staged, revision.clone())? {
+                    Some(new_rev) => *revision = Some(new_rev),
+                    // Older daemon without `Saved { revision }`: fall back to a reload.
+                    None => {
+                        if let Ok((_, new_rev)) = client.load_vault(&self.cfg.vault_path) {
+                            *revision = Some(new_rev);
+                        }
+                    }
                 }
             }
             Some(SessionBackend::Standalone { master_key, header }) => {
@@ -601,12 +656,7 @@ impl App {
                 } else {
                     "unlock cancelled: screen lock detected"
                 };
-                let client = DaemonClient::new(self.cfg.socket_path.clone());
-                let _ = client.lock();
-                self.mode = Mode::Locked {
-                    passphrase_input: Zeroizing::new(String::with_capacity(256)),
-                    error_msg: Some(reason.into()),
-                };
+                self.cancel_unlock(reason);
                 return;
             }
 
@@ -1065,6 +1115,29 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
     let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&signal_quit));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&signal_quit));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&signal_quit));
+    // `omavault lock` (Super+Ctrl+Shift+L) signals registered TUIs — including standalone ones
+    // with no daemon — with SIGUSR1.
+    let signal_lock = Arc::new(AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&signal_lock));
+    let _registration = TuiRegistration::register(&app.cfg.socket_path);
+
+    // Pre-sleep lock for this process's own secrets (standalone key + any decrypted entries).
+    // The callback blocks (bounded) until the UI thread confirms the wipe, so the logind delay
+    // inhibitor is held until secrets are gone.
+    let sleep_request = Arc::new(AtomicBool::new(false));
+    let sleep_done = Arc::new(AtomicBool::new(false));
+    let _sleep_monitor = {
+        let req = Arc::clone(&sleep_request);
+        let done = Arc::clone(&sleep_done);
+        SleepMonitor::spawn(move || {
+            done.store(false, Ordering::SeqCst);
+            req.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
 
     enable_raw_mode().map_err(VaultError::Io)?;
     let _tui_guard = TuiGuard;
@@ -1089,6 +1162,14 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
                     }
                 }
             }
+            if sleep_request.swap(false, Ordering::SeqCst) {
+                app.emergency_lock("system pre-sleep/hibernate");
+                terminal.draw(|f| draw_ui(f, &mut app)).map_err(VaultError::Io)?;
+                sleep_done.store(true, Ordering::SeqCst);
+            }
+            if signal_lock.swap(false, Ordering::SeqCst) {
+                app.emergency_lock("emergency lock (omavault lock)");
+            }
             app.on_tick();
 
             if app.should_quit || signal_quit.load(Ordering::SeqCst) {
@@ -1101,8 +1182,7 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
     // If the user cancelled/quit while an unlock was still in flight, immediately signal `omavaultd`
     // to bump `lock_epoch` so the background unlock cannot silently leave the daemon unlocked!
     if matches!(app.mode, Mode::Unlocking { .. }) {
-        let client = DaemonClient::new(app.cfg.socket_path.clone());
-        let _ = client.lock();
+        app.cancel_unlock("quit during unlock");
     }
 
     // Overwrite ratatui screen buffer and wipe RAM before TuiGuard restores terminal & clears clipboard.

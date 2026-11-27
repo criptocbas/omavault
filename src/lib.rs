@@ -5,6 +5,8 @@ pub mod daemon;
 pub mod error;
 pub mod generator;
 pub mod hardening;
+pub mod procsig;
+pub mod sleep;
 pub mod totp;
 pub mod tui;
 pub mod vault;

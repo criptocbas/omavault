@@ -48,6 +48,8 @@ directories = "6.0"
 
 # Errors
 thiserror = "2.0"
+# Unprivileged systemd-logind PrepareForSleep subscription + sleep delay inhibitor
+dbus = { version = "0.9", features = ["stdfd"] }
 
 [dev-dependencies]
 tempfile = "3.14"

@@ -1,11 +1,9 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -19,6 +17,8 @@ use crate::crypto::fido2::LibFido2Cli;
 use crate::crypto::kdf::hash_keyfile;
 use crate::crypto::{header_revision, resolve_master_key, VaultHeader};
 use crate::error::{Result, VaultError};
+use crate::procsig::{signal_daemon_lock, write_pid_into};
+use crate::sleep::{SleepMonitor, SleepMonitorState};
 use crate::hardening::{
     boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, CountingWriter,
     HardeningStatus, LockedKey,
@@ -30,12 +30,27 @@ use crate::vault::storage::{
 use crate::vault::Vault;
 
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
+/// Absolute maximum time a vault may stay unlocked in the daemon, regardless of IPC activity.
+pub const DEFAULT_MAX_SESSION_SECS: u64 = 3600;
+pub const MIN_MAX_SESSION_SECS: u64 = 60;
+pub const MAX_MAX_SESSION_SECS: u64 = 24 * 3600;
 const MAX_IPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum total concurrent IPC worker threads (reserves 8 dedicated control slots for Lock/Shutdown/Status).
-const MAX_TOTAL_WORKERS: usize = 16;
-/// Maximum concurrent heavy workers (`Unlock`, `LoadVault`, `SaveVault`) so emergency `Lock` is never starved.
+/// General-purpose concurrent IPC workers (any request type).
+const MAX_GENERAL_WORKERS: usize = 16;
+/// Extra worker slots used ONLY when the general pool is full, and only for requests whose
+/// first frame parses as `Lock` / `Status` / `Shutdown` within `CONTROL_FIRST_FRAME_DEADLINE`.
+const RESERVED_CONTROL_WORKERS: usize = 8;
+/// Maximum concurrent heavy workers (`Unlock`, `LoadVault`, `SaveVault`).
 const MAX_HEAVY_WORKERS: usize = 8;
+/// The 4-byte length header of the first request frame must arrive within this window, so idle
+/// "slowloris" connections release their worker slot quickly.
+const IPC_HEADER_DEADLINE: Duration = Duration::from_secs(1);
+const CONTROL_FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(250);
 const IPC_FRAME_DEADLINE: Duration = Duration::from_secs(10);
+/// Overall deadline for writing one response frame (a slow reader cannot pin plaintext).
+const IPC_WRITE_DEADLINE: Duration = Duration::from_secs(10);
+/// Initial receive buffer; grown once to the exact frame size after this much has arrived.
+const IPC_INITIAL_RECV_CAPACITY: usize = 64 * 1024;
 /// Extended client-side wait window for `DaemonRequest::Unlock` to accommodate
 /// Argon2id derivation plus the 45-second FIDO2 physical touch timeout.
 const IPC_UNLOCK_DEADLINE: Duration = Duration::from_secs(60);
@@ -130,6 +145,14 @@ pub struct DaemonStatus {
     #[serde(default)]
     pub core_dumps_disabled: bool,
     pub last_lock_reason: Option<String>,
+    /// Seconds until the absolute session lifetime forces a lock (0 when locked).
+    #[serde(default)]
+    pub session_remaining_secs: u64,
+    #[serde(default)]
+    pub max_session_secs: u64,
+    /// Human-readable state of the logind pre-sleep monitor.
+    #[serde(default)]
+    pub presleep_monitor: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -140,6 +163,10 @@ pub enum DaemonResponse {
     Vault {
         vault: Vault,
         #[serde(default)]
+        revision: String,
+    },
+    /// Successful `SaveVault`, carrying the new revision token (no plaintext round-trip needed).
+    Saved {
         revision: String,
     },
     Error {
@@ -153,11 +180,15 @@ struct UnlockedSession {
     header: VaultHeader,
     /// Last activity recorded on `CLOCK_BOOTTIME` (advances during suspend!).
     last_activity_boot_secs: u64,
+    /// When the session was unlocked (`CLOCK_BOOTTIME`); never refreshed by activity.
+    unlocked_at_boot_secs: u64,
 }
 
 struct DaemonState {
     session: Option<UnlockedSession>,
     idle_timeout_secs: u64,
+    max_session_secs: u64,
+    presleep: Option<Arc<Mutex<SleepMonitorState>>>,
     last_lock_reason: Option<String>,
     shutdown_requested: bool,
     /// Monotonic epoch incremented on EVERY lock/shutdown event so in-flight `Unlock` or
@@ -167,10 +198,12 @@ struct DaemonState {
 }
 
 impl DaemonState {
-    fn new(idle_timeout_secs: u64, hardening: HardeningStatus) -> Self {
+    fn new(idle_timeout_secs: u64, max_session_secs: u64, hardening: HardeningStatus) -> Self {
         Self {
             session: None,
             idle_timeout_secs,
+            max_session_secs,
+            presleep: None,
             last_lock_reason: None,
             shutdown_requested: false,
             lock_epoch: 0,
@@ -189,12 +222,26 @@ impl DaemonState {
         had_session
     }
 
+    fn presleep_description(&self) -> String {
+        match &self.presleep {
+            Some(st) => st
+                .lock()
+                .map(|s| s.describe())
+                .unwrap_or_else(|e| e.into_inner().describe()),
+            None => "disabled".into(),
+        }
+    }
+
     fn status(&self) -> DaemonStatus {
+        let presleep_monitor = self.presleep_description();
         match &self.session {
             Some(s) => {
                 let now = current_boot_secs();
                 let elapsed = now.saturating_sub(s.last_activity_boot_secs);
                 let remaining = self.idle_timeout_secs.saturating_sub(elapsed);
+                let session_remaining = self
+                    .max_session_secs
+                    .saturating_sub(now.saturating_sub(s.unlocked_at_boot_secs));
                 DaemonStatus {
                     unlocked: true,
                     vault_path: Some(s.vault_path.clone()),
@@ -206,6 +253,9 @@ impl DaemonState {
                     dumpable_disabled: self.hardening.dumpable_disabled,
                     core_dumps_disabled: self.hardening.core_dumps_disabled,
                     last_lock_reason: self.last_lock_reason.clone(),
+                    session_remaining_secs: session_remaining,
+                    max_session_secs: self.max_session_secs,
+                    presleep_monitor,
                 }
             }
             None => DaemonStatus {
@@ -219,7 +269,22 @@ impl DaemonState {
                 dumpable_disabled: self.hardening.dumpable_disabled,
                 core_dumps_disabled: self.hardening.core_dumps_disabled,
                 last_lock_reason: self.last_lock_reason.clone(),
+                session_remaining_secs: 0,
+                max_session_secs: self.max_session_secs,
+                presleep_monitor,
             },
+        }
+    }
+
+    /// Lock reason if the session has exceeded the idle timeout or absolute lifetime.
+    fn expiry_reason(&self, now: u64) -> Option<&'static str> {
+        let s = self.session.as_ref()?;
+        if now.saturating_sub(s.unlocked_at_boot_secs) >= self.max_session_secs {
+            Some("maximum session lifetime reached")
+        } else if now.saturating_sub(s.last_activity_boot_secs) >= self.idle_timeout_secs {
+            Some("inactivity timeout")
+        } else {
+            None
         }
     }
 }
@@ -262,6 +327,9 @@ impl DaemonInstanceLock {
                 "another omavault daemon instance is already running for this socket".into(),
             ));
         }
+        // Publish our PID so `omavault lock` can fall back to SIGUSR1 if the socket is flooded.
+        let mut file = file;
+        write_pid_into(&mut file)?;
         Ok(Self { _file: file })
     }
 }
@@ -274,62 +342,38 @@ fn resolve_socket_parent(socket_path: &Path) -> Result<&Path> {
     }
 }
 
-/// Spawn an optional `busctl --system monitor` thread listening for systemd-logind's
-/// `PrepareForSleep(true)` signal over `AF_UNIX` so `omavaultd` wipes keys *before* S3/S4 sleep.
-#[cfg(target_os = "linux")]
-fn spawn_presleep_monitor(state: Arc<Mutex<DaemonState>>, signal_stop: Arc<AtomicBool>) {
-    let busctl = Path::new("/usr/bin/busctl");
-    if !busctl.is_file() {
-        return;
+/// Daemon runtime configuration.
+#[derive(Clone, Debug)]
+pub struct DaemonConfig {
+    pub idle_timeout_secs: u64,
+    /// Absolute unlocked-session lifetime; clamped to `MIN_MAX_SESSION_SECS..=MAX_MAX_SESSION_SECS`.
+    pub max_session_secs: u64,
+    pub enforce_kdf_policy: bool,
+    pub hardening: HardeningStatus,
+    /// Subscribe to systemd-logind `PrepareForSleep` (disabled in tests).
+    pub presleep_monitor: bool,
+}
+
+impl DaemonConfig {
+    pub fn new(idle_timeout_secs: u64, enforce_kdf_policy: bool) -> Self {
+        Self {
+            idle_timeout_secs,
+            max_session_secs: DEFAULT_MAX_SESSION_SECS,
+            enforce_kdf_policy,
+            hardening: HardeningStatus::default(),
+            presleep_monitor: false,
+        }
     }
-    let _ = thread::Builder::new()
-        .name("omavaultd-presleep".into())
-        .spawn(move || {
-            let mut cmd = Command::new(busctl);
-            cmd.args([
-                "--system",
-                "monitor",
-                "--match",
-                "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-            unsafe {
-                cmd.pre_exec(|| {
-                    let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-                    Ok(())
-                });
-            }
-            let Ok(mut child) = cmd.spawn() else {
-                return;
-            };
-            let Some(stdout) = child.stdout.take() else {
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
-            };
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if signal_stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                let Ok(text) = line else {
-                    break;
-                };
-                if text.contains("boolean true") {
-                    let should_clear = {
-                        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.lock_inner("system pre-sleep/hibernate detected")
-                    };
-                    if should_clear {
-                        clear_clipboard_best_effort();
-                    }
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+}
+
+/// Validate a user-supplied `--max-session` value.
+pub fn validate_max_session_secs(secs: u64) -> Result<u64> {
+    if !(MIN_MAX_SESSION_SECS..=MAX_MAX_SESSION_SECS).contains(&secs) {
+        return Err(VaultError::Daemon(format!(
+            "--max-session must be between {MIN_MAX_SESSION_SECS} and {MAX_MAX_SESSION_SECS} seconds"
+        )));
+    }
+    Ok(secs)
 }
 
 /// Run the auto-locking background daemon listening on `socket_path`.
@@ -338,11 +382,9 @@ pub fn run_daemon(
     idle_timeout_secs: u64,
     enforce_kdf_policy: bool,
 ) -> Result<()> {
-    run_daemon_with_hardening(
+    run_daemon_with_config(
         socket_path,
-        idle_timeout_secs,
-        enforce_kdf_policy,
-        HardeningStatus::default(),
+        DaemonConfig::new(idle_timeout_secs, enforce_kdf_policy),
     )
 }
 
@@ -353,6 +395,23 @@ pub fn run_daemon_with_hardening(
     enforce_kdf_policy: bool,
     hardening: HardeningStatus,
 ) -> Result<()> {
+    let mut cfg = DaemonConfig::new(idle_timeout_secs, enforce_kdf_policy);
+    cfg.hardening = hardening;
+    cfg.presleep_monitor = true;
+    run_daemon_with_config(socket_path, cfg)
+}
+
+fn lock_and_clear(state: &Mutex<DaemonState>, reason: &str) {
+    {
+        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+        g.lock_inner(reason);
+    }
+    clear_clipboard_best_effort();
+}
+
+/// Run the daemon with an explicit [`DaemonConfig`].
+pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<()> {
+    let enforce_kdf_policy = cfg.enforce_kdf_policy;
     let parent = resolve_socket_parent(socket_path)?;
     // Use strict 0700 for dedicated omavault/private dirs without accidentally chmodding $HOME.
     let is_dedicated = parent
@@ -393,30 +452,56 @@ pub fn run_daemon_with_hardening(
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
+    // The CLI enforces MIN_MAX_SESSION_SECS..=MAX_MAX_SESSION_SECS via
+    // `validate_max_session_secs`; library callers (tests) may use shorter lifetimes.
+    let max_session = cfg.max_session_secs.clamp(1, MAX_MAX_SESSION_SECS);
     let state = Arc::new(Mutex::new(DaemonState::new(
-        idle_timeout_secs.max(10),
-        hardening,
+        cfg.idle_timeout_secs.max(10),
+        max_session,
+        cfg.hardening,
     )));
     let io_lock = Arc::new(Mutex::new(()));
-    let active_total_workers = Arc::new(AtomicUsize::new(0));
+    let general_workers = Arc::new(AtomicUsize::new(0));
+    let control_workers = Arc::new(AtomicUsize::new(0));
     let active_heavy_workers = Arc::new(AtomicUsize::new(0));
     let signal_stop = Arc::new(AtomicBool::new(false));
-    let signal_lock = Arc::new(AtomicBool::new(false));
 
-    // Register graceful shutdown signals (SIGTERM, SIGINT, SIGHUP) and out-of-band emergency lock (SIGUSR1).
+    // Graceful shutdown signals (SIGTERM, SIGINT, SIGHUP).
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&signal_stop));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&signal_stop));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&signal_stop));
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&signal_lock));
 
-    #[cfg(target_os = "linux")]
-    spawn_presleep_monitor(Arc::clone(&state), Arc::clone(&signal_stop));
+    // Out-of-band emergency lock (SIGUSR1), handled IMMEDIATELY on a dedicated thread. This is
+    // the fallback path `omavault lock` uses when the socket is flooded.
+    let mut sigusr1 = signal_hook::iterator::Signals::new([signal_hook::consts::SIGUSR1])
+        .map_err(|e| VaultError::Daemon(format!("failed registering SIGUSR1: {e}")))?;
+    let sigusr1_handle = sigusr1.handle();
+    let sigusr1_state = Arc::clone(&state);
+    let sigusr1_thread = thread::Builder::new()
+        .name("omavaultd-sigusr1".into())
+        .spawn(move || {
+            for _ in sigusr1.forever() {
+                lock_and_clear(&sigusr1_state, "emergency SIGUSR1 lock");
+            }
+        })
+        .map_err(|e| VaultError::Daemon(format!("failed spawning signal thread: {e}")))?;
 
-    // Spawn security watchdog thread (CLOCK_BOOTTIME idle timeout, Hyprland/proc screen lock,
-    // SIGUSR1 emergency lock, and CLOCK_BOOTTIME - CLOCK_MONOTONIC suspend/resume detection).
+    // Pre-sleep / hibernate lock via unprivileged systemd-logind subscription + delay inhibitor.
+    let _sleep_monitor = if cfg.presleep_monitor {
+        let sleep_state = Arc::clone(&state);
+        let monitor = SleepMonitor::spawn(move || {
+            lock_and_clear(&sleep_state, "system pre-sleep/hibernate");
+        });
+        state.lock().unwrap_or_else(|e| e.into_inner()).presleep = Some(monitor.state_handle());
+        Some(monitor)
+    } else {
+        None
+    };
+
+    // Spawn security watchdog thread (CLOCK_BOOTTIME idle timeout + absolute session lifetime,
+    // Hyprland/proc screen lock, and CLOCK_BOOTTIME - CLOCK_MONOTONIC suspend/resume detection).
     let watchdog_state = Arc::clone(&state);
     let watchdog_signal = Arc::clone(&signal_stop);
-    let watchdog_lock_sig = Arc::clone(&signal_lock);
     let watchdog_handle = thread::Builder::new()
         .name("omavaultd-watchdog".into())
         .spawn(move || {
@@ -434,14 +519,6 @@ pub fn run_daemon_with_hardening(
                         clear_clipboard_best_effort();
                     }
                     break;
-                }
-
-                if watchdog_lock_sig.swap(false, Ordering::SeqCst) {
-                    let _ = {
-                        let mut g = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
-                        g.lock_inner("emergency SIGUSR1 lock")
-                    };
-                    clear_clipboard_best_effort();
                 }
 
                 let current_skew = boottime_monotonic_skew_ms();
@@ -470,12 +547,8 @@ pub fn run_daemon_with_hardening(
                         clear_clip = guard.lock_inner("system suspend/resume detected");
                     } else if locker_active {
                         clear_clip = guard.lock_inner("screen lock detected");
-                    } else if let Some(session) = &guard.session {
-                        let elapsed =
-                            current_boot_secs().saturating_sub(session.last_activity_boot_secs);
-                        if elapsed >= guard.idle_timeout_secs {
-                            clear_clip = guard.lock_inner("inactivity timeout");
-                        }
+                    } else if let Some(reason) = guard.expiry_reason(current_boot_secs()) {
+                        clear_clip = guard.lock_inner(reason);
                     }
                     if poisoned {
                         drop(guard);
@@ -494,8 +567,9 @@ pub fn run_daemon_with_hardening(
         })
         .map_err(|e| VaultError::Daemon(format!("failed spawning watchdog thread: {e}")))?;
 
-    // Main accept loop dispatching to bounded worker threads with dedicated control headroom
-    // so slow Argon2id/FIDO2 unlocks NEVER starve emergency `omavault lock` requests.
+    // Main accept loop. Connections go to the general pool; when it is full, a small reserved
+    // pool accepts ONLY control requests (Lock/Status/Shutdown) that arrive within 250 ms, so a
+    // flood of idle or slow connections cannot starve `omavault lock`.
     loop {
         if signal_stop.load(Ordering::SeqCst) {
             break;
@@ -516,23 +590,20 @@ pub fn run_daemon_with_hardening(
                     eprintln!("omavaultd: rejected IPC connection with mismatched peer UID");
                     continue;
                 }
-                let prev = active_total_workers.fetch_add(1, Ordering::AcqRel);
-                if prev >= MAX_TOTAL_WORKERS {
-                    active_total_workers.fetch_sub(1, Ordering::AcqRel);
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-                    let _ = write_frame(
-                        &mut stream,
-                        &DaemonResponse::Error {
-                            message: "daemon busy (too many concurrent connections)".into(),
-                        },
-                    );
+                let (pool, control_only) = if try_acquire(&general_workers, MAX_GENERAL_WORKERS)
+                {
+                    (Arc::clone(&general_workers), false)
+                } else if try_acquire(&control_workers, RESERVED_CONTROL_WORKERS) {
+                    (Arc::clone(&control_workers), true)
+                } else {
+                    reject_busy(&mut stream);
                     continue;
-                }
+                };
 
                 let st = Arc::clone(&state);
                 let io_l = Arc::clone(&io_lock);
-                let total_workers = Arc::clone(&active_total_workers);
                 let heavy_workers = Arc::clone(&active_heavy_workers);
+                let pool_for_thread = Arc::clone(&pool);
                 let spawn_res = thread::Builder::new().spawn(move || {
                     struct WorkerGuard(Arc<AtomicUsize>);
                     impl Drop for WorkerGuard {
@@ -540,10 +611,12 @@ pub fn run_daemon_with_hardening(
                             self.0.fetch_sub(1, Ordering::AcqRel);
                         }
                     }
-                    let _wg = WorkerGuard(total_workers);
+                    let _wg = WorkerGuard(pool_for_thread);
 
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    if stream.set_nonblocking(false).is_err() {
+                        return;
+                    }
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
                     let response = handle_connection(
                         &mut stream,
                         &st,
@@ -551,15 +624,16 @@ pub fn run_daemon_with_hardening(
                         &heavy_workers,
                         my_uid,
                         enforce_kdf_policy,
+                        control_only,
                     );
                     let _ = write_frame(&mut stream, &response);
                 });
                 if spawn_res.is_err() {
-                    active_total_workers.fetch_sub(1, Ordering::AcqRel);
+                    pool.fetch_sub(1, Ordering::AcqRel);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(20));
             }
             Err(_) => {
                 thread::sleep(Duration::from_millis(100));
@@ -577,7 +651,34 @@ pub fn run_daemon_with_hardening(
     }
     let _ = fs::remove_file(socket_path);
     let _ = watchdog_handle.join();
+    sigusr1_handle.close();
+    let _ = sigusr1_thread.join();
     Ok(())
+}
+
+/// Increment `counter` only if it is below `max`.
+fn try_acquire(counter: &AtomicUsize, max: usize) -> bool {
+    let mut cur = counter.load(Ordering::Acquire);
+    while cur < max {
+        match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+    false
+}
+
+/// Best-effort, NON-blocking busy reply so a full peer buffer can never stall the accept loop.
+fn reject_busy(stream: &mut UnixStream) {
+    let _ = stream.set_nonblocking(true);
+    let msg = DaemonResponse::Error {
+        message: "daemon busy (too many concurrent connections)".into(),
+    };
+    if let Ok(payload) = serde_json::to_vec(&msg) {
+        let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+        let _ = stream.write(&frame);
+    }
 }
 
 fn handle_connection(
@@ -587,8 +688,14 @@ fn handle_connection(
     heavy_workers: &Arc<AtomicUsize>,
     my_uid: u32,
     enforce_kdf_policy: bool,
+    control_only: bool,
 ) -> DaemonResponse {
-    let raw = match read_frame(stream) {
+    let (header_deadline, frame_deadline) = if control_only {
+        (CONTROL_FIRST_FRAME_DEADLINE, CONTROL_FIRST_FRAME_DEADLINE)
+    } else {
+        (IPC_HEADER_DEADLINE, IPC_FRAME_DEADLINE)
+    };
+    let raw = match read_frame_with_deadlines(stream, header_deadline, frame_deadline) {
         Ok(b) => b,
         Err(e) => {
             return DaemonResponse::Error {
@@ -615,12 +722,8 @@ fn handle_connection(
             DaemonResponse::Status(guard.status())
         }
         DaemonRequest::Lock => {
-            let _had_session = {
-                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                guard.lock_inner("manual lock")
-            };
             // Always clear clipboard on explicit Lock (even if vault was already locked or unlocking).
-            clear_clipboard_best_effort();
+            lock_and_clear(state, "manual lock");
             DaemonResponse::Ok
         }
         DaemonRequest::Shutdown => {
@@ -632,10 +735,11 @@ fn handle_connection(
             clear_clipboard_best_effort();
             DaemonResponse::Ok
         }
+        _ if control_only => DaemonResponse::Error {
+            message: "daemon busy (only lock/status/shutdown accepted right now)".into(),
+        },
         heavy_req => {
-            let prev = heavy_workers.fetch_add(1, Ordering::AcqRel);
-            if prev >= MAX_HEAVY_WORKERS {
-                heavy_workers.fetch_sub(1, Ordering::AcqRel);
+            if !try_acquire(heavy_workers, MAX_HEAVY_WORKERS) {
                 return DaemonResponse::Error {
                     message: "daemon busy (too many concurrent unlock/vault operations)".into(),
                 };
@@ -719,30 +823,36 @@ fn handle_heavy_request(
                 let (verified_header, _vault) =
                     load_vault_from_disk(&canonical, &master_key, enforce_kdf_policy)?;
 
+                let now = current_boot_secs();
                 Ok(UnlockedSession {
                     vault_path: canonical,
                     master_key,
                     header: verified_header,
-                    last_activity_boot_secs: current_boot_secs(),
+                    last_activity_boot_secs: now,
+                    unlocked_at_boot_secs: now,
                 })
             })();
 
             match result {
                 Ok(session) => {
+                    // Probe the (potentially slow) screen locker BEFORE taking the state mutex so
+                    // a wedged compositor socket can never block Lock/Status/SIGUSR1/sleep.
+                    let locker_active = is_screen_locker_active(my_uid);
                     let Ok(mut guard) = state.lock() else {
                         return DaemonResponse::Error {
                             message: "daemon state lock poisoned".into(),
                         };
                     };
                     // Re-check lock_epoch, shutdown & screen locker before committing unlocked session.
-                    if guard.shutdown_requested
-                        || guard.lock_epoch != start_epoch
-                        || is_screen_locker_active(my_uid)
+                    if guard.shutdown_requested || guard.lock_epoch != start_epoch || locker_active
                     {
                         return DaemonResponse::Error {
                             message: "unlock cancelled due to concurrent lock/shutdown".into(),
                         };
                     }
+                    // A session switch is an epoch boundary: in-flight Load/Save for the previous
+                    // session must not complete against the new one.
+                    guard.lock_epoch = guard.lock_epoch.wrapping_add(1);
                     guard.session = Some(session);
                     DaemonResponse::Ok
                 }
@@ -753,12 +863,13 @@ fn handle_heavy_request(
         }
         DaemonRequest::LoadVault { vault_path } => {
             let canonical = canonical_or_owned(vault_path);
-            let key_clone = {
+            let (key_clone, start_epoch) = {
                 let Ok(mut guard) = state.lock() else {
                     return DaemonResponse::Error {
                         message: "daemon state lock poisoned".into(),
                     };
                 };
+                let epoch = guard.lock_epoch;
                 let Some(session) = guard.session.as_mut() else {
                     return DaemonResponse::Error {
                         message: "vault is locked".into(),
@@ -771,7 +882,7 @@ fn handle_heavy_request(
                 }
                 session.last_activity_boot_secs = current_boot_secs();
                 match session.master_key.try_clone() {
-                    Ok(k) => k,
+                    Ok(k) => (k, epoch),
                     Err(e) => {
                         return DaemonResponse::Error {
                             message: e.to_string(),
@@ -788,16 +899,39 @@ fn handle_heavy_request(
                     }
                 }
             };
-            match load_vault_from_disk(&canonical, &key_clone, enforce_kdf_policy) {
+            if !session_still_current(state, start_epoch, &canonical) {
+                return DaemonResponse::Error {
+                    message: "load cancelled: vault was locked concurrently".into(),
+                };
+            }
+            let loaded = load_vault_from_disk(&canonical, &key_clone, enforce_kdf_policy);
+            drop(key_clone);
+            match loaded {
                 Ok((hdr, vault)) => {
                     let rev = header_revision(&hdr);
-                    if let Ok(mut guard) = state.lock() {
-                        if let Some(session) = guard.session.as_mut() {
-                            if session.vault_path == canonical {
-                                session.header = hdr;
+                    // Re-check under the state mutex right before releasing plaintext: a Lock,
+                    // suspend, or shutdown that raced the disk read wins and the vault is dropped.
+                    let Ok(mut guard) = state.lock() else {
+                        return DaemonResponse::Error {
+                            message: "daemon state lock poisoned".into(),
+                        };
+                    };
+                    if guard.shutdown_requested || guard.lock_epoch != start_epoch {
+                        return DaemonResponse::Error {
+                            message: "load cancelled: vault was locked concurrently".into(),
+                        };
+                    }
+                    match guard.session.as_mut() {
+                        Some(session) if session.vault_path == canonical => {
+                            session.header = hdr;
+                        }
+                        _ => {
+                            return DaemonResponse::Error {
+                                message: "load cancelled: vault was locked concurrently".into(),
                             }
                         }
                     }
+                    drop(guard);
                     DaemonResponse::Vault {
                         vault,
                         revision: rev,
@@ -852,18 +986,11 @@ fn handle_heavy_request(
                 }
             };
 
-            // Verify session was not locked while waiting for io_lock.
-            {
-                let Ok(guard) = state.lock() else {
-                    return DaemonResponse::Error {
-                        message: "daemon state lock poisoned".into(),
-                    };
+            // Verify session was not locked or switched while waiting for io_lock.
+            if !session_still_current(state, start_epoch, &canonical) {
+                return DaemonResponse::Error {
+                    message: "save cancelled: vault was locked concurrently".into(),
                 };
-                if guard.shutdown_requested || guard.lock_epoch != start_epoch {
-                    return DaemonResponse::Error {
-                        message: "save cancelled: vault was locked concurrently".into(),
-                    };
-                }
             }
 
             // Use the latest known header revision if caller omitted expected_revision.
@@ -881,6 +1008,7 @@ fn handle_heavy_request(
                 true,
             ) {
                 Ok(()) => {
+                    let revision = header_revision(&header_copy);
                     if let Ok(mut guard) = state.lock() {
                         if guard.lock_epoch == start_epoch {
                             if let Some(session) = guard.session.as_mut() {
@@ -890,7 +1018,7 @@ fn handle_heavy_request(
                             }
                         }
                     }
-                    DaemonResponse::Ok
+                    DaemonResponse::Saved { revision }
                 }
                 Err(e) => DaemonResponse::Error {
                     message: e.to_string(),
@@ -903,9 +1031,31 @@ fn handle_heavy_request(
     }
 }
 
+/// True iff no lock/shutdown/session-switch happened since `start_epoch` and the unlocked
+/// session is still for `canonical`.
+fn session_still_current(state: &Mutex<DaemonState>, start_epoch: u64, canonical: &Path) -> bool {
+    let Ok(guard) = state.lock() else {
+        return false;
+    };
+    !guard.shutdown_requested
+        && guard.lock_epoch == start_epoch
+        && guard
+            .session
+            .as_ref()
+            .is_some_and(|s| s.vault_path == canonical)
+}
+
 /// Client helper for communicating with the local `omavault` daemon.
 pub struct DaemonClient {
     socket_path: PathBuf,
+}
+
+/// How an emergency lock reached the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOutcome {
+    Socket,
+    /// Socket path failed; `SIGUSR1` was delivered to this verified daemon PID.
+    Signal(u32),
 }
 
 impl DaemonClient {
@@ -917,7 +1067,17 @@ impl DaemonClient {
     fn validate_socket_security(&self) -> Result<()> {
         let my_uid = unsafe { libc::geteuid() };
         let parent = resolve_socket_parent(&self.socket_path)?;
-        let pmeta = fs::symlink_metadata(parent)?;
+        let not_running = |e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                VaultError::DaemonUnavailable(format!(
+                    "no daemon socket at '{}'",
+                    self.socket_path.display()
+                ))
+            } else {
+                VaultError::Io(e)
+            }
+        };
+        let pmeta = fs::symlink_metadata(parent).map_err(not_running)?;
         if !pmeta.file_type().is_dir()
             || pmeta.uid() != my_uid
             || (pmeta.permissions().mode() & 0o077) != 0
@@ -927,7 +1087,7 @@ impl DaemonClient {
                 parent.display()
             )));
         }
-        let smeta = fs::symlink_metadata(&self.socket_path)?;
+        let smeta = fs::symlink_metadata(&self.socket_path).map_err(not_running)?;
         if !smeta.file_type().is_socket()
             || smeta.uid() != my_uid
             || (smeta.permissions().mode() & 0o077) != 0
@@ -960,10 +1120,16 @@ impl DaemonClient {
     ) -> Result<DaemonResponse> {
         self.validate_socket_security()?;
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|e| {
-            VaultError::Daemon(format!(
+            let msg = format!(
                 "cannot connect to omavault daemon at '{}': {e}",
                 self.socket_path.display()
-            ))
+            );
+            match e.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                    VaultError::DaemonUnavailable(msg)
+                }
+                _ => VaultError::Daemon(msg),
+            }
         })?;
         // CRITICAL: Mutual SO_PEERCRED — verify the SERVER belongs to our exact UID BEFORE
         // sending any master passphrase or decrypted vault bytes!
@@ -1017,6 +1183,38 @@ impl DaemonClient {
         }
     }
 
+    /// Lock via the socket, falling back to a verified `SIGUSR1` to the daemon process if the
+    /// socket request fails for any reason other than "daemon not running" (e.g. a connection
+    /// flood exhausting worker slots).
+    pub fn lock_with_fallback(&self) -> Result<LockOutcome> {
+        // A "busy" reply means the daemon is alive but its pools are saturated: retry briefly
+        // (reserved control slots free up within 250 ms), then fall back to SIGUSR1.
+        let mut result = self.lock();
+        for _ in 0..3 {
+            match &result {
+                Err(VaultError::Daemon(m)) if m.contains("busy") => {
+                    thread::sleep(Duration::from_millis(100));
+                    result = self.lock();
+                }
+                _ => break,
+            }
+        }
+        match result {
+            Ok(()) => Ok(LockOutcome::Socket),
+            Err(VaultError::DaemonUnavailable(m)) => {
+                // A stale or removed socket can still leave a live daemon behind.
+                match signal_daemon_lock(&self.socket_path) {
+                    Some(pid) => Ok(LockOutcome::Signal(pid)),
+                    None => Err(VaultError::DaemonUnavailable(m)),
+                }
+            }
+            Err(e) => match signal_daemon_lock(&self.socket_path) {
+                Some(pid) => Ok(LockOutcome::Signal(pid)),
+                None => Err(e),
+            },
+        }
+    }
+
     pub fn load_vault(&self, vault_path: &Path) -> Result<(Vault, String)> {
         match self.request(&DaemonRequest::LoadVault {
             vault_path: vault_path.to_path_buf(),
@@ -1027,19 +1225,21 @@ impl DaemonClient {
         }
     }
 
+    /// Save via the daemon. Returns the new revision token when the daemon reports it.
     pub fn save_vault(
         &self,
         vault_path: &Path,
         vault: &Vault,
         expected_revision: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let req = DaemonRequest::SaveVault {
             vault_path: vault_path.to_path_buf(),
             vault: vault.clone(),
             expected_revision,
         };
         match self.request(&req)? {
-            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Saved { revision } => Ok(Some(revision)),
+            DaemonResponse::Ok => Ok(None),
             DaemonResponse::Error { message } => Err(VaultError::Daemon(message)),
             _ => Err(VaultError::Daemon("unexpected response to save_vault".into())),
         }
@@ -1103,31 +1303,68 @@ fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     serde_json::to_writer(&mut *payload, value)
         .map_err(|_| VaultError::Serialization("failed serializing IPC frame".into()))?;
     let len = (payload.len() as u32).to_le_bytes();
-    stream.write_all(&len)?;
-    stream.write_all(&payload)?;
-    stream.flush()?;
+    let deadline = Instant::now() + IPC_WRITE_DEADLINE;
+    write_all_with_deadline(stream, &len, deadline)?;
+    write_all_with_deadline(stream, &payload, deadline)?;
     Ok(())
 }
 
-/// Read an IPC frame with an absolute monotonic deadline and exact pre-sized `Zeroizing<Vec<u8>>`
-/// (peer UID is already authenticated via `SO_PEERCRED` before calling).
-fn read_frame(stream: &mut UnixStream) -> Result<Zeroizing<Vec<u8>>> {
-    read_frame_with_deadline(stream, IPC_FRAME_DEADLINE)
+/// `write_all` bounded by ONE overall monotonic deadline (not per-syscall), so a peer that
+/// reads a byte every few seconds cannot keep a plaintext response pinned in daemon memory.
+fn write_all_with_deadline(stream: &mut UnixStream, mut buf: &[u8], deadline: Instant) -> Result<()> {
+    while !buf.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(VaultError::Daemon("IPC frame write timed out".into()));
+        }
+        let remaining = (deadline - now).max(Duration::from_millis(1));
+        let _ = stream.set_write_timeout(Some(remaining));
+        let end = buf.len().min(64 * 1024);
+        match stream.write(&buf[..end]) {
+            Ok(0) => return Err(VaultError::Daemon("IPC peer closed during write".into())),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(VaultError::Io(e)),
+        }
+    }
+    Ok(())
 }
 
 fn read_frame_with_deadline(
     stream: &mut UnixStream,
     timeout: Duration,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let deadline = Instant::now() + timeout;
+    read_frame_with_deadlines(stream, timeout, timeout)
+}
+
+/// Read one IPC frame: the 4-byte length header must arrive within `header_timeout`, the whole
+/// frame within `frame_timeout` (both measured from now).
+///
+/// Memory is reserved incrementally: at most `IPC_INITIAL_RECV_CAPACITY` up front, then ONE
+/// exact-size `Zeroizing` buffer once that much has actually arrived (the small buffer is wiped
+/// on drop), so a peer cannot make the daemon reserve 16 MiB with a 4-byte header.
+fn read_frame_with_deadlines(
+    stream: &mut UnixStream,
+    header_timeout: Duration,
+    frame_timeout: Duration,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let start = Instant::now();
+    let header_deadline = start + header_timeout;
+    let deadline = start + frame_timeout.max(header_timeout);
     let mut len_buf = [0u8; 4];
-    read_exact_with_deadline(stream, &mut len_buf, deadline)?;
+    read_exact_with_deadline(stream, &mut len_buf, header_deadline)?;
     let total_len = u32::from_le_bytes(len_buf) as usize;
     if total_len == 0 || total_len > MAX_IPC_FRAME_BYTES {
         return Err(VaultError::Daemon("invalid IPC frame length".into()));
     }
 
-    let mut out = Zeroizing::new(Vec::with_capacity(total_len));
+    let mut out = Zeroizing::new(Vec::with_capacity(total_len.min(IPC_INITIAL_RECV_CAPACITY)));
     let mut chunk = Zeroizing::new([0u8; 16 * 1024]);
     let mut remaining = total_len;
     while remaining > 0 {
@@ -1135,6 +1372,11 @@ fn read_frame_with_deadline(
         let n = read_some_with_deadline(stream, &mut chunk[..want], deadline)?;
         if n == 0 {
             return Err(VaultError::Daemon("unexpected EOF reading IPC frame".into()));
+        }
+        if out.len() + n > out.capacity() {
+            let mut grown = Zeroizing::new(Vec::with_capacity(total_len));
+            grown.extend_from_slice(&out);
+            out = grown; // previous buffer is zeroized on drop
         }
         out.extend_from_slice(&chunk[..n]);
         remaining -= n;

@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased (v0.4.0) — Phase 2: reliable locking
+
+### Fixed
+- **Pre-sleep/hibernate lock never worked** for the unprivileged daemon (`busctl monitor`
+  requires root; stderr was discarded; it also matched `boolean true` while busctl prints
+  `BOOLEAN true`). Replaced with a native unprivileged D-Bus subscription to logind
+  `PrepareForSleep` (pinned to logind's unique bus name) that holds a logind **delay
+  inhibitor**, so suspend/hibernate waits until keys are wiped. State is shown in
+  `omavault status`. The standalone TUI uses the same monitor. New dependency: `dbus`.
+- **IPC polling could keep the vault unlocked forever**: new absolute session lifetime
+  (`omavault daemon --max-session`, default 3600 s, 60..=86400) that activity cannot extend.
+- **Emergency lock could be starved** by idle connections (the documented reserved control
+  slots did not exist): 8 real reserved slots that accept only `Lock`/`Status`/`Shutdown`,
+  1 s first-frame header deadline, non-blocking busy replies, an overall write deadline, and
+  incremental receive-buffer growth. `omavault lock` retries briefly on "busy" and then falls back
+  to a verified `SIGUSR1` to the daemon PID (published in `daemon.lock`); `SIGUSR1` is now
+  handled immediately instead of once per second.
+- **Lock hotkey ignored standalone TUIs**: TUIs register in the runtime dir and lock on `SIGUSR1`;
+  `omavault lock` signals all of them. Daemon-not-running detection is now a typed error instead
+  of English `strerror` matching.
+- **`SystemCallFilter=` deny-list was silently ignored** (mixed `~` tokens on one line); split into
+  allow/deny lines. Added `ProtectSystem=full`, `ProtectKernel{Tunables,Modules,Logs}`,
+  `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `PrivateIPC`, `IPAddressDeny=any`
+  (`systemd-analyze security`: 5.6 → 3.8).
+- Daemon races: `LoadVault` re-checks the lock epoch before releasing plaintext; the screen-locker
+  probe no longer runs under the state mutex; session switches bump the epoch; `SaveVault`
+  re-verifies the session and returns the new revision (`Saved { revision }`), removing the TUI's
+  plaintext reload after every save.
+- TUI unlock-cancel race: a shared cancel flag (set before the TUI's own `Lock`) makes the worker
+  re-lock the daemon if its unlock lands after the user cancelled or quit.
+- Client connect helper retries `EAGAIN` (full backlog) and `EINTR` within its deadline.
+- Hyprland `.conf` and hypridle snippets prefer root-owned `/usr/bin/omavault` over `~/.local/bin`.
+
+### Tests
+- `tests/daemon_lock_tests.rs`: max-session vs. a polling attacker, sustained connection flood
+  against the real daemon binary, control-slot refusal of heavy requests, `Saved` revision, typed
+  `DaemonUnavailable`. `tests/daemon_sigusr1_test.rs`: SIGUSR1 lock latency < 500 ms.
+
 ## v0.3.1 — Critical data-loss fix
 
 > [!CAUTION]

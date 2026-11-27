@@ -705,51 +705,81 @@ fn connect_unix_with_timeout(
 
     let addr_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
         as libc::socklen_t;
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
-            addr_len,
-        )
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    let close_fd = |fd: libc::c_int| unsafe {
+        libc::close(fd);
     };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINPROGRESS)
-            && err.raw_os_error() != Some(libc::EAGAIN)
-        {
-            unsafe {
-                libc::close(fd);
-            }
-            return None;
-        }
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        let poll_rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if poll_rc <= 0 || (pfd.revents & libc::POLLOUT) == 0 {
-            unsafe {
-                libc::close(fd);
-            }
-            return None;
-        }
-        let mut so_err: libc::c_int = 0;
-        let mut so_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let opt_rc = unsafe {
-            libc::getsockopt(
+    loop {
+        let rc = unsafe {
+            libc::connect(
                 fd,
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                &mut so_err as *mut libc::c_int as *mut libc::c_void,
-                &mut so_len,
+                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                addr_len,
             )
         };
-        if opt_rc != 0 || so_err != 0 {
-            unsafe {
-                libc::close(fd);
+        if rc == 0 {
+            break;
+        }
+        let errno = io::Error::last_os_error().raw_os_error();
+        match errno {
+            Some(libc::EINTR) => continue,
+            // Linux AF_UNIX returns EAGAIN (not EINPROGRESS) when the listener's backlog is
+            // full; the socket is still unconnected, so retry connect() until the deadline.
+            Some(libc::EAGAIN) => {
+                if std::time::Instant::now() >= deadline {
+                    close_fd(fd);
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             }
-            return None;
+            Some(libc::EINPROGRESS) => {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        close_fd(fd);
+                        return None;
+                    }
+                    let wait_ms = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as i32;
+                    let poll_rc = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+                    if poll_rc < 0
+                        && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    if poll_rc <= 0 || (pfd.revents & libc::POLLOUT) == 0 {
+                        close_fd(fd);
+                        return None;
+                    }
+                    break;
+                }
+                let mut so_err: libc::c_int = 0;
+                let mut so_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                let opt_rc = unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        &mut so_err as *mut libc::c_int as *mut libc::c_void,
+                        &mut so_len,
+                    )
+                };
+                if opt_rc != 0 || so_err != 0 {
+                    close_fd(fd);
+                    return None;
+                }
+                break;
+            }
+            _ => {
+                close_fd(fd);
+                return None;
+            }
         }
     }
 

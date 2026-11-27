@@ -48,6 +48,11 @@ pub enum VaultError {
     #[error("daemon error: {0}")]
     Daemon(String),
 
+    /// The daemon socket is absent or nothing is listening (typed so callers never have to
+    /// match locale-dependent OS error strings).
+    #[error("omavault daemon is not running: {0}")]
+    DaemonUnavailable(String),
+
     #[error("entry not found: {0}")]
     EntryNotFound(String),
 

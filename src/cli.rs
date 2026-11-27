@@ -21,7 +21,8 @@ use crate::crypto::{
     wrap_master_key_for_slot, VaultHeader, MAX_FIDO2_SLOTS, VAULT_VERSION_V1, VAULT_VERSION_V2,
 };
 use crate::daemon::{
-    default_socket_path, run_daemon_with_hardening, DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS,
+    default_socket_path, run_daemon_with_config, validate_max_session_secs, DaemonClient,
+    DaemonConfig, LockOutcome, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_SESSION_SECS,
 };
 use crate::error::{Result, VaultError};
 use crate::generator::{
@@ -29,6 +30,7 @@ use crate::generator::{
     passphrase_entropy_bits, strength_label, PassphraseOptions, PasswordOptions,
 };
 use crate::hardening::{fill_random, sanitize_single_line, HardeningStatus, LockedKey};
+use crate::procsig::signal_registered_tuis;
 use crate::totp::TotpConfig;
 use crate::tui::{run_tui, TuiConfig};
 use crate::vault::audit::run_audit;
@@ -307,6 +309,10 @@ pub enum Commands {
         /// Auto-lock timeout in seconds (default: 300)
         #[arg(long, default_value_t = DEFAULT_IDLE_TIMEOUT_SECS)]
         timeout: u64,
+        /// Absolute maximum unlocked-session lifetime in seconds, regardless of activity
+        /// (default: 3600, range: 60..=86400)
+        #[arg(long, default_value_t = DEFAULT_MAX_SESSION_SECS)]
+        max_session: u64,
     },
 
     /// Unlock the vault in the running daemon
@@ -412,7 +418,9 @@ impl VaultSession {
                 vault_path,
                 vault,
                 revision,
-            } => client.save_vault(vault_path, vault, Some(revision.clone())),
+            } => client
+                .save_vault(vault_path, vault, Some(revision.clone()))
+                .map(|_| ()),
             Self::Standalone {
                 vault_path,
                 master_key,
@@ -938,14 +946,23 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
             Ok(())
         }
 
-        Commands::Daemon { timeout } => {
+        Commands::Daemon {
+            timeout,
+            max_session,
+        } => {
+            let max_session = validate_max_session_secs(max_session)?;
             eprintln!(
-                "omavault daemon listening on '{}' (idle timeout: {}s, {})",
+                "omavault daemon listening on '{}' (idle timeout: {}s, max session: {}s, {})",
                 socket_path.display(),
                 timeout,
+                max_session,
                 hardening.summary()
             );
-            run_daemon_with_hardening(&socket_path, timeout, true, hardening)
+            let mut cfg = DaemonConfig::new(timeout, true);
+            cfg.max_session_secs = max_session;
+            cfg.hardening = hardening;
+            cfg.presleep_monitor = true;
+            run_daemon_with_config(&socket_path, cfg)
         }
 
         Commands::StopDaemon => {
@@ -960,26 +977,30 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
             // Always clear Wayland clipboard & stop local clipboard helper in the user's session
             // (even if omavaultd lacks WAYLAND_DISPLAY).
             clear_clipboard_best_effort();
+            // Standalone and daemon-backed TUIs lock themselves on SIGUSR1.
+            let tuis = signal_registered_tuis(&socket_path);
+            if tuis > 0 {
+                println!("Signalled {tuis} running omavault TUI(s) to lock.");
+            }
             let client = DaemonClient::new(socket_path);
-            match client.lock() {
-                Ok(()) => {
+            match client.lock_with_fallback() {
+                Ok(LockOutcome::Socket) => {
                     println!("Vault locked (master key wiped from RAM, clipboard cleared).");
                     Ok(())
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let not_running = !client.socket_exists()
-                        || msg.contains("Connection refused")
-                        || msg.contains("No such file or directory");
-                    if not_running {
-                        println!("Daemon not running; local clipboard cleared.");
-                        Ok(())
-                    } else {
-                        Err(VaultError::Daemon(format!(
-                            "local clipboard cleared, but FAILED to lock running daemon: {msg}"
-                        )))
-                    }
+                Ok(LockOutcome::Signal(pid)) => {
+                    println!(
+                        "Daemon socket unavailable; sent emergency lock signal to omavaultd (pid {pid}). Clipboard cleared."
+                    );
+                    Ok(())
                 }
+                Err(VaultError::DaemonUnavailable(_)) => {
+                    println!("Daemon not running; local clipboard cleared.");
+                    Ok(())
+                }
+                Err(e) => Err(VaultError::Daemon(format!(
+                    "local clipboard cleared, but FAILED to lock running daemon: {e}"
+                ))),
             }
         }
 
@@ -1047,11 +1068,20 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     st.kernel_hardened,
                     st.remaining_secs
                 );
+                if st.unlocked {
+                    println!(
+                        "Session lifetime:  {}s remaining (max {}s, regardless of activity)",
+                        st.session_remaining_secs, st.max_session_secs
+                    );
+                }
                 println!(
                     "Daemon hardening:  ptrace-block:{} core-dump-off:{}",
                     if st.dumpable_disabled { "ON" } else { "OFF" },
                     if st.core_dumps_disabled { "ON" } else { "OFF" },
                 );
+                if !st.presleep_monitor.is_empty() {
+                    println!("Pre-sleep lock:    {}", tty_safe(&st.presleep_monitor));
+                }
                 if let Some(reason) = st.last_lock_reason {
                     println!("Last lock reason:  {}", tty_safe(&reason));
                 }
