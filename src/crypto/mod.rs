@@ -53,8 +53,22 @@ pub const MAX_CIPHERTEXT_SIZE: usize =
 pub const MAX_VAULT_FILE_BYTES: u64 =
     (FIXED_HEADER_LEN + MAX_FIDO2_META_LEN_V2 + MAX_CIPHERTEXT_SIZE) as u64;
 
-/// Validate a human-friendly FIDO2 slot label (1..=64 printable chars, no control chars or outer whitespace).
+/// Validate a NEW human-friendly FIDO2 slot label: 1..=64 bytes, no outer whitespace, no control
+/// characters, and no BiDi overrides / zero-width / tag characters that could spoof terminal output.
 pub fn validate_slot_label(label: &str) -> Result<()> {
+    validate_slot_label_lenient(label)?;
+    if label.chars().any(crate::hardening::is_dangerous_display_char) {
+        return Err(VaultError::Fido2Error(
+            "FIDO2 key label cannot contain BiDi control, zero-width, or other invisible characters"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse-time label validation (kept lenient so vaults created by earlier versions still open;
+/// labels are additionally sanitized whenever they are displayed).
+fn validate_slot_label_lenient(label: &str) -> Result<()> {
     if label.is_empty() || label.len() > 64 {
         return Err(VaultError::Fido2Error(
             "FIDO2 key label must be between 1 and 64 bytes".into(),
@@ -85,7 +99,7 @@ pub struct Fido2KeySlot {
 
 impl Fido2KeySlot {
     pub fn validate(&self) -> Result<()> {
-        validate_slot_label(&self.label)?;
+        validate_slot_label_lenient(&self.label)?;
         self.fido2.validate()?;
         let nonce = BASE64
             .decode(self.wrap_nonce_b64.as_bytes())
@@ -450,9 +464,27 @@ impl VaultHeader {
     }
 }
 
-/// Compute the hex revision token for a vault header (derived from its per-save `save_salt`).
+/// Compute the opaque revision token for a vault header.
+///
+/// It is a domain-separated BLAKE3 hash of the COMPLETE serialized header (version, flags, KDF
+/// params, `kdf_salt`, per-save `save_salt` + nonce, and every key slot), so ANY on-disk header
+/// edit — not just a `save_salt` change — is detected as a concurrent modification. (Hashing only
+/// `save_salt` let a tampered header that kept `save_salt` pass the check.)
 pub fn header_revision(header: &VaultHeader) -> String {
-    header.save_salt.iter().map(|b| format!("{b:02x}")).collect()
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"omavault-header-revision-v1\0");
+    match header.to_bytes() {
+        Ok(bytes) => {
+            hasher.update(&bytes);
+        }
+        // Unreachable for parsed/constructed headers (they are validated); still never collide
+        // with a real revision.
+        Err(_) => {
+            hasher.update(b"\xffinvalid-header");
+            hasher.update(&header.save_salt);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Generate a fresh CSPRNG 256-bit vault master key inside `mlock`ed `PROT_NONE` memory.

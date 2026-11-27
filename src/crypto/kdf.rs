@@ -150,6 +150,12 @@ pub fn hash_keyfile(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
             "keyfile path must be a regular file (special files/FIFOs/devices are rejected)".into(),
         ));
     }
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(VaultError::Hardening(format!(
+            "keyfile '{}' is not owned by the current user",
+            path.display()
+        )));
+    }
     if (meta.mode() & 0o077) != 0 {
         return Err(VaultError::Hardening(format!(
             "keyfile '{}' has unsafe permissions {:04o} (must be owner-only 0600)",
@@ -168,7 +174,11 @@ pub fn hash_keyfile(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
     let mut buf = Zeroizing::new([0u8; 8192]);
     let mut total_bytes = 0u64;
     loop {
-        let n = reader.read(&mut *buf)?;
+        let n = match reader.read(&mut *buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(VaultError::Io(e)),
+        };
         if n == 0 {
             break;
         }

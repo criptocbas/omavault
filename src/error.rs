@@ -67,6 +67,25 @@ pub enum VaultError {
 
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    #[error("ROLLBACK DETECTED: {0}. If you restored this file on purpose, re-run with --allow-rollback")]
+    RollbackDetected(String),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
+
+/// Whether background components may print warnings to stderr. The TUI disables this while it
+/// owns the terminal (stray stderr output would corrupt the full-screen display); the daemon
+/// and CLI keep it enabled so problems are visible (journald / terminal).
+static STDERR_WARNINGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_stderr_warnings(enabled: bool) {
+    STDERR_WARNINGS.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Print a non-fatal background warning to stderr unless suppressed (see [`set_stderr_warnings`]).
+pub fn warn(msg: &str) {
+    if STDERR_WARNINGS.load(std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("omavault: warning: {msg}");
+    }
+}

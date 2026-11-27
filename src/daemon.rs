@@ -19,6 +19,7 @@ use crate::crypto::{header_revision, resolve_master_key, VaultHeader};
 use crate::error::{Result, VaultError};
 use crate::procsig::{signal_daemon_lock, write_pid_into};
 use crate::sleep::{SleepMonitor, SleepMonitorState};
+use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault, RollbackStore};
 use crate::hardening::{
     boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, CountingWriter,
     HardeningStatus, LockedKey,
@@ -97,6 +98,9 @@ pub enum DaemonRequest {
         passphrase: SecretString,
         keyfile_path: Option<PathBuf>,
         fido2_device: Option<String>,
+        /// Accept an older/different vault than last seen at this path (`--allow-rollback`).
+        #[serde(default)]
+        allow_rollback: bool,
     },
     Lock,
     LoadVault {
@@ -182,6 +186,9 @@ struct UnlockedSession {
     last_activity_boot_secs: u64,
     /// When the session was unlocked (`CLOCK_BOOTTIME`); never refreshed by activity.
     unlocked_at_boot_secs: u64,
+    /// Highest vault generation seen in this session. Saves never write a lower generation,
+    /// even when a long-running client sends a vault copy with a stale counter.
+    generation: u64,
 }
 
 struct DaemonState {
@@ -189,6 +196,8 @@ struct DaemonState {
     idle_timeout_secs: u64,
     max_session_secs: u64,
     presleep: Option<Arc<Mutex<SleepMonitorState>>>,
+    /// Rollback/file-swap detection store (`None` disables, e.g. no `$HOME`).
+    rollback: Option<RollbackStore>,
     last_lock_reason: Option<String>,
     shutdown_requested: bool,
     /// Monotonic epoch incremented on EVERY lock/shutdown event so in-flight `Unlock` or
@@ -204,6 +213,7 @@ impl DaemonState {
             idle_timeout_secs,
             max_session_secs,
             presleep: None,
+            rollback: None,
             last_lock_reason: None,
             shutdown_requested: false,
             lock_epoch: 0,
@@ -352,6 +362,8 @@ pub struct DaemonConfig {
     pub hardening: HardeningStatus,
     /// Subscribe to systemd-logind `PrepareForSleep` (disabled in tests).
     pub presleep_monitor: bool,
+    /// Rollback state directory; `None` uses `$XDG_STATE_HOME/omavault/seen` (or `~/.local/state`).
+    pub rollback_state_dir: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -362,6 +374,7 @@ impl DaemonConfig {
             enforce_kdf_policy,
             hardening: HardeningStatus::default(),
             presleep_monitor: false,
+            rollback_state_dir: None,
         }
     }
 }
@@ -460,6 +473,10 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
         max_session,
         cfg.hardening,
     )));
+    state.lock().unwrap_or_else(|e| e.into_inner()).rollback = match &cfg.rollback_state_dir {
+        Some(dir) => Some(RollbackStore::in_dir(dir)),
+        None => RollbackStore::from_env(),
+    };
     let io_lock = Arc::new(Mutex::new(()));
     let general_workers = Arc::new(AtomicUsize::new(0));
     let control_workers = Arc::new(AtomicUsize::new(0));
@@ -769,7 +786,10 @@ fn handle_heavy_request(
             passphrase,
             keyfile_path,
             fido2_device,
+            allow_rollback,
         } => {
+            let allow_rollback = *allow_rollback;
+            let rollback = rollback_store(state);
             if is_screen_locker_active(my_uid) {
                 return DaemonResponse::Error {
                     message: "refusing to unlock while screen locker is active".into(),
@@ -820,8 +840,9 @@ fn handle_heavy_request(
                 drop(pass_owned);
                 let master_key = resolution.master_key;
 
-                let (verified_header, _vault) =
+                let (verified_header, vault) =
                     load_vault_from_disk(&canonical, &master_key, enforce_kdf_policy)?;
+                enforce_rollback_policy(rollback.as_ref(), &canonical, &vault, allow_rollback)?;
 
                 let now = current_boot_secs();
                 Ok(UnlockedSession {
@@ -830,6 +851,7 @@ fn handle_heavy_request(
                     header: verified_header,
                     last_activity_boot_secs: now,
                     unlocked_at_boot_secs: now,
+                    generation: vault.generation,
                 })
             })();
 
@@ -904,7 +926,12 @@ fn handle_heavy_request(
                     message: "load cancelled: vault was locked concurrently".into(),
                 };
             }
-            let loaded = load_vault_from_disk(&canonical, &key_clone, enforce_kdf_policy);
+            let loaded = load_vault_from_disk(&canonical, &key_clone, enforce_kdf_policy)
+                .and_then(|(hdr, vault)| {
+                    // The file may have been swapped for an older copy while unlocked.
+                    enforce_rollback_policy(rollback_store(state).as_ref(), &canonical, &vault, false)?;
+                    Ok((hdr, vault))
+                });
             drop(key_clone);
             match loaded {
                 Ok((hdr, vault)) => {
@@ -924,6 +951,7 @@ fn handle_heavy_request(
                     match guard.session.as_mut() {
                         Some(session) if session.vault_path == canonical => {
                             session.header = hdr;
+                            session.generation = session.generation.max(vault.generation);
                         }
                         _ => {
                             return DaemonResponse::Error {
@@ -948,7 +976,7 @@ fn handle_heavy_request(
             expected_revision,
         } => {
             let canonical = canonical_or_owned(vault_path);
-            let (key_clone, mut header_copy, start_epoch) = {
+            let (key_clone, mut header_copy, start_epoch, session_generation) = {
                 let Ok(mut guard) = state.lock() else {
                     return DaemonResponse::Error {
                         message: "daemon state lock poisoned".into(),
@@ -974,7 +1002,7 @@ fn handle_heavy_request(
                         }
                     }
                 };
-                (key, session.header.clone(), epoch)
+                (key, session.header.clone(), epoch, session.generation)
             };
 
             let _io = match io_lock.lock() {
@@ -993,6 +1021,9 @@ fn handle_heavy_request(
                 };
             }
 
+            // Never write a lower generation than this session has already seen/written.
+            vault.generation = vault.generation.max(session_generation);
+
             // Use the latest known header revision if caller omitted expected_revision.
             let effective_rev = expected_revision
                 .clone()
@@ -1009,11 +1040,13 @@ fn handle_heavy_request(
             ) {
                 Ok(()) => {
                     let revision = header_revision(&header_copy);
+                    record_saved_vault(rollback_store(state).as_ref(), &canonical, vault);
                     if let Ok(mut guard) = state.lock() {
                         if guard.lock_epoch == start_epoch {
                             if let Some(session) = guard.session.as_mut() {
                                 if session.vault_path == canonical {
                                     session.header = header_copy;
+                                    session.generation = vault.generation;
                                 }
                             }
                         }
@@ -1029,6 +1062,13 @@ fn handle_heavy_request(
             message: "unexpected control request in heavy handler".into(),
         },
     }
+}
+
+fn rollback_store(state: &Mutex<DaemonState>) -> Option<RollbackStore> {
+    state
+        .lock()
+        .map(|g| g.rollback.clone())
+        .unwrap_or_else(|e| e.into_inner().rollback.clone())
 }
 
 /// True iff no lock/shutdown/session-switch happened since `start_epoch` and the unlocked
@@ -1157,9 +1197,21 @@ impl DaemonClient {
     pub fn unlock(
         &self,
         vault_path: &Path,
+        passphrase: Zeroizing<String>,
+        keyfile_path: Option<PathBuf>,
+        fido2_device: Option<String>,
+    ) -> Result<()> {
+        self.unlock_with_options(vault_path, passphrase, keyfile_path, fido2_device, false)
+    }
+
+    /// Unlock, optionally accepting an older/different vault than last seen at this path.
+    pub fn unlock_with_options(
+        &self,
+        vault_path: &Path,
         mut passphrase: Zeroizing<String>,
         keyfile_path: Option<PathBuf>,
         fido2_device: Option<String>,
+        allow_rollback: bool,
     ) -> Result<()> {
         let secret = SecretString(std::mem::take(&mut *passphrase));
         let req = DaemonRequest::Unlock {
@@ -1167,6 +1219,7 @@ impl DaemonClient {
             passphrase: secret,
             keyfile_path,
             fido2_device,
+            allow_rollback,
         };
         match self.request_with_deadline(&req, IPC_UNLOCK_DEADLINE)? {
             DaemonResponse::Ok => Ok(()),

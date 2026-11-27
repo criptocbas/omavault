@@ -33,7 +33,41 @@
 - Client connect helper retries `EAGAIN` (full backlog) and `EINTR` within its deadline.
 - Hyprland `.conf` and hypridle snippets prefer root-owned `/usr/bin/omavault` over `~/.local/bin`.
 
+### Phase 3: integrity & output safety
+- **Rollback / file-swap protection**: authenticated `vault_id` + monotonic `generation` inside the
+  encrypted payload; a per-path record in `~/.local/state/omavault/seen/` refuses older copies,
+  different vaults at the same path, and pre-v0.4 copies of a versioned vault. Enforced by the
+  CLI, TUI, and daemon (unlock and every load); new global `--allow-rollback`. Vaults written by
+  older versions open normally and get an ID on their next save.
+- **Full-header revision token** (BLAKE3 of the serialized header) instead of `save_salt` only,
+  so a tampered header can no longer be "laundered" by the next save.
+- **Terminal-escape injection**: stdout fields are sanitized even when piped (new global `--raw`
+  to opt out); `get --reveal` on a terminal strips control sequences from notes and refuses
+  passwords containing them; error messages are always sanitized; FIDO2 labels are sanitized
+  and `fido2 list` notes that it reads the unauthenticated header. Entries with control, BiDi, or
+  zero-width characters in any field are rejected on add/edit (all front-ends); CRLF in notes is
+  normalized. New FIDO2 labels reject BiDi/zero-width characters.
+- **Filesystem trust on every read**: vault file must be owned by you, not group/world-writable,
+  not hard-linked, in a directory you own that is not group/world-writable. Existing
+  group/world-writable directories are refused instead of silently `chmod`ed; hard-linked lock
+  files are refused; `purge` also removes orphaned `.tmp.` files and fsyncs the directory;
+  keyfiles must be owned by you (and `EINTR` is retried while hashing).
+- **`omavault gen`** copies to the secret clipboard by default on a terminal (use `--print` to
+  print). `--totp-file` must be owned by you, `0600`, and at most 4 KiB.
+- TUI: Diceware generator defaults to 12 words within 10..=24 and shows errors instead of a blank
+  "STRONG" secret; editing an entry no longer resets custom TOTP parameters unless the secret
+  actually changed; multi-line notes render as separate lines.
+- Background warnings (pre-sleep monitor, rollback store) no longer write to stderr while the
+  TUI owns the terminal, so they cannot corrupt the full-screen display.
+- **API**: `save_vault_to_disk*` / `create_new_vault_on_disk` take `&mut Vault` (they stamp the
+  generation; restored on failure). `DaemonRequest::Unlock` gained `allow_rollback` (defaults to
+  `false`).
+
 ### Tests
+- `tests/integrity_output_tests.rs`: revision vs. header tampering, generation stamping, rollback
+  store (restore / swap / downgrade / allow), end-to-end rollback refusal, piped-output and
+  real-pty `--reveal` sanitizing, input validation, filesystem trust, hard-linked lock file,
+  orphaned temp purge. Each fix was mutation-checked (reverting it makes its test fail).
 - `tests/daemon_lock_tests.rs`: max-session vs. a polling attacker, sustained connection flood
   against the real daemon binary, control-slot refusal of heavy requests, `Saved` revision, typed
   `DaemonUnavailable`. `tests/daemon_sigusr1_test.rs`: SIGUSR1 lock latency < 500 ms.

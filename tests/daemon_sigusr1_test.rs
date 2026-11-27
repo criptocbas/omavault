@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 #[test]
 fn sigusr1_locks_daemon_immediately() {
     let tmp = TempDir::new().unwrap();
+    std::env::set_var("XDG_STATE_HOME", tmp.path().join("state"));
     let vault_path = tmp.path().join("vault.omav");
     let sock_path = tmp.path().join("omavault_run/daemon.sock");
     let params = KdfParams {
@@ -33,7 +34,7 @@ fn sigusr1_locks_daemon_immediately() {
         false,
     )
     .unwrap();
-    save_vault_to_disk(&vault_path, &key, &mut header, &Vault::new()).unwrap();
+    save_vault_to_disk(&vault_path, &key, &mut header, &mut Vault::new()).unwrap();
 
     let sock = sock_path.clone();
     let handle = thread::spawn(move || {

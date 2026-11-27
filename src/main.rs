@@ -1,5 +1,3 @@
-use std::io::IsTerminal;
-
 use clap::Parser;
 
 use omavault::cli::{execute, Cli};
@@ -19,12 +17,8 @@ fn main() {
 
     let cli = Cli::parse();
     if let Err(err) = execute(cli, hardening) {
-        let msg = if std::io::stderr().is_terminal() {
-            sanitize_single_line(&err.to_string())
-        } else {
-            err.to_string()
-        };
-        eprintln!("omavault error: {msg}");
+        // Always sanitize: stderr redirected to a log can still be `cat`/`less -R`'d later.
+        eprintln!("omavault error: {}", sanitize_single_line(&err.to_string()));
         std::process::exit(1);
     }
 }

@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod rollback;
 pub mod storage;
 
 use std::fmt;
@@ -183,6 +184,62 @@ fn contains_ascii_icase(haystack: &str, needle: &str) -> bool {
         .any(|win| win.iter().zip(n.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)))
 }
 
+/// Normalize Windows line endings in multi-line fields (pasted notes) before validation.
+fn normalize_entry_text(entry: &mut Entry) {
+    if entry.notes.contains('\r') {
+        let mut fixed = Zeroizing::new(entry.notes.replace("\r\n", "\n"));
+        std::mem::swap(&mut entry.notes, &mut *fixed);
+    }
+}
+
+/// Reject stored text that could drive or spoof a terminal when later displayed: C0/C1 control
+/// characters (ANSI/CSI/OSC escapes such as an OSC 52 clipboard write), DEL, BiDi overrides and
+/// zero-width/tag characters. Secrets may contain any other Unicode; notes may contain `\n`/`\t`.
+///
+/// This is the input-side complement to output sanitizing: it stops escape bytes planted via a
+/// hijacked clipboard paste at a hidden prompt from ever being stored.
+fn validate_entry_text(entry: &Entry) -> Result<()> {
+    use crate::hardening::is_dangerous_display_char as dangerous;
+    let line = |field: &str, v: &str| -> Result<()> {
+        if v.chars().any(dangerous) {
+            return Err(VaultError::InvalidFormat(format!(
+                "{field} contains terminal control or invisible characters"
+            )));
+        }
+        Ok(())
+    };
+    line("entry name", &entry.name)?;
+    line("username", &entry.username)?;
+    line("URL", &entry.url)?;
+    for tag in &entry.tags {
+        line("tag", tag)?;
+    }
+    if entry.password.chars().any(char::is_control) {
+        return Err(VaultError::InvalidFormat(
+            "password contains control characters (escape sequences are not allowed)".into(),
+        ));
+    }
+    if entry
+        .notes
+        .chars()
+        .any(|c| c != '\n' && c != '\t' && dangerous(c))
+    {
+        return Err(VaultError::InvalidFormat(
+            "notes contain terminal control or invisible characters (only newlines and tabs are allowed)".into(),
+        ));
+    }
+    for cf in &entry.custom_fields {
+        line("custom field label", &cf.label)?;
+        if cf.value.chars().any(char::is_control) {
+            return Err(VaultError::InvalidFormat(format!(
+                "custom field '{}' contains control characters",
+                crate::hardening::sanitize_single_line(&cf.label)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Top-level decrypted vault structure. Automatically zeroizes all secrets on Drop.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct Vault {
@@ -192,6 +249,15 @@ pub struct Vault {
     pub created_at: DateTime<Utc>,
     #[zeroize(skip)]
     pub updated_at: DateTime<Utc>,
+    /// Stable random vault identity (assigned on the first v0.4+ save). Lives inside the AEAD
+    /// payload, so it is authenticated. Used for rollback / file-swap detection.
+    #[zeroize(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_id: Option<Uuid>,
+    /// Monotonic save counter, incremented on every save (authenticated; rollback detection).
+    #[zeroize(skip)]
+    #[serde(default)]
+    pub generation: u64,
     pub entries: Vec<Entry>,
 }
 
@@ -218,12 +284,16 @@ impl Vault {
             schema_version: 1,
             created_at: now,
             updated_at: now,
+            vault_id: Some(Uuid::new_v4()),
+            generation: 0,
             entries: Vec::new(),
         }
     }
 
     pub fn add_entry(&mut self, mut entry: Entry) -> Result<()> {
         entry.name = entry.name.trim().to_string();
+        normalize_entry_text(&mut entry);
+        validate_entry_text(&entry)?;
         if entry.name.is_empty() {
             return Err(VaultError::InvalidFormat(
                 "entry name cannot be empty".into(),
@@ -271,10 +341,15 @@ impl Vault {
             return Err(VaultError::DuplicateEntry(trimmed_new.to_string()));
         }
 
-        let entry = &mut self.entries[target_idx];
-        entry.name = trimmed_new.to_string();
-        apply(entry);
-        entry.updated_at = Utc::now();
+        // Apply to a copy and validate before committing, so a rejected edit leaves the
+        // stored entry untouched.
+        let mut candidate = self.entries[target_idx].clone();
+        candidate.name = trimmed_new.to_string();
+        apply(&mut candidate);
+        normalize_entry_text(&mut candidate);
+        validate_entry_text(&candidate)?;
+        candidate.updated_at = Utc::now();
+        self.entries[target_idx] = candidate;
 
         self.entries
             .sort_by_key(|a| a.name.to_ascii_lowercase());

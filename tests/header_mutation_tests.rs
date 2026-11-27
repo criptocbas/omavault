@@ -73,8 +73,8 @@ fn reopen<P: Fido2Provider>(path: &Path, pass: &[u8], fido2: &P) -> Result<Vault
 fn v1_vault_on_disk(path: &Path) -> (VaultHeader, LockedKey<32>, Vault) {
     let mut hdr = VaultHeader::new(fast_params(), false, None).unwrap();
     let key = derive_master_key(OLD_PASS, &hdr.kdf_salt, fast_params(), None, None, false).unwrap();
-    let vault = sample_vault();
-    create_new_vault_on_disk(path, &key, &mut hdr, &vault).unwrap();
+    let mut vault = sample_vault();
+    create_new_vault_on_disk(path, &key, &mut hdr, &mut vault).unwrap();
     (hdr, key, vault)
 }
 
@@ -96,8 +96,8 @@ fn v2_vault_on_disk(path: &Path, keys: &[(&str, &MockTrackedFido2Key)]) -> V2Fix
         let slot = wrap_master_key_for_slot(&hdr, &mk, &pw_hash, None, label, meta, &sec).unwrap();
         hdr.fido2_slots.push(slot);
     }
-    let vault = sample_vault();
-    create_new_vault_on_disk(path, &mk, &mut hdr, &vault).unwrap();
+    let mut vault = sample_vault();
+    create_new_vault_on_disk(path, &mk, &mut hdr, &mut vault).unwrap();
     V2Fixture {
         hdr,
         master_key: mk,
@@ -109,7 +109,7 @@ fn v2_vault_on_disk(path: &Path, keys: &[(&str, &MockTrackedFido2Key)]) -> V2Fix
 fn rekey_writes_new_header_and_new_passphrase_unlocks_from_disk() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("vault.omav");
-    let (old_hdr, _old_key, vault) = v1_vault_on_disk(&path);
+    let (old_hdr, _old_key, mut vault) = v1_vault_on_disk(&path);
     let expected_rev = header_revision(&old_hdr);
 
     // What `omavault rekey` does: fresh header (new kdf_salt) + key from the NEW passphrase.
@@ -127,7 +127,7 @@ fn rekey_writes_new_header_and_new_passphrase_unlocks_from_disk() {
         &path,
         &new_key,
         &mut new_hdr,
-        &vault,
+        &mut vault,
         Some(&expected_rev),
         false,
         true,
@@ -167,7 +167,7 @@ fn fido2_add_v2_persists_new_slot_and_new_key_unlocks() {
     let path = dir.path().join("vault.omav");
     let key1 = MockTrackedFido2Key::new([0x11; 32]);
     let key2 = MockTrackedFido2Key::new([0x22; 32]);
-    let fx = v2_vault_on_disk(&path, &[("primary", &key1)]);
+    let mut fx = v2_vault_on_disk(&path, &[("primary", &key1)]);
     assert!(matches!(
         reopen(&path, OLD_PASS, &key2),
         Err(VaultError::Fido2NoMatchingCredential)
@@ -195,7 +195,7 @@ fn fido2_add_v2_persists_new_slot_and_new_key_unlocks() {
         &path,
         &fx.master_key,
         &mut updated,
-        &fx.vault,
+        &mut fx.vault,
         Some(&expected_rev),
         false,
         true,
@@ -239,7 +239,7 @@ fn fido2_remove_with_rotation_revokes_key_and_remaining_key_unlocks() {
     let path = dir.path().join("vault.omav");
     let key1 = MockTrackedFido2Key::new([0x11; 32]);
     let key2 = MockTrackedFido2Key::new([0x22; 32]);
-    let fx = v2_vault_on_disk(&path, &[("primary", &key1), ("backup", &key2)]);
+    let mut fx = v2_vault_on_disk(&path, &[("primary", &key1), ("backup", &key2)]);
     let expected_rev = header_revision(&fx.hdr);
 
     // What `omavault fido2 remove backup` does: rotate kdf_salt + master key, re-wrap key1.
@@ -257,7 +257,7 @@ fn fido2_remove_with_rotation_revokes_key_and_remaining_key_unlocks() {
         &path,
         &new_mk,
         &mut hdr,
-        &fx.vault,
+        &mut fx.vault,
         Some(&expected_rev),
         false,
         true,
@@ -297,7 +297,7 @@ fn fido2_remove_no_rotate_drops_slot_from_disk() {
     let path = dir.path().join("vault.omav");
     let key1 = MockTrackedFido2Key::new([0x11; 32]);
     let key2 = MockTrackedFido2Key::new([0x22; 32]);
-    let fx = v2_vault_on_disk(&path, &[("primary", &key1), ("backup", &key2)]);
+    let mut fx = v2_vault_on_disk(&path, &[("primary", &key1), ("backup", &key2)]);
     let expected_rev = header_revision(&fx.hdr);
 
     let mut hdr = fx.hdr.clone();
@@ -306,7 +306,7 @@ fn fido2_remove_no_rotate_drops_slot_from_disk() {
         &path,
         &fx.master_key,
         &mut hdr,
-        &fx.vault,
+        &mut fx.vault,
         Some(&expected_rev),
         false,
         true,
@@ -345,7 +345,7 @@ fn verify_saved_vault_rejects_mismatches() {
 fn stale_revision_is_still_rejected_and_header_untouched() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("vault.omav");
-    let (mut hdr, key, vault) = v1_vault_on_disk(&path);
+    let (mut hdr, key, mut vault) = v1_vault_on_disk(&path);
     let stale_rev = header_revision(&hdr);
 
     // Concurrent writer moves the file forward.
@@ -354,7 +354,7 @@ fn stale_revision_is_still_rejected_and_header_untouched() {
         &path,
         &key,
         &mut writer_hdr,
-        &vault,
+        &mut vault,
         Some(&stale_rev),
         false,
         true,
@@ -363,7 +363,7 @@ fn stale_revision_is_still_rejected_and_header_untouched() {
 
     let before = hdr.to_bytes().unwrap();
     let err =
-        save_vault_to_disk_checked(&path, &key, &mut hdr, &vault, Some(&stale_rev), false, true);
+        save_vault_to_disk_checked(&path, &key, &mut hdr, &mut vault, Some(&stale_rev), false, true);
     assert!(err.is_err(), "stale revision must be rejected");
     assert_eq!(
         hdr.to_bytes().unwrap(),
@@ -379,12 +379,12 @@ fn failed_write_leaves_caller_header_in_sync_with_disk() {
     fs::create_dir(&vdir).unwrap();
     fs::set_permissions(&vdir, fs::Permissions::from_mode(0o700)).unwrap();
     let path = vdir.join("vault.omav");
-    let (mut hdr, key, vault) = v1_vault_on_disk(&path);
+    let (mut hdr, key, mut vault) = v1_vault_on_disk(&path);
     let rev = header_revision(&hdr);
 
     // Make the directory read-only so creating the temp file fails (e.g. like ENOSPC/EROFS).
     fs::set_permissions(&vdir, fs::Permissions::from_mode(0o500)).unwrap();
-    let res = save_vault_to_disk_checked(&path, &key, &mut hdr, &vault, Some(&rev), false, true);
+    let res = save_vault_to_disk_checked(&path, &key, &mut hdr, &mut vault, Some(&rev), false, true);
     fs::set_permissions(&vdir, fs::Permissions::from_mode(0o700)).unwrap();
 
     if unsafe { libc::geteuid() } == 0 {
@@ -397,7 +397,7 @@ fn failed_write_leaves_caller_header_in_sync_with_disk() {
         "header must not advance when the write fails"
     );
     // A retry with the unchanged header succeeds (no permanent desync).
-    save_vault_to_disk_checked(&path, &key, &mut hdr, &vault, Some(&rev), false, true).unwrap();
+    save_vault_to_disk_checked(&path, &key, &mut hdr, &mut vault, Some(&rev), false, true).unwrap();
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn create_new_vault_never_overwrites_existing_file() {
     let mut hdr2 = VaultHeader::new(fast_params(), false, None).unwrap();
     let key2 =
         derive_master_key(NEW_PASS, &hdr2.kdf_salt, fast_params(), None, None, false).unwrap();
-    let err = create_new_vault_on_disk(&path, &key2, &mut hdr2, &Vault::new());
+    let err = create_new_vault_on_disk(&path, &key2, &mut hdr2, &mut Vault::new());
     assert!(matches!(err, Err(VaultError::VaultAlreadyExists(_))));
     assert_eq!(
         fs::read(&path).unwrap(),

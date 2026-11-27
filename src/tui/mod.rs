@@ -30,6 +30,7 @@ use crate::crypto::kdf::hash_keyfile;
 use crate::crypto::{header_revision, resolve_master_key, VaultHeader, VAULT_VERSION_V2};
 use crate::daemon::{DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS};
 use crate::procsig::TuiRegistration;
+use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault};
 use crate::sleep::SleepMonitor;
 use crate::error::{Result, VaultError};
 use crate::generator::{
@@ -58,6 +59,8 @@ pub struct TuiConfig {
     pub clipboard_timeout_secs: u64,
     pub paste_once: bool,
     pub hardening: HardeningStatus,
+    /// Accept an older/different vault file than last seen at this path (`--allow-rollback`).
+    pub allow_rollback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -131,8 +134,6 @@ struct EntryForm {
     editing_original_name: Option<String>,
     original_totp: Option<TotpConfig>,
     #[zeroize(skip)]
-    totp_modified: bool,
-    #[zeroize(skip)]
     reveal_secrets: bool,
     #[zeroize(skip)]
     active_field: usize,
@@ -151,7 +152,6 @@ impl EntryForm {
         Self {
             editing_original_name: None,
             original_totp: None,
-            totp_modified: false,
             reveal_secrets: false,
             active_field: 0,
             name: String::new(),
@@ -178,7 +178,6 @@ impl EntryForm {
         Self {
             editing_original_name: Some(entry.name.clone()),
             original_totp: entry.totp.clone(),
-            totp_modified: false,
             reveal_secrets: false,
             active_field: 0,
             name: entry.name.clone(),
@@ -195,9 +194,6 @@ impl EntryForm {
     const FIELD_COUNT: usize = 7;
 
     fn current_mut(&mut self) -> &mut String {
-        if self.active_field == 5 {
-            self.totp_modified = true;
-        }
         match self.active_field {
             0 => &mut self.name,
             1 => &mut self.username,
@@ -210,12 +206,19 @@ impl EntryForm {
     }
 }
 
+/// Diceware word-count bounds enforced by `generate_passphrase` (10..=24).
+const GEN_MIN_WORDS: usize = 10;
+const GEN_MAX_WORDS: usize = 24;
+const GEN_DEFAULT_WORDS: usize = 12;
+
 struct GenModalState {
     passphrase_mode: bool,
     length: usize,
     words: usize,
     symbols: bool,
     preview: Zeroizing<String>,
+    /// Generator error to display instead of silently showing an empty secret.
+    error: Option<String>,
 }
 
 impl GenModalState {
@@ -225,27 +228,36 @@ impl GenModalState {
         Self {
             passphrase_mode: false,
             length: 24,
-            words: 8,
+            words: GEN_DEFAULT_WORDS,
             symbols: true,
             preview,
+            error: None,
         }
     }
 
     fn regenerate(&mut self) {
-        self.preview = if self.passphrase_mode {
+        let result = if self.passphrase_mode {
             generate_passphrase(&PassphraseOptions {
                 words: self.words,
                 ..PassphraseOptions::default()
             })
-            .unwrap_or_else(|_| Zeroizing::new(String::new()))
         } else {
             generate_password(&PasswordOptions {
                 length: self.length,
                 symbols: self.symbols,
                 ..PasswordOptions::default()
             })
-            .unwrap_or_else(|_| Zeroizing::new(String::new()))
         };
+        match result {
+            Ok(secret) => {
+                self.preview = secret;
+                self.error = None;
+            }
+            Err(e) => {
+                self.preview = Zeroizing::new(String::new());
+                self.error = Some(e.to_string());
+            }
+        }
     }
 }
 
@@ -388,6 +400,7 @@ impl App {
         let vault_path = self.cfg.vault_path.clone();
         let keyfile_path = self.cfg.keyfile_path.clone();
         let fido2_device = self.cfg.fido2_device.clone();
+        let allow_rollback = self.cfg.allow_rollback;
         let requires_fido2 = self.header_preview.requires_fido2();
 
         let (tx, rx) = mpsc::channel();
@@ -402,8 +415,13 @@ impl App {
         thread::spawn(move || {
             let client = DaemonClient::new(socket_path);
             if client.status().is_ok() {
-                let outcome = match client.unlock(&vault_path, passphrase, keyfile_path, fido2_device)
-                {
+                let outcome = match client.unlock_with_options(
+                    &vault_path,
+                    passphrase,
+                    keyfile_path,
+                    fido2_device,
+                    allow_rollback,
+                ) {
                     // The TUI sets `cancelled` BEFORE it sends its own Lock, so either we observe
                     // the flag here, or our unlock committed before that Lock (which then wins).
                     Ok(()) if cancelled.load(Ordering::SeqCst) => {
@@ -453,6 +471,7 @@ impl App {
                 }
                 let (verified_header, vault) =
                     load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                enforce_rollback_policy(None, &vault_path, &vault, allow_rollback)?;
                 Ok((res.master_key, verified_header, vault))
             })();
 
@@ -523,7 +542,7 @@ impl App {
     }
 
     /// Persist a staged vault snapshot cleanly; only commit to `self.vault` if disk/daemon write succeeds.
-    fn persist_staged_vault(&mut self, staged: Vault) -> Result<()> {
+    fn persist_staged_vault(&mut self, mut staged: Vault) -> Result<()> {
         match self.backend.as_mut() {
             Some(SessionBackend::Daemon { revision, .. }) => {
                 let client = DaemonClient::new(self.cfg.socket_path.clone());
@@ -543,11 +562,12 @@ impl App {
                     &self.cfg.vault_path,
                     master_key,
                     header,
-                    &staged,
+                    &mut staged,
                     Some(&expected_rev),
                     true,
                     true,
                 )?;
+                record_saved_vault(None, &self.cfg.vault_path, &staged);
             }
             None => return Err(VaultError::Daemon("vault not unlocked".into())),
         }
@@ -838,7 +858,7 @@ impl App {
                 }
                 KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right => {
                     if gen_state.passphrase_mode {
-                        gen_state.words = (gen_state.words + 1).min(16);
+                        gen_state.words = (gen_state.words + 1).min(GEN_MAX_WORDS);
                     } else {
                         gen_state.length = (gen_state.length + 2).min(64);
                     }
@@ -846,13 +866,13 @@ impl App {
                 }
                 KeyCode::Char('-') | KeyCode::Left => {
                     if gen_state.passphrase_mode {
-                        gen_state.words = gen_state.words.saturating_sub(1).max(6);
+                        gen_state.words = gen_state.words.saturating_sub(1).max(GEN_MIN_WORDS);
                     } else {
                         gen_state.length = gen_state.length.saturating_sub(2).max(12);
                     }
                     gen_state.regenerate();
                 }
-                KeyCode::Char('y') | KeyCode::Enter => {
+                KeyCode::Char('y') | KeyCode::Enter if gen_state.error.is_none() => {
                     let secret = gen_state.preview.clone();
                     self.copy_to_secret_clipboard("generated password", &secret);
                 }
@@ -1021,7 +1041,16 @@ impl App {
         }
 
         // Preserve original TotpConfig (algorithm, digits, period, issuer) unless modified!
-        let totp_cfg = if !form.totp_modified {
+        // Only treat TOTP as changed if the secret text actually differs from what was loaded;
+        // merely focusing or editing-and-restoring field 5 must not reset custom params
+        // (SHA256 / 8 digits / 60 s / issuer) to defaults.
+        let original_secret = form
+            .original_totp
+            .as_ref()
+            .map(|t| t.secret_base32.as_str())
+            .unwrap_or("");
+        let totp_changed = form.totp.trim() != original_secret;
+        let totp_cfg = if !totp_changed {
             form.original_totp.clone()
         } else if form.totp.trim().is_empty() {
             None
@@ -1101,6 +1130,7 @@ struct TuiGuard;
 
 impl Drop for TuiGuard {
     fn drop(&mut self) {
+        crate::error::set_stderr_warnings(true);
         clear_clipboard_best_effort();
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
@@ -1139,6 +1169,8 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
         })
     };
 
+    // From here on the TUI owns the terminal: background warnings must not write to stderr.
+    crate::error::set_stderr_warnings(false);
     enable_raw_mode().map_err(VaultError::Io)?;
     let _tui_guard = TuiGuard;
     let mut stdout = io::stdout();
@@ -1582,17 +1614,18 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(""),
         Line::from(Span::styled(" Notes:", theme::muted_style())),
-        Line::from(format!(
-            " {}",
-            if entry.notes.is_empty() {
-                "(none)".to_string()
-            } else if app.reveal_password {
-                sanitize_multiline(&entry.notes)
-            } else {
-                "•••••••••••• (press [r] to reveal)".to_string()
-            }
-        )),
     ];
+    // One `Line` per note line: embedding '\n' inside a single ratatui `Line` corrupts layout.
+    if entry.notes.is_empty() {
+        lines.push(Line::from(" (none)"));
+    } else if app.reveal_password {
+        let shown = Zeroizing::new(sanitize_multiline(&entry.notes));
+        for note_line in shown.lines() {
+            lines.push(Line::from(format!(" {note_line}")));
+        }
+    } else {
+        lines.push(Line::from(" •••••••••••• (press [r] to reveal)"));
+    }
 
     if !entry.custom_fields.is_empty() {
         lines.push(Line::from(""));
@@ -1778,10 +1811,16 @@ fn draw_generator_modal(f: &mut Frame, area: Rect, gen: &GenModalState) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", *gen.preview),
-            Style::default().fg(theme::ACCENT_CYAN).add_modifier(Modifier::BOLD),
-        )),
+        match &gen.error {
+            Some(err) => Line::from(Span::styled(
+                format!("  Generator error: {}", sanitize_display(err)),
+                theme::danger_style(),
+            )),
+            None => Line::from(Span::styled(
+                format!("  {}", *gen.preview),
+                Style::default().fg(theme::ACCENT_CYAN).add_modifier(Modifier::BOLD),
+            )),
+        },
         Line::from(""),
         Line::from(Span::styled(
             "  [Space] Regenerate  [m] Switch Mode  [+/-] Size  [s] Symbols  [y] Secret Copy  [Esc] Close",
@@ -1999,6 +2038,38 @@ impl Default for TuiConfig {
             clipboard_timeout_secs: DEFAULT_CLIPBOARD_TIMEOUT_SECS,
             paste_once: false,
             hardening: HardeningStatus::default(),
+            allow_rollback: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generator_modal_produces_secrets_in_both_modes_within_bounds() {
+        let mut gen = GenModalState::new();
+        assert!(!gen.preview.is_empty());
+        assert!(gen.words >= GEN_MIN_WORDS && gen.words <= GEN_MAX_WORDS);
+
+        gen.passphrase_mode = true;
+        for words in [GEN_MIN_WORDS, GEN_DEFAULT_WORDS, GEN_MAX_WORDS] {
+            gen.words = words;
+            gen.regenerate();
+            assert!(gen.error.is_none(), "words={words}: {:?}", gen.error);
+            assert_eq!(gen.preview.split('-').count(), words);
+        }
+
+        // Out-of-range input is surfaced as an error, never as a blank "STRONG" secret.
+        gen.words = GEN_MIN_WORDS - 1;
+        gen.regenerate();
+        assert!(gen.error.is_some());
+        assert!(gen.preview.is_empty());
+
+        gen.passphrase_mode = false;
+        gen.regenerate();
+        assert!(gen.error.is_none());
+        assert_eq!(gen.preview.chars().count(), gen.length);
     }
 }

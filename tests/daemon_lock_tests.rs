@@ -57,10 +57,11 @@ impl Harness {
             false,
         )
         .unwrap();
-        save_vault_to_disk(&vault_path, &key, &mut header, &Vault::new()).unwrap();
+        save_vault_to_disk(&vault_path, &key, &mut header, &mut Vault::new()).unwrap();
 
         let mut cfg = DaemonConfig::new(idle_timeout_secs, false);
         cfg.max_session_secs = max_session_secs;
+        cfg.rollback_state_dir = Some(tmp.path().join("state"));
         let sock_for_thread = sock_path.clone();
         let handle = thread::spawn(move || {
             let _ = run_daemon_with_config(&sock_for_thread, cfg);
@@ -165,6 +166,7 @@ impl ProcessDaemon {
             .env("HOME", tmp.path())
             .env("XDG_RUNTIME_DIR", &run)
             .env("OMAVAULT_SOCKET", run.join("omavault/daemon.sock"))
+            .env("XDG_STATE_HOME", tmp.path().join("state"))
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
             .stdin(Stdio::null())
@@ -209,7 +211,7 @@ fn sustained_connection_flood_cannot_prevent_lock() {
     let mut header = VaultHeader::new(params, false, None).unwrap();
     let key =
         derive_master_key(PASS.as_bytes(), &header.kdf_salt, params, None, None, true).unwrap();
-    save_vault_to_disk(&vault_path, &key, &mut header, &Vault::new()).unwrap();
+    save_vault_to_disk(&vault_path, &key, &mut header, &mut Vault::new()).unwrap();
     client
         .unlock(&vault_path, Zeroizing::new(PASS.into()), None, None)
         .expect("unlock");

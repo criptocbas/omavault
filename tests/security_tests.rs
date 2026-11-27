@@ -240,7 +240,7 @@ fn atomic_disk_storage_permissions_rolling_backups_and_purge() {
     entry.totp = Some(TotpConfig::parse("JBSWY3DPEHPK3PXP").unwrap());
     vault.add_entry(entry).unwrap();
 
-    save_vault_to_disk(&vault_path, &key, &mut header, &vault).expect("first save");
+    save_vault_to_disk(&vault_path, &key, &mut header, &mut vault).expect("first save");
     assert_eq!(
         fs::metadata(&vault_dir).unwrap().permissions().mode() & 0o777,
         0o700
@@ -257,7 +257,7 @@ fn atomic_disk_storage_permissions_rolling_backups_and_purge() {
             "S3cur3!Pass#2026".into(),
         ))
         .unwrap();
-    save_vault_to_disk(&vault_path, &key, &mut header, &vault).expect("second save");
+    save_vault_to_disk(&vault_path, &key, &mut header, &mut vault).expect("second save");
 
     let bak1 = vault_dir.join("vault.omav.bak.1");
     assert!(bak1.exists());
@@ -302,6 +302,8 @@ fn rejects_symlinks_and_special_files() {
 #[test]
 fn daemon_unlock_load_save_revision_conflict_and_lock_lifecycle() {
     let tmp = TempDir::new().expect("tempdir");
+    // Keep the daemon's rollback records out of the developer's real ~/.local/state.
+    std::env::set_var("XDG_STATE_HOME", tmp.path().join("state"));
     let vault_path = tmp.path().join("vault.omav");
     let sock_path = tmp.path().join("omavault_run/daemon.sock");
 
@@ -310,8 +312,8 @@ fn daemon_unlock_load_save_revision_conflict_and_lock_lifecycle() {
     let key =
         derive_master_key(b"daemon-master-pass!", &header.kdf_salt, params, None, None, false)
             .expect("key");
-    let vault = Vault::new();
-    save_vault_to_disk(&vault_path, &key, &mut header, &vault).expect("init save");
+    let mut vault = Vault::new();
+    save_vault_to_disk(&vault_path, &key, &mut header, &mut vault).expect("init save");
 
     let sock_for_thread = sock_path.clone();
     let handle = thread::spawn(move || {
@@ -451,6 +453,7 @@ fn fido2_totp_clipboard_and_daemon_request_regression_checks() {
         passphrase: SecretString("secret-passphrase".into()),
         keyfile_path: None,
         fido2_device: None,
+        allow_rollback: false,
     };
     drop(req);
 }
@@ -591,17 +594,17 @@ fn v03_audit_regressions_utf8_totp_keyfile_eexist_sanitizer_and_checked_save() {
     let mut hdr = VaultHeader::new(params, false, None).expect("hdr");
     let mk = derive_master_key(b"checked-save-pass!", &hdr.kdf_salt, params, None, None, false)
         .expect("mk");
-    let v1 = Vault::new();
-    save_vault_to_disk(&vault_path, &mk, &mut hdr, &v1).expect("save 1");
+    let mut v1 = Vault::new();
+    save_vault_to_disk(&vault_path, &mk, &mut hdr, &mut v1).expect("save 1");
     let stale_rev = header_revision(&hdr);
-    save_vault_to_disk_checked(&vault_path, &mk, &mut hdr, &v1, Some(&stale_rev), false, true)
+    save_vault_to_disk_checked(&vault_path, &mk, &mut hdr, &mut v1, Some(&stale_rev), false, true)
         .expect("save 2 with matching revision");
     // Re-using stale_rev MUST fail.
     assert!(save_vault_to_disk_checked(
         &vault_path,
         &mk,
         &mut hdr,
-        &v1,
+        &mut v1,
         Some(&stale_rev),
         false,
         true

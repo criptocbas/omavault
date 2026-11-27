@@ -31,7 +31,9 @@ impl io::Write for CountingWriter {
     }
 }
 
-fn is_dangerous_display_char(c: char) -> bool {
+/// True for characters that can alter terminal state or visually spoof text: C0/C1 controls
+/// (ANSI/OSC/CSI escapes), DEL, Unicode BiDi overrides/isolates, zero-width and tag characters.
+pub fn is_dangerous_display_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

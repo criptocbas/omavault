@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +30,10 @@ use crate::generator::{
     estimate_entropy_bits, generate_passphrase, generate_password, generated_password_entropy_bits,
     passphrase_entropy_bits, strength_label, PassphraseOptions, PasswordOptions,
 };
-use crate::hardening::{fill_random, sanitize_single_line, HardeningStatus, LockedKey};
+use crate::hardening::{
+    fill_random, is_dangerous_display_char, sanitize_multiline, sanitize_single_line,
+    HardeningStatus, LockedKey,
+};
 use crate::procsig::signal_registered_tuis;
 use crate::totp::TotpConfig;
 use crate::tui::{run_tui, TuiConfig};
@@ -39,6 +43,7 @@ use crate::vault::storage::{
     create_new_vault_on_disk, read_header_from_disk, save_vault_to_disk_checked,
     verify_saved_vault,
 };
+use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault};
 use crate::vault::{Entry, Vault};
 
 fn parse_clip_timeout(s: &str) -> std::result::Result<u64, String> {
@@ -80,6 +85,15 @@ pub struct Cli {
     /// Read master passphrase line from stdin (for non-interactive scripts only)
     #[arg(long, global = true)]
     pub passphrase_stdin: bool,
+
+    /// Accept a vault file that is OLDER than (or different from) the one last seen at this path
+    /// (only use this if you restored a backup on purpose)
+    #[arg(long, global = true)]
+    pub allow_rollback: bool,
+
+    /// Print stored text byte-exact on stdout (disables stripping of terminal escape sequences)
+    #[arg(long, global = true)]
+    pub raw: bool,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -244,8 +258,12 @@ pub enum Commands {
         #[arg(long)]
         no_ambiguous: bool,
         /// Copy directly to Wayland secret clipboard instead of printing
-        #[arg(short, long)]
+        /// (the default when stdout is a terminal in a Wayland session)
+        #[arg(short, long, conflicts_with = "print")]
         copy: bool,
+        /// Print the secret to stdout even on a terminal (lands in scrollback)
+        #[arg(long)]
+        print: bool,
         #[arg(long)]
         paste_once: bool,
         #[arg(long, default_value_t = DEFAULT_CLIPBOARD_TIMEOUT_SECS, value_parser = parse_clip_timeout)]
@@ -436,7 +454,9 @@ impl VaultSession {
                     Some(&expected_rev),
                     true,
                     true,
-                )
+                )?;
+                record_saved_vault(None, vault_path, vault);
+                Ok(())
             }
         }
     }
@@ -452,15 +472,27 @@ fn absolutize_path(path: PathBuf) -> PathBuf {
     }
 }
 
+/// Set from `--raw`: print stored text byte-exact on stdout.
+static RAW_STDOUT: AtomicBool = AtomicBool::new(false);
+
+/// Sanitize stored/untrusted text for STDOUT. Applied whether or not stdout is a TTY, because
+/// `omavault list | less -R`, `| grep`, or `$(omavault get …)` still end up in a terminal.
+/// `--raw` opts out for scripts that need exact bytes.
 fn tty_safe(s: &str) -> String {
-    if io::stdout().is_terminal() {
-        sanitize_single_line(s)
-    } else {
+    if RAW_STDOUT.load(Ordering::Relaxed) {
         s.to_string()
+    } else {
+        sanitize_single_line(s)
     }
 }
 
+/// Sanitize stored/untrusted text for STDERR (always; `--raw` only affects stdout).
+fn err_safe(s: &str) -> String {
+    sanitize_single_line(s)
+}
+
 pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
+    RAW_STDOUT.store(cli.raw, Ordering::Relaxed);
     let vault_path = absolutize_path(cli.vault.clone().unwrap_or_else(default_vault_path));
     let socket_path = absolutize_path(cli.socket.clone().unwrap_or_else(default_socket_path));
     cli.keyfile = cli.keyfile.map(absolutize_path);
@@ -509,11 +541,14 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         println!(
                             "  {}. {:<20} uv={}  cred={}...",
                             idx + 1,
-                            slot.label,
+                            tty_safe(&slot.label),
                             slot.fido2.require_uv,
-                            fp
+                            tty_safe(&fp)
                         );
                     }
+                    eprintln!(
+                        "Note: read from the vault header without unlocking (not yet authenticated); unlock to verify."
+                    );
                 } else if let Some(meta) = &header.fido2 {
                     let fp: String = meta.credential_id_b64.chars().take(12).collect();
                     println!("Legacy OMAV v1 single FIDO2 key enrolled:");
@@ -572,7 +607,8 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     cli.fido2_device.as_deref(),
                     true,
                 )?;
-                let (_, vault) = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                let (_, mut vault) = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                enforce_rollback_policy(None, &vault_path, &vault, cli.allow_rollback)?;
 
                 wait_for_yubikey_swap(&format!(
                     "Now plug in ONLY the NEW YubiKey to enroll as '{label}', then press Enter..."
@@ -611,7 +647,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         &vault_path,
                         &res.master_key,
                         &mut updated_header,
-                        &vault,
+                        &mut vault,
                         Some(&expected_rev),
                         true,
                         true,
@@ -626,6 +662,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         vault.entries.len(),
                         true,
                     )?;
+                    record_saved_vault(None, &vault_path, &vault);
                     drop(passphrase);
                     println!(
                         "Enrolled FIDO2 key '{}' ({}/{} slots). You can now unlock with any enrolled key: {}",
@@ -683,7 +720,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         &vault_path,
                         &new_master_key,
                         &mut v2_header,
-                        &vault,
+                        &mut vault,
                         Some(&expected_rev),
                         true,
                         true,
@@ -698,12 +735,13 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         vault.entries.len(),
                         true,
                     )?;
+                    record_saved_vault(None, &vault_path, &vault);
                     drop(passphrase);
                     println!(
                         "Upgraded vault to OMAV v2 and enrolled '{label}' ({}/{} slots: {}).",
                         v2_header.fido2_slots.len(),
                         MAX_FIDO2_SLOTS,
-                        v2_header.fido2_labels().join(", ")
+                        tty_safe(&v2_header.fido2_labels().join(", "))
                     );
                 }
                 Ok(())
@@ -771,7 +809,8 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         "you touched '{label}' (the key being removed); touch one of your other enrolled YubiKeys instead"
                     )));
                 }
-                let (_, vault) = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                let (_, mut vault) = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                enforce_rollback_policy(None, &vault_path, &vault, cli.allow_rollback)?;
                 let expected_rev = header_revision(&old_header);
 
                 let remaining_slots: Vec<(usize, _)> = old_header
@@ -807,11 +846,11 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         } else {
                             wait_for_yubikey_swap(&format!(
                                 "Plug in remaining YubiKey '{}' to re-wrap under the rotated master key, then press Enter...",
-                                rem_slot.label
+                                err_safe(&rem_slot.label)
                             ))?;
                             eprintln!(
                                 "Touch YubiKey '{}' to complete master-key rotation...",
-                                rem_slot.label
+                                err_safe(&rem_slot.label)
                             );
                             provider.assert_on_any_device(
                                 &rem_slot.fido2,
@@ -833,7 +872,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         &vault_path,
                         &new_mk,
                         &mut hdr,
-                        &vault,
+                        &mut vault,
                         Some(&expected_rev),
                         true,
                         true,
@@ -846,7 +885,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         &vault_path,
                         &res.master_key,
                         &mut hdr,
-                        &vault,
+                        &mut vault,
                         Some(&expected_rev),
                         true,
                         true,
@@ -870,6 +909,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     vault.entries.len(),
                     true,
                 )?;
+                record_saved_vault(None, &vault_path, &vault);
                 drop(passphrase);
                 if updated_header.has_fido2_label(&label) {
                     return Err(VaultError::Fido2Error(format!(
@@ -909,6 +949,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
             no_symbols,
             no_ambiguous,
             copy,
+            print,
             paste_once,
             timeout,
         } => {
@@ -927,7 +968,12 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 };
                 (generate_password(&opts)?, generated_password_entropy_bits(&opts))
             };
-            if copy {
+            // On an interactive terminal, printing would leave the secret in scrollback, so the
+            // default is the secret-tagged clipboard; pipes/scripts still get stdout.
+            let default_to_clipboard = !print
+                && io::stdout().is_terminal()
+                && std::env::var_os("WAYLAND_DISPLAY").is_some();
+            if copy || default_to_clipboard {
                 copy_secret(
                     &secret,
                     ClipboardOptions {
@@ -936,8 +982,9 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     },
                 )?;
                 eprintln!(
-                    "Copied generated secret ({bits:.0} bits · {}) to Wayland secret clipboard (clears in {timeout}s).",
-                    strength_label(bits)
+                    "Copied generated secret ({bits:.0} bits · {}) to Wayland secret clipboard (clears in {timeout}s).{}",
+                    strength_label(bits),
+                    if copy { "" } else { " Use --print to print it instead." }
                 );
             } else {
                 println!("{}", *secret);
@@ -1016,11 +1063,12 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
             if header.requires_fido2() {
                 eprintln!("Touch your FIDO2 security key when it blinks...");
             }
-            client.unlock(
+            client.unlock_with_options(
                 &vault_path,
                 passphrase,
                 cli.keyfile.clone(),
                 cli.fido2_device.clone(),
+                cli.allow_rollback,
             )?;
             println!("Vault unlocked in daemon.");
             Ok(())
@@ -1043,7 +1091,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                         " + FIDO2 ({} {}: {})",
                         header.fido2_slots.len(),
                         if header.fido2_slots.len() == 1 { "key" } else { "keys" },
-                        header.fido2_labels().join(", ")
+                        tty_safe(&header.fido2_labels().join(", "))
                     )
                 } else if header.requires_fido2() {
                     " + FIDO2 (legacy v1)".to_string()
@@ -1158,8 +1206,9 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 (hdr, mk)
             };
 
-            let vault = Vault::new();
-            create_new_vault_on_disk(&vault_path, &master_key, &mut header, &vault)?;
+            let mut vault = Vault::new();
+            create_new_vault_on_disk(&vault_path, &master_key, &mut header, &mut vault)?;
+            record_saved_vault(None, &vault_path, &vault);
 
             println!(
                 "Initialized encrypted OMAV v{} vault at '{}'",
@@ -1207,6 +1256,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 clipboard_timeout_secs: clip_timeout,
                 paste_once,
                 hardening,
+                allow_rollback: cli.allow_rollback,
             })
         }
 
@@ -1217,6 +1267,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.keyfile.as_deref(),
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
+                cli.allow_rollback,
             )?;
             let q = query.as_deref().unwrap_or("");
             let entries = session.vault().search(q);
@@ -1261,6 +1312,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.keyfile.as_deref(),
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
+                cli.allow_rollback,
             )?;
 
             if session.vault().find_by_name(&trimmed_name).is_some() {
@@ -1300,9 +1352,12 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
 
             if copy {
                 copy_secret(&password, ClipboardOptions::default())?;
-                println!("Added '{trimmed_name}' and copied password to Wayland secret clipboard.");
+                println!(
+                    "Added '{}' and copied password to Wayland secret clipboard.",
+                    tty_safe(&trimmed_name)
+                );
             } else {
-                println!("Added '{trimmed_name}' to encrypted vault.");
+                println!("Added '{}' to encrypted vault.", tty_safe(&trimmed_name));
             }
             Ok(())
         }
@@ -1321,6 +1376,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.keyfile.as_deref(),
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
+                cli.allow_rollback,
             )?;
             let entry = session
                 .vault()
@@ -1351,19 +1407,17 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     },
                 )?;
                 eprintln!(
-                    "Copied {field:?} for '{name}' (Wayland secret-tagged, clears in {timeout}s)."
+                    "Copied {field:?} for '{}' (Wayland secret-tagged, clears in {timeout}s).",
+                    err_safe(&name)
                 );
             } else if matches!(field, GetField::Password | GetField::Notes) && !reveal {
                 return Err(VaultError::InvalidFormat(
                     "refusing to print password or sensitive notes without `--reveal` (use `--copy` for Wayland secret clipboard)".into(),
                 ));
+            } else if matches!(field, GetField::Password | GetField::Notes) {
+                print_revealed_secret(&value, matches!(field, GetField::Notes))?;
             } else {
-                let out = if matches!(field, GetField::Password | GetField::Notes) {
-                    (*value).clone()
-                } else {
-                    tty_safe(&value)
-                };
-                println!("{out}");
+                println!("{}", tty_safe(&value));
             }
             Ok(())
         }
@@ -1380,6 +1434,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.keyfile.as_deref(),
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
+                cli.allow_rollback,
             )?;
             let entry = session
                 .vault()
@@ -1398,7 +1453,8 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     },
                 )?;
                 eprintln!(
-                    "Copied TOTP for '{name}' ({}s remaining, secret-tagged).",
+                    "Copied TOTP for '{}' ({}s remaining, secret-tagged).",
+                    err_safe(&name),
                     code.remaining_secs
                 );
             } else {
@@ -1438,6 +1494,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.keyfile.as_deref(),
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
+                cli.allow_rollback,
             )?;
 
             // Verify entry exists BEFORE prompting for secrets or generating passwords.
@@ -1491,11 +1548,14 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
             if copy {
                 if let Some(pw) = copy_pw {
                     copy_secret(&pw, ClipboardOptions::default())?;
-                    println!("Updated '{name}' and copied new password to Wayland secret clipboard.");
+                    println!(
+                        "Updated '{}' and copied new password to Wayland secret clipboard.",
+                        tty_safe(&name)
+                    );
                     return Ok(());
                 }
             }
-            println!("Updated '{name}' and re-encrypted vault.");
+            println!("Updated '{}' and re-encrypted vault.", tty_safe(&name));
             Ok(())
         }
 
@@ -1506,6 +1566,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.keyfile.as_deref(),
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
+                cli.allow_rollback,
             )?;
             if session.vault().find_by_name(&name).is_none() {
                 return Err(VaultError::EntryNotFound(name));
@@ -1533,6 +1594,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 cli.keyfile.as_deref(),
                 cli.fido2_device.as_deref(),
                 cli.passphrase_stdin,
+                cli.allow_rollback,
             )?;
             let report = run_audit(session.vault())?;
             println!("=== omavault Security Audit ===");
@@ -1627,7 +1689,8 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
             )?;
             drop(old_pass);
 
-            let (_, vault) = load_vault_from_disk(&vault_path, &old_res.master_key, true)?;
+            let (_, mut vault) = load_vault_from_disk(&vault_path, &old_res.master_key, true)?;
+            enforce_rollback_policy(None, &vault_path, &vault, cli.allow_rollback)?;
             let expected_rev = header_revision(&old_header);
             let old_matched_idx = old_res.matched_slot_index;
             let old_fido2_secret = old_res.matched_fido2_secret;
@@ -1740,7 +1803,10 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     } else {
                         let keep = prompt_rewrap_or_skip(&old_slot.label)?;
                         if keep {
-                            eprintln!("Touch YubiKey '{}' to re-wrap its key slot...", old_slot.label);
+                            eprintln!(
+                                "Touch YubiKey '{}' to re-wrap its key slot...",
+                                err_safe(&old_slot.label)
+                            );
                             let sec = provider.assert_on_any_device(
                                 &old_slot.fido2,
                                 cli.fido2_device.as_deref(),
@@ -1756,7 +1822,10 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                             )?;
                             hdr.fido2_slots.push(wrapped);
                         } else {
-                            eprintln!("Dropped FIDO2 key slot '{}' during rekey.", old_slot.label);
+                            eprintln!(
+                                "Dropped FIDO2 key slot '{}' during rekey.",
+                                err_safe(&old_slot.label)
+                            );
                         }
                     }
                 }
@@ -1769,7 +1838,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 &vault_path,
                 &new_master_key,
                 &mut new_header,
-                &vault,
+                &mut vault,
                 Some(&expected_rev),
                 true,
                 true,
@@ -1787,6 +1856,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 vault.entries.len(),
                 true,
             )?;
+            record_saved_vault(None, &vault_path, &vault);
             drop(new_pass);
 
             if should_purge {
@@ -1821,6 +1891,7 @@ fn open_session(
     keyfile_path: Option<&Path>,
     fido2_device: Option<&str>,
     passphrase_stdin: bool,
+    allow_rollback: bool,
 ) -> Result<VaultSession> {
     let client = DaemonClient::new(socket_path.to_path_buf());
     if let Ok((vault, revision)) = client.load_vault(vault_path) {
@@ -1855,12 +1926,45 @@ fn open_session(
     )?;
 
     let (verified_header, vault) = load_vault_from_disk(vault_path, &res.master_key, true)?;
+    enforce_rollback_policy(None, vault_path, &vault, allow_rollback)?;
     Ok(VaultSession::Standalone {
         vault_path: vault_path.to_path_buf(),
         master_key: res.master_key,
         header: verified_header,
         vault,
     })
+}
+
+/// Print a revealed password/note.
+///
+/// On a terminal (and without `--raw`), stored bytes must never be able to drive the terminal: an
+/// OSC 52 sequence in a note could silently replace the clipboard, and CSI sequences could forge
+/// prompts. Notes are printed with control/BiDi characters stripped; a password containing such
+/// characters is refused (printing an altered password would be wrong) — use `--copy`.
+/// When stdout is a pipe/file, the exact bytes are emitted (e.g. `| wl-copy`).
+fn print_revealed_secret(value: &str, is_notes: bool) -> Result<()> {
+    let to_terminal = io::stdout().is_terminal() && !RAW_STDOUT.load(Ordering::Relaxed);
+    if !to_terminal {
+        let mut out = io::stdout().lock();
+        out.write_all(value.as_bytes())?;
+        out.write_all(b"\n")?;
+        return Ok(());
+    }
+    if is_notes {
+        let shown = Zeroizing::new(sanitize_multiline(value));
+        if shown.len() != value.len() {
+            eprintln!("note: terminal control characters were removed from this display (use --copy, or pipe the output, for exact bytes)");
+        }
+        println!("{}", *shown);
+        return Ok(());
+    }
+    if value.chars().any(is_dangerous_display_char) {
+        return Err(VaultError::InvalidFormat(
+            "this password contains terminal control characters; refusing to print it to a terminal (use --copy, or pipe the output)".into(),
+        ));
+    }
+    println!("{value}");
+    Ok(())
 }
 
 /// Read an interactive confirmation line directly from `/dev/tty`, flushing any buffered
@@ -1903,7 +2007,8 @@ fn wait_for_yubikey_swap(prompt: &str) -> Result<()> {
 fn prompt_rewrap_or_skip(label: &str) -> Result<bool> {
     loop {
         let reply = read_clean_tty_line(&format!(
-            "Plug in YubiKey '{label}' and press Enter to re-wrap it (or type 'skip' to drop it): "
+            "Plug in YubiKey '{}' and press Enter to re-wrap it (or type 'skip' to drop it): ",
+            err_safe(label)
         ))?;
         if reply.is_empty() || reply.eq_ignore_ascii_case("yes") || reply.eq_ignore_ascii_case("ok")
         {
@@ -1913,7 +2018,8 @@ fn prompt_rewrap_or_skip(label: &str) -> Result<bool> {
             return Ok(false);
         }
         eprintln!(
-            "Ignored unexpected input (possible stray YubiKey OTP burst) — press Enter to keep '{label}' or type 'skip'."
+            "Ignored unexpected input (possible stray YubiKey OTP burst) — press Enter to keep '{}' or type 'skip'.",
+            err_safe(label)
         );
     }
 }
@@ -1924,9 +2030,21 @@ fn read_totp_input(prompt_flag: bool, file_path: Option<&Path>) -> Result<Option
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
             .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
             return Err(VaultError::InvalidTotp(
                 "TOTP file must be a regular file".into(),
+            ));
+        }
+        if meta.uid() != unsafe { libc::geteuid() } || (meta.mode() & 0o077) != 0 {
+            return Err(VaultError::InvalidTotp(format!(
+                "TOTP secret file '{}' must be owned by you with owner-only permissions (chmod 600)",
+                path.display()
+            )));
+        }
+        if meta.len() > 4096 {
+            return Err(VaultError::InvalidTotp(
+                "TOTP secret file exceeds 4096 bytes".into(),
             ));
         }
         let mut raw = Zeroizing::new(String::with_capacity(256));

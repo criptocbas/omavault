@@ -89,17 +89,21 @@ pub fn ensure_private_dir_strict(dir: &Path, chmod_existing: bool) -> Result<()>
         )));
     }
 
+    // A pre-existing group/world-WRITABLE directory is refused, never silently chmod'ed: other
+    // users may already have planted files in it. (Only harmless read bits are tightened.)
+    if !created && (meta.mode() & 0o022) != 0 {
+        return Err(VaultError::Hardening(format!(
+            "directory '{}' is group/world-writable (mode {:04o}); inspect its contents, then run `chmod 700 {}`",
+            dir.display(),
+            meta.mode() & 0o7777,
+            dir.display()
+        )));
+    }
     if created || chmod_existing {
         let rc = unsafe { libc::fchmod(dir_file.as_raw_fd(), 0o700) };
         if rc != 0 {
             return Err(VaultError::Io(std::io::Error::last_os_error()));
         }
-    } else if (meta.mode() & 0o022) != 0 {
-        return Err(VaultError::Hardening(format!(
-            "directory '{}' is group/world-writable (mode {:04o})",
-            dir.display(),
-            meta.mode() & 0o7777
-        )));
     }
 
     Ok(())
@@ -131,9 +135,9 @@ impl FileLockGuard {
             .open(&lock_path)?;
         let meta = file.metadata()?;
         let my_uid = unsafe { libc::geteuid() };
-        if !meta.file_type().is_file() || meta.uid() != my_uid {
+        if !meta.file_type().is_file() || meta.uid() != my_uid || meta.nlink() != 1 {
             return Err(VaultError::Hardening(format!(
-                "lock file '{}' is not a regular file owned by current user",
+                "lock file '{}' is not a private regular file owned by current user (hard links are refused)",
                 lock_path.display()
             )));
         }
@@ -300,7 +304,61 @@ pub fn purge_encrypted_backups(path: &Path) -> Result<usize> {
             removed += 1;
         }
     }
+    // Temp files orphaned by a crash/SIGKILL mid-save (`.<name>.tmp.<hex>`,
+    // `.<name>.bak.N.tmp.<hex>`) may also hold old-key ciphertext.
+    if let (Some(name), Ok(entries)) = (path.file_name(), fs::read_dir(parent)) {
+        let mut prefix = OsString::from(".");
+        prefix.push(name);
+        let prefix = prefix.into_vec();
+        for entry in entries.flatten() {
+            let fname = entry.file_name().into_vec();
+            let is_orphan = fname.starts_with(&prefix)
+                && fname[prefix.len()..].windows(5).any(|w| w == b".tmp.");
+            if is_orphan {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.file_type().is_file() {
+                        fs::remove_file(entry.path())?;
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(dir_file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)
+    {
+        let _ = dir_file.sync_all();
+    }
     Ok(removed)
+}
+
+/// Refuse vault files (and their directory) that another user could have written or swapped:
+/// the file must be owned by us, not group/world-writable, and not hard-linked; its directory
+/// must be owned by us and not group/world-writable. Applied on EVERY read (including read-only
+/// commands and the daemon), not just on save.
+fn verify_file_trust(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me || (meta.mode() & 0o022) != 0 || meta.nlink() != 1 {
+        return Err(VaultError::Hardening(format!(
+            "refusing vault file '{}': it must be owned by you, not group/world-writable, and not hard-linked (owner uid {}, mode {:04o}, links {})",
+            path.display(),
+            meta.uid(),
+            meta.mode() & 0o7777,
+            meta.nlink()
+        )));
+    }
+    let parent = resolve_parent(path)?;
+    let pmeta = fs::metadata(parent)?;
+    if !pmeta.is_dir() || pmeta.uid() != me || (pmeta.mode() & 0o022) != 0 {
+        return Err(VaultError::Hardening(format!(
+            "refusing vault directory '{}': it must be owned by you and not group/world-writable (mode {:04o})",
+            parent.display(),
+            pmeta.mode() & 0o7777
+        )));
+    }
+    Ok(())
 }
 
 /// Read a regular file with `O_NONBLOCK | O_NOFOLLOW`, strict `is_file()` verification, and
@@ -323,6 +381,7 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
             "vault path must be a regular file (special files/FIFOs/devices are rejected)".into(),
         ));
     }
+    verify_file_trust(path, &meta)?;
     if meta.len() > max_bytes {
         return Err(VaultError::InvalidFormat(format!(
             "vault file exceeds maximum allowed size ({max_bytes} bytes)"
@@ -368,7 +427,7 @@ pub fn save_vault_to_disk_checked(
     path: &Path,
     master_key: &LockedKey<32>,
     header: &mut VaultHeader,
-    vault: &Vault,
+    vault: &mut Vault,
     expected_revision: Option<&str>,
     enforce_kdf_policy: bool,
     create_backup: bool,
@@ -386,12 +445,48 @@ pub fn save_vault_to_disk_checked(
         }
     }
 
-    let plaintext = serialize_vault_exact(vault)?;
-    let mut next_header = header.clone();
-    let blob = seal_vault(master_key, &mut next_header, &plaintext)?;
-    atomic_write_unlocked(path, parent, &blob, create_backup, false)?;
-    *header = next_header;
-    Ok(())
+    let restore = stamp_generation(vault);
+    let written = (|| -> Result<VaultHeader> {
+        let plaintext = serialize_vault_exact(vault)?;
+        let mut next_header = header.clone();
+        let blob = seal_vault(master_key, &mut next_header, &plaintext)?;
+        atomic_write_unlocked(path, parent, &blob, create_backup, false)?;
+        Ok(next_header)
+    })();
+    match written {
+        Ok(next_header) => {
+            *header = next_header;
+            Ok(())
+        }
+        Err(e) => {
+            restore.undo(vault);
+            Err(e)
+        }
+    }
+}
+
+/// Previous identity/generation, restored if a save fails.
+struct GenerationRestore {
+    vault_id: Option<uuid::Uuid>,
+    generation: u64,
+}
+
+impl GenerationRestore {
+    fn undo(self, vault: &mut Vault) {
+        vault.vault_id = self.vault_id;
+        vault.generation = self.generation;
+    }
+}
+
+/// Assign a vault ID if missing and bump the monotonic generation for this save.
+fn stamp_generation(vault: &mut Vault) -> GenerationRestore {
+    let restore = GenerationRestore {
+        vault_id: vault.vault_id,
+        generation: vault.generation,
+    };
+    vault.vault_id.get_or_insert_with(uuid::Uuid::new_v4);
+    vault.generation = vault.generation.saturating_add(1);
+    restore
 }
 
 /// Serialize into an exact-size zeroizing buffer, encrypt (rotating `save_salt` + `nonce`),
@@ -400,7 +495,7 @@ pub fn save_vault_to_disk(
     path: &Path,
     master_key: &LockedKey<32>,
     header: &mut VaultHeader,
-    vault: &Vault,
+    vault: &mut Vault,
 ) -> Result<()> {
     save_vault_to_disk_checked(path, master_key, header, vault, None, false, true)
 }
@@ -412,7 +507,7 @@ pub fn create_new_vault_on_disk(
     path: &Path,
     master_key: &LockedKey<32>,
     header: &mut VaultHeader,
-    vault: &Vault,
+    vault: &mut Vault,
 ) -> Result<()> {
     let parent = resolve_parent(path)?;
     ensure_private_dir(parent)?;
@@ -421,12 +516,24 @@ pub fn create_new_vault_on_disk(
         return Err(VaultError::VaultAlreadyExists(path.display().to_string()));
     }
 
-    let plaintext = serialize_vault_exact(vault)?;
-    let mut next_header = header.clone();
-    let blob = seal_vault(master_key, &mut next_header, &plaintext)?;
-    atomic_write_unlocked(path, parent, &blob, false, true)?;
-    *header = next_header;
-    Ok(())
+    let restore = stamp_generation(vault);
+    let written = (|| -> Result<VaultHeader> {
+        let plaintext = serialize_vault_exact(vault)?;
+        let mut next_header = header.clone();
+        let blob = seal_vault(master_key, &mut next_header, &plaintext)?;
+        atomic_write_unlocked(path, parent, &blob, false, true)?;
+        Ok(next_header)
+    })();
+    match written {
+        Ok(next_header) => {
+            *header = next_header;
+            Ok(())
+        }
+        Err(e) => {
+            restore.undo(vault);
+            Err(e)
+        }
+    }
 }
 
 /// Independently re-open a freshly written vault from disk using ONLY user credentials,

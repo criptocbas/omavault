@@ -132,8 +132,12 @@ omavault get github.com --copy --paste-once
 # Get live TOTP code
 omavault totp github.com --copy
 
-# Generate a 12-word Diceware passphrase (105.6 bits entropy; min 10 words)
-omavault gen --passphrase --words 12 --copy
+# Generate a 12-word Diceware passphrase (105.6 bits entropy; min 10 words).
+# On a terminal it goes to the secret clipboard by default; add --print to print it instead.
+omavault gen --passphrase --words 12
+
+# Restored an older vault backup on purpose? omavault refuses older copies by default:
+omavault --allow-rollback list
 
 # Run local security audit
 omavault audit

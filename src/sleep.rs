@@ -87,7 +87,7 @@ impl SleepMonitor {
                 while !t_stop.load(Ordering::SeqCst) {
                     if let Err(e) = run_session(&on_sleep, &t_stop, &t_state) {
                         let msg = e.to_string();
-                        eprintln!("omavault: pre-sleep monitor error: {msg}");
+                        crate::error::warn(&format!("pre-sleep monitor error: {msg}"));
                         set_state(&t_state, SleepMonitorState::Failed(msg));
                         sleep_unless_stopped(&t_stop, RETRY_BACKOFF);
                     }
