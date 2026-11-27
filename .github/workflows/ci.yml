@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo test --locked
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo check --locked
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  systemd-unit:
+    name: systemd-unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify the user unit
+        run: |
+          set -euo pipefail
+          # GitHub-hosted runners do not start a user manager unless asked.
+          if ! systemctl --user is-system-running >/dev/null 2>&1; then
+            runtime="/run/user/$(id -u)"
+            sudo mkdir -p "$runtime"
+            sudo chown "$(id -u):$(id -g)" "$runtime"
+            sudo chmod 700 "$runtime"
+            export XDG_RUNTIME_DIR="$runtime"
+            sudo systemctl start "user@$(id -u).service"
+          fi
+          set +e
+          out=$(systemd-analyze --user verify omarchy/omavaultd.service 2>&1)
+          set -e
+          # ExecStart is %h/.local/bin/omavault, which is not installed on CI.
+          filtered=$(printf '%s\n' "$out" | grep -v -E 'Command .+/\.local/bin/omavault is not executable' || true)
+          printf '%s\n' "$filtered"
+          if printf '%s\n' "$filtered" | grep -E 'Unknown|not known|Ignoring'; then
+            echo "systemd-analyze reported an unknown or ignored directive"
+            exit 1
+          fi
+          if printf '%s\n' "$filtered" | grep -q '[^[:space:]]'; then
+            echo "unexpected systemd-analyze output"
+            exit 1
+          fi
