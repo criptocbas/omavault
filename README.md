@@ -1,21 +1,21 @@
 # omavault
 
-A bulletproof, memory-hardened, keyboard-first password manager crafted in Rust specifically for **Omarchy Linux** (Arch + Hyprland + Wayland).
+A memory-hardened, keyboard-first password manager crafted in Rust specifically for **Omarchy Linux** (Arch + Hyprland + Wayland).
 
 ## Security Architecture at a Glance
 
 | Layer | Technology | Protection |
 |---|---|---|
 | **Password KDF** | **Argon2id** (`128 MiB` RAM, `t=4`, `p=4`, enforced `64 MiB`/`t=3` floor, `1 GiB`/`t=16` ceiling) | Resists GPU/ASIC brute-force & blocks header downgrade / DoS attacks |
-| **Multi-Key Hardware 2FA** | **`OMAV` v2 Key Slots (`1..=8` YubiKeys)** via `libfido2` `hmac-secret` + HKDF-SHA512 + XChaCha20-Poly1305 | Every unlock requires **both** master passphrase + physical YubiKey touch; add backup keys (`fido2 add`), revoke lost keys with automatic `master_key` + `kdf_salt` rotation (`fido2 remove`), and strict CBOR `rpIdHash` + `UP`/`UV`/`AT`/`ED` verification |
+| **Multi-Key Hardware 2FA** | **`OMAV` v2 Key Slots (`1..=8` YubiKeys)** via `libfido2` `hmac-secret` + HKDF-SHA512 + XChaCha20-Poly1305 | Optional. When a slot is enrolled, unlock needs the master passphrase **and** a physical touch. Add backup keys (`fido2 add`), revoke lost keys with automatic `master_key` + `kdf_salt` rotation (`fido2 remove`). CBOR `rpIdHash` + `UP`/`UV`/`AT`/`ED` are checked. UV/PIN slots need a TTY, so they do not unlock through `omavaultd` |
 | **Per-Save Key Rotation** | **HKDF-SHA512** (`master_key`, fresh 32-byte `save_salt`) | Every single save uses a brand-new 256-bit encryption subkey |
 | **Authenticated Encryption** | **XChaCha20-Poly1305** (256-bit key, fresh 192-bit nonce, full-header AAD) | Constant-time software AEAD with zero nonce-collision risk; any 1-bit tamper fails MAC |
 | **Traffic / Size Privacy** | **4 KiB CSPRNG random padding** inside AEAD ciphertext | Hides entry lengths and minor edit sizes |
-| **RAM Hardening** | `mmap` + `mlock` + `MADV_DONTDUMP` + `MADV_WIPEONFORK` + `mprotect(PROT_NONE)` for the master key; a **zeroizing global allocator** (`explicit_bzero` on every free/realloc); stack scrubbing after HKDF | Master key never swaps to disk, never dumps, wipes on fork, stays `PROT_NONE` when idle; freed heap never retains secret copies; `omavault status` warns if swap could page decrypted entries to disk |
+| **RAM Hardening** | `mmap` + `mlock` + `MADV_DONTDUMP` + `MADV_WIPEONFORK` + `mprotect(PROT_NONE)` for the master key; a **zeroizing global allocator** (`explicit_bzero` on every free/realloc); stack scrubbing after HKDF | The 32-byte master key is `mlock`ed when `RLIMIT_MEMLOCK` allows it (`init` and `status` say if the lock is active), excluded from core dumps, wiped on fork, and kept `PROT_NONE` when idle. Decrypted entries are ordinary heap. Freed blocks are wiped. `omavault status` reports whether swap could page those entries out |
 | **Process & Sandbox Hardening** | `prctl(PR_SET_DUMPABLE, 0)`, `RLIMIT_CORE=0`, `umask(0o077)`, `overflow-checks = true`, `systemd` `SystemCallFilter` seccomp + `MemoryDenyWriteExecute` | Blocks non-root `ptrace`, core dumps, W^X JIT, and disallowed syscalls from line 1 of `main()` |
 | **Omarchy Clipboard Shield** | Native Wayland **`wl-clipboard-rs` `sensitive(true)`** (`x-kde-passwordManagerHint`) | Excludes copied secrets from Omarchy 4.5's `omarchy.clipboard` (`Super + Ctrl + V`), supports `--paste-once`, and fail-closed auto-clears after 15s or on lock |
 | **Auto-Lock Daemon** | `omavaultd` over `0600` `$XDG_RUNTIME_DIR` socket with mutual `SO_PEERCRED` UID verification & priority control lane | Locks & wipes RAM automatically on inactivity timeout, **Omarchy/Hyprland `ext-session-lock` IPC**, **pre-sleep/hibernate (`systemd-logind` `PrepareForSleep`)**, **post-wake `CLOCK_BOOTTIME` skew**, `SIGUSR1`, or `Super + Ctrl + Shift + L` |
-| **Hyprland & Terminal Privacy** | `no_screen_share = true`, `stay_focused = true`, `foot` with `scrollback.lines=0`, `main.selection-target=none`, `security.osc52=disabled` | Blocks screenshots & screen-sharing portals from capturing the TUI and prevents secrets from leaking into scrollback, primary selection, or OSC-52 |
+| **Hyprland & Terminal Privacy** | `no_screen_share = true`, `stay_focused = true`; `foot`, Ghostty 1.4, and Alacritty launchers disable scrollback and clipboard writes (OSC-52 off, selection not saved) | Hides the TUI from screen-sharing portals. Launchers do not keep scrollback or copy a selection into the clipboard. This does not stop a compromised compositor |
 | **Disk Durability** | `0700` dir / `0600` temp file + `O_NOFOLLOW | O_NONBLOCK` + revision-checked `flock` + `fsync` + atomic `rename` + encrypted `.bak.1..5` | Crash-safe, concurrency-safe writes; old-key backups are automatically purged on `rekey` and `fido2 remove` |
 
 ---
@@ -138,8 +138,12 @@ omavault totp github.com --copy
 # On a terminal it goes to the secret clipboard by default; add --print to print it instead.
 omavault gen --passphrase --words 12
 
-# Restored an older vault backup on purpose? omavault refuses older copies by default:
+# Restored an older vault backup on purpose? omavault refuses older copies by default.
+# Anyone who can write ~/.local/state/omavault/seen/ can erase that history.
 omavault --allow-rollback list
+
+# Print stored text byte-exact. This skips terminal-escape stripping.
+omavault --raw get github.com --field notes --reveal
 
 # Run local security audit
 omavault audit
@@ -148,10 +152,18 @@ omavault audit
 # (automatically purges old-key backups after verifying the new vault; pass --keep-old-backups to retain them)
 omavault rekey --mem-mib 256 --enable-fido2
 
-# Check process & daemon hardening, crypto parameters, enrolled YubiKeys, and daemon status
+# Version is `<crate> (<git commit>)` on the TUI lock screen, --version, and status.
+omavault --version
+
+# Swap exposure, pre-sleep monitor, last lock reason, and session time remaining.
 omavault status
 
-# Lock immediately (exits non-zero if a running daemon fails to lock)
+# Absolute unlocked lifetime. IPC activity cannot extend it (60..=86400, default 3600).
+# While the daemon is unlocked, any same-user process can request the decrypted vault.
+omavault daemon --max-session 3600
+
+# Lock immediately. If the socket is flooded, this falls back to a verified SIGUSR1
+# to the daemon and to every registered TUI (including a standalone TUI).
 omavault lock
 ```
 

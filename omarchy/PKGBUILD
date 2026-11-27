@@ -2,7 +2,7 @@
 pkgname=omavault
 pkgver=0.3.1
 pkgrel=1
-pkgdesc="Bulletproof, memory-hardened Rust password manager for Omarchy Linux (Arch + Hyprland + Wayland)"
+pkgdesc="Memory-hardened Rust password manager for Omarchy Linux (Arch + Hyprland + Wayland)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/criptocbas/omavault"
 license=('MIT')

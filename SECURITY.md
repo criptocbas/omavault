@@ -85,3 +85,13 @@ Offset   Size   Field            Notes
 - **Root / kernel compromise**: A malicious `root` user or compromised Linux kernel can always read physical memory, inject keystrokes, or instrument Wayland compositors while the vault is unlocked. Keep your Omarchy Arch system updated, keep full-disk encryption (LUKS2) enabled, and lock the vault (`Super + Ctrl + Shift + L`) whenever stepping away.
 - **Same-user binary tampering**: Installing via `omarchy/PKGBUILD` (`makepkg -si`) places the binary at root-owned `/usr/bin/omavault` instead of user-writable `~/.local/bin/omavault`. The shipped Hyprland (`.lua`, `.conf`) and hypridle snippets always prefer `/usr/bin/omavault` when it exists, so a planted `~/.local/bin/omavault` cannot shadow the packaged binary. A same-user attacker can still edit your Hyprland config itself; protect your dotfiles accordingly.
 - **Disaster recovery**: Keep an offline/offsite backup of `~/.local/share/omavault/vault.omav` alongside your backup YubiKey so hardware failure of either the laptop or one YubiKey never causes data loss.
+
+## 5. Known limitations
+
+These are the boundaries the current code does not close. The threat model above has the longer form of each one.
+
+- **Same-UID daemon access.** While `omavaultd` is unlocked, any process running as your user can request the decrypted vault over the socket. `--max-session` (default 3600 s, allowed 60..=86400) locks the vault on that clock even if something keeps talking to the daemon. Activity does not extend it.
+- **Only the master key is `mlock`ed.** That is 32 bytes, and only when `RLIMIT_MEMLOCK` allows it. Decrypted entries in the TUI or CLI are ordinary heap and can be paged out. `omavault status` reports swap exposure: zram only, encrypted, unencrypted, or unverified. `mlockall` is not used; Argon2id's working set is far above the default 8 MiB memlock limit.
+- **Rollback history is a local file.** An attacker who can write `~/.local/state/omavault/seen/` can erase the generation record. The first open of a vault at a new path has nothing to compare against. `--allow-rollback` accepts a deliberate restore once.
+- **UV/PIN FIDO2 slots need a TTY.** `fido2-assert -t pin=true` reads the PIN from `/dev/tty`. `omavaultd` has no terminal, so those slots do not unlock through the daemon. They work in the standalone CLI or TUI (`systemctl --user stop omavaultd`, or no daemon).
+- **Root, kernel, and hibernation.** A root user or a compromised kernel can read process memory and inject input while the vault is unlocked. Hibernate (S4) writes RAM to disk. The pre-sleep inhibitor wipes keys before that image is taken; still use encrypted swap or an encrypted hibernation target.

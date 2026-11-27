@@ -62,7 +62,7 @@ fn parse_clip_timeout(s: &str) -> std::result::Result<u64, String> {
 #[command(
     name = "omavault",
     version = crate::VERSION,
-    about = "Bulletproof, memory-hardened password manager for Omarchy Linux (Arch + Hyprland + Wayland)",
+    about = "Memory-hardened password manager for Omarchy Linux (Arch + Hyprland + Wayland)",
     long_about = "Encrypted with Argon2id + HKDF-SHA512 + XChaCha20-Poly1305.\n\
                   Hardened with mlock/PROT_NONE/anti-ptrace, Wayland secret clipboard tagging, \
                   built-in TOTP, keyfile/FIDO2 2FA, and Hyprlock-synced auto-locking."
