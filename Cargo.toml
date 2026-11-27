@@ -5,7 +5,7 @@ edition = "2021"
 description = "Bulletproof, memory-hardened password manager crafted for Omarchy Linux (Arch + Hyprland + Wayland)"
 repository = "https://github.com/criptocbas/omavault"
 license = "MIT"
-rust-version = "1.80"
+rust-version = "1.88"
 
 [[bin]]
 name = "omavault"
@@ -36,8 +36,11 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # CLI & TUI
 clap = { version = "4.5", features = ["derive", "env"] }
-ratatui = "0.29"
-crossterm = "0.28"
+# crossterm_0_29 is the backend ratatui 0.30 uses. Default features stay on:
+# layout-cache now depends on lru 0.18, which is outside RUSTSEC-2026-0002
+# and RUSTSEC-2026-0253 (those were lru 0.12, pulled by ratatui 0.29).
+ratatui = { version = "0.30", features = ["crossterm_0_29"] }
+crossterm = "0.29"
 rpassword = "7.3"
 
 # OS, Signal Handling & Wayland integration
