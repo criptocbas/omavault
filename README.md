@@ -14,8 +14,8 @@ A bulletproof, memory-hardened, keyboard-first password manager crafted in Rust 
 | **RAM Hardening** | `mmap` + `mlock` + `MADV_DONTDUMP` + `MADV_WIPEONFORK` + `mprotect(PROT_NONE)` + `zeroize` | Master key never swaps to disk, never dumps, wipes on fork, and stays unreadable (`PROT_NONE`) when idle |
 | **Process Hardening** | `prctl(PR_SET_DUMPABLE, 0)`, `RLIMIT_CORE=0`, `umask(0o077)` | Blocks non-root `ptrace` attachment and core dumps from line 1 of `main()` |
 | **Omarchy Clipboard Shield** | Native Wayland **`wl-clipboard-rs` `sensitive(true)`** (`x-kde-passwordManagerHint`) | Excludes copied passwords from Omarchy's universal clipboard history (`Super + Ctrl + V`), supports `--paste-once`, and safely auto-clears after 15s |
-| **Auto-Lock Daemon** | `omavaultd` over `0600` `$XDG_RUNTIME_DIR` socket with `SO_PEERCRED` UID verification | Locks & wipes RAM automatically on inactivity timeout, **`hyprlock` detection**, **lid-close/suspend** (`CLOCK_BOOTTIME - CLOCK_MONOTONIC` skew), or `Super + Ctrl + Shift + L` |
-| **Hyprland Screen Privacy** | `windowrule = no_screen_share on` | Blocks screen-sharing portals & screenshots from capturing the floating TUI window |
+| **Auto-Lock Daemon** | `omavaultd` over `0600` `$XDG_RUNTIME_DIR` socket with `SO_PEERCRED` UID verification | Locks & wipes RAM automatically on inactivity timeout, **Omarchy/Hyprland session lock (`ext-session-lock` IPC + `hyprlock`)**, **lid-close/suspend** (`CLOCK_BOOTTIME - CLOCK_MONOTONIC` skew), or `Super + Ctrl + Shift + L` |
+| **Hyprland Screen Privacy** | `no_screen_share = true` (Lua) / `windowrule = no_screen_share on` | Blocks screen-sharing portals & screenshots from capturing the floating TUI window |
 | **Disk Durability** | `0700` dir / `0600` temp file + `fsync` + atomic `rename` + encrypted `.bak.1..5` | Crash-safe writes; vault is never world-readable or half-written |
 
 ---
@@ -30,7 +30,19 @@ chmod +x omarchy/install.sh
 
 Or build an Arch package with `makepkg -si` inside `omarchy/`.
 
-Then add this single line to `~/.config/hypr/hyprland.conf`:
+### Omarchy 4.5+ (Lua Hyprland config)
+
+Add this single line to `~/.config/hypr/hyprland.lua`:
+
+```lua
+require("hypr.omavault")
+```
+
+Then validate with `hyprctl reload && hyprctl configerrors`. The Lua module launches `omavault tui` in `foot` (with `scrollback.lines=0`, falling back to `ghostty`/`alacritty`) and rebinds `Super + Shift + /` (`SUPER + SHIFT + SLASH`, replacing Omarchy's default 1Password shortcut) plus `Super + Ctrl + Shift + L` for instant locking. `omavaultd` automatically detects Omarchy's `omarchy-shell` lock screen over Hyprland IPC.
+
+### Legacy Hyprland (`.conf`)
+
+Add this single line to `~/.config/hypr/hyprland.conf`:
 
 ```ini
 source = ~/.config/hypr/omavault.conf
@@ -58,16 +70,23 @@ omavault init
 omavault keyfile generate ~/.config/omavault-backup.key
 omavault init --keyfile ~/.config/omavault-backup.key
 
-# Master passphrase + YubiKey / FIDO2 hardware touch (hmac-secret)
-omavault init --fido2 --fido2-uv
+# Master passphrase + YubiKey / FIDO2 hardware touch (OMAV v2 multi-key slots)
+omavault init --fido2 --fido2-label primary
+
+# Add a second backup YubiKey (unlock with either key!)
+omavault fido2 add --label backup
+omavault fido2 list
+
+# Remove a lost/stolen YubiKey using your remaining key
+omavault fido2 remove backup --purge-old-backups
 
 # Maximum paranoia: Triple-factor (Passphrase + Keyfile + YubiKey FIDO2)
-omavault init --keyfile /run/media/$USER/USB/omavault.key --fido2 --fido2-uv
+omavault init --keyfile /run/media/$USER/USB/omavault.key --fido2 --fido2-label primary
 ```
 
 ### 2. Launch the Omarchy TUI
 
-Press **`Super + Shift + P`** anywhere in Hyprland, or run:
+Press **`Super + Shift + /`** anywhere in Hyprland (on Omarchy 4.5+), or run:
 
 ```bash
 omavault

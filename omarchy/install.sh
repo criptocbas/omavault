@@ -20,8 +20,18 @@ echo "==> Installed binary to ${BIN_DIR}/omavault (0700)"
 install -m 0600 omarchy/omavaultd.service "${SYSTEMD_DIR}/omavaultd.service"
 echo "==> Installed systemd user unit to ${SYSTEMD_DIR}/omavaultd.service (0600)"
 
-install -m 0600 omarchy/hypr-omavault.conf "${HYPR_DIR}/omavault.conf"
-echo "==> Installed Hyprland config snippet to ${HYPR_DIR}/omavault.conf (0600)"
+USE_LUA=false
+if [[ -f "${HYPR_DIR}/hyprland.lua" || -f "/usr/share/omarchy/default/hypr/bootstrap.lua" ]]; then
+    USE_LUA=true
+fi
+
+if [[ "${USE_LUA}" == "true" ]]; then
+    install -m 0600 omarchy/omavault.lua "${HYPR_DIR}/omavault.lua"
+    echo "==> Installed Omarchy Lua Hyprland module to ${HYPR_DIR}/omavault.lua (0600)"
+else
+    install -m 0600 omarchy/hypr-omavault.conf "${HYPR_DIR}/omavault.conf"
+    echo "==> Installed Hyprland config snippet to ${HYPR_DIR}/omavault.conf (0600)"
+fi
 
 if command -v systemctl >/dev/null 2>&1; then
     if systemctl --user daemon-reload && systemctl --user enable omavaultd.service && systemctl --user restart omavaultd.service; then
@@ -33,11 +43,22 @@ fi
 
 echo ""
 echo "Next steps on your Omarchy laptop:"
-echo "  1. Add this line to ~/.config/hypr/hyprland.conf:"
-echo "       source = ~/.config/hypr/omavault.conf"
-echo "  2. (Optional) Add omavault lock hooks from omarchy/hypridle-hook.conf to ~/.config/hypr/hypridle.conf"
-echo "  3. (Optional, for YubiKey FIDO2) Install libfido2:"
+if [[ "${USE_LUA}" == "true" ]]; then
+    echo "  1. Add this line to ~/.config/hypr/hyprland.lua:"
+    echo '       require("hypr.omavault")'
+    echo "     Then reload and validate: hyprctl reload && hyprctl configerrors"
+    echo "     (omavaultd automatically detects Omarchy's lock screen via Hyprland IPC.)"
+else
+    echo "  1. Add this line to ~/.config/hypr/hyprland.conf:"
+    echo "       source = ~/.config/hypr/omavault.conf"
+    echo "  2. (Optional) Add omavault lock hooks from omarchy/hypridle-hook.conf to ~/.config/hypr/hypridle.conf"
+fi
+echo "  - (Optional, for YubiKey FIDO2) Ensure libfido2 is installed:"
 echo "       sudo pacman -S libfido2"
-echo "  4. Initialize your vault:"
+echo "  - Initialize your vault:"
 echo "       omavault init"
-echo "  5. Press Super + Shift + P anywhere in Hyprland to open omavault!"
+if [[ "${USE_LUA}" == "true" ]]; then
+    echo "  - Press Super + Shift + / anywhere in Hyprland to open omavault!"
+else
+    echo "  - Press Super + Shift + P anywhere in Hyprland to open omavault!"
+fi

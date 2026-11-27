@@ -33,6 +33,7 @@ pub const MAX_ARGON2_WORK_KIB_ITERS: u64 = 8 * 1_048_576;
 const MAX_KEYFILE_BYTES: u64 = 64 * 1024 * 1024;
 
 const HKDF_MASTER_INFO: &[u8] = b"omavault-v1-master-key-combiner";
+const HKDF_SLOT_KEK_INFO: &[u8] = b"omavault-v2-fido2-slot-kek";
 const HKDF_PAYLOAD_INFO: &[u8] = b"omavault-v1-payload-xchacha20poly1305";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,23 +180,16 @@ pub fn hash_keyfile(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
     Ok(out)
 }
 
-/// Derive the 32-byte hardened `MasterKey` stored in `mlock`ed `PROT_NONE` memory.
+/// Compute the raw 32-byte Argon2id passphrase hash (`RFC 9106 v0x13`).
 ///
-/// Pipeline:
-/// 1. `pw_hash = Argon2id(passphrase, kdf_salt, params)` (32 bytes, zeroized matrix)
-/// 2. Domain-separated IKM construction:
-///    `b"PW" || pw_hash`
-///    `|| (if keyfile: b"KF" || blake3(keyfile))`
-///    `|| (if fido2:   b"F2" || fido2_hmac_secret)`
-/// 3. `master_key = HKDF-SHA512(salt = kdf_salt, ikm = tagged_ikm, info = "omavault-v1-master-key-combiner")`
-pub fn derive_master_key(
+/// Exposed separately so `OMAV` v2 multi-slot vaults run Argon2id once per unlock/enroll
+/// instead of repeating expensive memory-hard hashing per slot.
+pub fn derive_passphrase_hash(
     passphrase: &[u8],
     kdf_salt: &[u8; 32],
     params: KdfParams,
-    keyfile_digest: Option<&[u8; 32]>,
-    fido2_secret: Option<&[u8; 32]>,
     enforce_policy: bool,
-) -> Result<LockedKey<32>> {
+) -> Result<Zeroizing<[u8; 32]>> {
     if enforce_policy {
         params.validate()?;
     } else {
@@ -210,10 +204,19 @@ pub fn derive_master_key(
     argon2
         .hash_password_into(passphrase, kdf_salt, &mut *pw_hash)
         .map_err(|e| VaultError::Crypto(format!("Argon2id derivation failed: {e}")))?;
+    Ok(pw_hash)
+}
 
+/// Derive a 32-byte `OMAV` v1 hardened `MasterKey` directly from a pre-computed Argon2id `pw_hash`.
+pub fn derive_master_key_from_pw_hash(
+    pw_hash: &[u8; 32],
+    kdf_salt: &[u8; 32],
+    keyfile_digest: Option<&[u8; 32]>,
+    fido2_secret: Option<&[u8; 32]>,
+) -> Result<LockedKey<32>> {
     let mut ikm = Zeroizing::new(Vec::with_capacity(34 * 3));
     ikm.extend_from_slice(b"PW");
-    ikm.extend_from_slice(&*pw_hash);
+    ikm.extend_from_slice(pw_hash);
 
     if let Some(kf) = keyfile_digest {
         ikm.extend_from_slice(b"KF");
@@ -230,6 +233,55 @@ pub fn derive_master_key(
         .map_err(|_| VaultError::Crypto("HKDF-SHA512 master key expand failed".into()))?;
 
     LockedKey::new(&mut master_raw)
+}
+
+/// Derive a 32-byte Key-Encryption-Key (KEK) for wrapping/unwrapping an `OMAV` v2 FIDO2 key slot.
+///
+/// Combines the Argon2id passphrase hash, optional 512-bit keyfile BLAKE3 digest, and the
+/// hardware-bound 32-byte FIDO2 `hmac-secret` under domain separation `"omavault-v2-fido2-slot-kek"`.
+pub fn derive_slot_kek(
+    pw_hash: &[u8; 32],
+    kdf_salt: &[u8; 32],
+    keyfile_digest: Option<&[u8; 32]>,
+    fido2_secret: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(34 * 3));
+    ikm.extend_from_slice(b"PW");
+    ikm.extend_from_slice(pw_hash);
+
+    if let Some(kf) = keyfile_digest {
+        ikm.extend_from_slice(b"KF");
+        ikm.extend_from_slice(kf);
+    }
+    ikm.extend_from_slice(b"F2");
+    ikm.extend_from_slice(fido2_secret);
+
+    let hk = Hkdf::<Sha512>::new(Some(kdf_salt), &ikm);
+    let mut kek = Zeroizing::new([0u8; 32]);
+    hk.expand(HKDF_SLOT_KEK_INFO, &mut *kek)
+        .map_err(|_| VaultError::Crypto("HKDF-SHA512 slot KEK expand failed".into()))?;
+    Ok(kek)
+}
+
+/// Derive the 32-byte hardened `MasterKey` stored in `mlock`ed `PROT_NONE` memory (`OMAV` v1).
+///
+/// Pipeline:
+/// 1. `pw_hash = Argon2id(passphrase, kdf_salt, params)` (32 bytes, zeroized matrix)
+/// 2. Domain-separated IKM construction:
+///    `b"PW" || pw_hash`
+///    `|| (if keyfile: b"KF" || blake3(keyfile))`
+///    `|| (if fido2:   b"F2" || fido2_hmac_secret)`
+/// 3. `master_key = HKDF-SHA512(salt = kdf_salt, ikm = tagged_ikm, info = "omavault-v1-master-key-combiner")`
+pub fn derive_master_key(
+    passphrase: &[u8],
+    kdf_salt: &[u8; 32],
+    params: KdfParams,
+    keyfile_digest: Option<&[u8; 32]>,
+    fido2_secret: Option<&[u8; 32]>,
+    enforce_policy: bool,
+) -> Result<LockedKey<32>> {
+    let pw_hash = derive_passphrase_hash(passphrase, kdf_salt, params, enforce_policy)?;
+    derive_master_key_from_pw_hash(&pw_hash, kdf_salt, keyfile_digest, fido2_secret)
 }
 
 /// Derive a fresh per-save 256-bit AEAD encryption key from `master_key` and `save_salt`.

@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::clipboard::clear_clipboard_best_effort;
-use crate::crypto::fido2::{Fido2Provider, LibFido2Cli};
-use crate::crypto::kdf::{derive_master_key, hash_keyfile};
-use crate::crypto::VaultHeader;
+use crate::crypto::fido2::LibFido2Cli;
+use crate::crypto::kdf::hash_keyfile;
+use crate::crypto::{resolve_master_key, VaultHeader};
 use crate::error::{Result, VaultError};
 use crate::hardening::{
     boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, LockedKey,
@@ -29,6 +29,9 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
 const MAX_IPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_WORKERS: usize = 8;
 const IPC_FRAME_DEADLINE: Duration = Duration::from_secs(10);
+/// Extended client-side wait window for `DaemonRequest::Unlock` to accommodate
+/// Argon2id derivation plus the 45-second FIDO2 physical touch timeout.
+const IPC_UNLOCK_DEADLINE: Duration = Duration::from_secs(60);
 const SUSPEND_SKEW_THRESHOLD_MS: u64 = 2000;
 
 /// Default runtime path for the daemon Unix socket:
@@ -329,7 +332,7 @@ pub fn run_daemon(
                 if slept {
                     clear_clip = guard.lock_inner("system suspend/resume detected");
                 } else if locker_active {
-                    clear_clip = guard.lock_inner("screen lock (hyprlock) detected");
+                    clear_clip = guard.lock_inner("screen lock detected");
                 } else if let Some(session) = &guard.session {
                     let elapsed = current_boot_secs().saturating_sub(session.last_activity_boot_secs);
                     if elapsed >= guard.idle_timeout_secs {
@@ -507,22 +510,15 @@ fn handle_connection(
                     None
                 };
 
-                let fido2_secret = if header.requires_fido2() {
-                    let meta = header.fido2.as_ref().ok_or(VaultError::Fido2Required)?;
-                    let provider = LibFido2Cli;
-                    Some(provider.get_hmac_secret(meta, fido2_device.as_deref())?)
-                } else {
-                    None
-                };
-
-                let master_key = derive_master_key(
+                let resolution = resolve_master_key(
+                    &header,
                     passphrase.0.as_bytes(),
-                    &header.kdf_salt,
-                    header.kdf_params,
                     kf_digest.as_deref(),
-                    fido2_secret.as_deref(),
+                    &LibFido2Cli,
+                    fido2_device.as_deref(),
                     enforce_kdf_policy,
                 )?;
+                let master_key = resolution.master_key;
 
                 let (verified_header, _vault) =
                     load_vault_from_disk(&canonical, &master_key, enforce_kdf_policy)?;
@@ -738,6 +734,14 @@ impl DaemonClient {
     }
 
     pub fn request(&self, req: &DaemonRequest) -> Result<DaemonResponse> {
+        self.request_with_deadline(req, IPC_FRAME_DEADLINE)
+    }
+
+    fn request_with_deadline(
+        &self,
+        req: &DaemonRequest,
+        response_deadline: Duration,
+    ) -> Result<DaemonResponse> {
         self.validate_socket_security()?;
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|e| {
             VaultError::Daemon(format!(
@@ -753,7 +757,7 @@ impl DaemonClient {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         write_frame(&mut stream, req)?;
-        let raw = read_frame(&mut stream)?;
+        let raw = read_frame_with_deadline(&mut stream, response_deadline)?;
         let resp: DaemonResponse = serde_json::from_slice(&raw)
             .map_err(|_| VaultError::Daemon("invalid daemon response".into()))?;
         drop(raw);
@@ -782,7 +786,7 @@ impl DaemonClient {
             keyfile_path,
             fido2_device,
         };
-        match self.request(&req)? {
+        match self.request_with_deadline(&req, IPC_UNLOCK_DEADLINE)? {
             DaemonResponse::Ok => Ok(()),
             DaemonResponse::Error { message } => Err(VaultError::Daemon(message)),
             _ => Err(VaultError::Daemon("unexpected response to unlock".into())),
@@ -887,7 +891,14 @@ fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
 /// Read an IPC frame with an absolute monotonic deadline and incremental chunked allocation
 /// (prevents slow-loris stalls and blind 16 MiB OOM allocations from untrusted length headers).
 fn read_frame(stream: &mut UnixStream) -> Result<Zeroizing<Vec<u8>>> {
-    let deadline = Instant::now() + IPC_FRAME_DEADLINE;
+    read_frame_with_deadline(stream, IPC_FRAME_DEADLINE)
+}
+
+fn read_frame_with_deadline(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let deadline = Instant::now() + timeout;
     let mut len_buf = [0u8; 4];
     read_exact_with_deadline(stream, &mut len_buf, deadline)?;
     let total_len = u32::from_le_bytes(len_buf) as usize;

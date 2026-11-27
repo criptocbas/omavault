@@ -15,7 +15,7 @@ pub enum VaultError {
     #[error("invalid vault format: {0}")]
     InvalidFormat(String),
 
-    #[error("unsupported vault version {0} (supported: 1)")]
+    #[error("unsupported vault version {0} (supported: 1, 2)")]
     UnsupportedVersion(u16),
 
     #[error("KDF parameters violate security policy: {0}")]
@@ -29,6 +29,9 @@ pub enum VaultError {
 
     #[error("FIDO2 hardware key required to unlock this vault")]
     Fido2Required,
+
+    #[error("connected FIDO2 hardware key does not match any enrolled key slot for this vault")]
+    Fido2NoMatchingCredential,
 
     #[error("FIDO2 hardware key error: {0}")]
     Fido2Error(String),

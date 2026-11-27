@@ -473,13 +473,22 @@ pub fn boottime_monotonic_skew_ms() -> Option<u64> {
 }
 
 /// Inspect `/proc/<pid>/status` atomically (zero subprocesses) to detect active Wayland/X11
-/// screen lockers owned by `target_uid`.
+/// screen lockers owned by `target_uid`, and query Hyprland's IPC socket directly over `AF_UNIX`
+/// to detect Wayland `ext-session-lock` screen locks (such as Omarchy 4.5's `omarchy-shell` lock).
 ///
 /// Parsing `Uid:` from `/proc/<pid>/status` works even when a hardened screen locker sets
 /// `PR_SET_DUMPABLE=0` (which changes `/proc/<pid>` directory ownership to root UID 0),
 /// and ignores zombie (`Z`) / dead (`X`) processes.
 #[cfg(target_os = "linux")]
 pub fn is_screen_locker_active(target_uid: u32) -> bool {
+    if is_proc_screen_locker_active(target_uid) {
+        return true;
+    }
+    is_hyprland_session_locked(target_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn is_proc_screen_locker_active(target_uid: u32) -> bool {
     let Ok(entries) = fs::read_dir("/proc") else {
         return false;
     };
@@ -501,9 +510,99 @@ pub fn is_screen_locker_active(target_uid: u32) -> bool {
     false
 }
 
+/// Query Hyprland's `j/monitors` IPC endpoint directly over `AF_UNIX` (zero subprocesses)
+/// to detect an active `ext-session-lock` (reported as `"LOCK"` in `solitaryBlockedBy`).
+#[cfg(target_os = "linux")]
+fn is_hyprland_session_locked(target_uid: u32) -> bool {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    const MAX_IPC_RESPONSE_BYTES: u64 = 256 * 1024;
+    const IPC_TIMEOUT: Duration = Duration::from_millis(250);
+
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("/run/user/{target_uid}"));
+    let hypr_base = PathBuf::from(runtime_dir).join("hypr");
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        if !sig.is_empty() && !sig.contains('/') && !sig.contains("..") {
+            candidates.push(hypr_base.join(sig).join(".socket.sock"));
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(&hypr_base) {
+        let mut discovered: Vec<(SystemTime, PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let sock = entry.path().join(".socket.sock");
+                let meta = fs::symlink_metadata(&sock).ok()?;
+                if meta.uid() != target_uid || !meta.file_type().is_socket() {
+                    return None;
+                }
+                let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((modified, sock))
+            })
+            .collect();
+        discovered.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, sock) in discovered.into_iter().take(4) {
+            if !candidates.contains(&sock) {
+                candidates.push(sock);
+            }
+        }
+    }
+
+    let query_socket = |sock_path: &Path| -> Option<bool> {
+        let meta = fs::symlink_metadata(sock_path).ok()?;
+        if meta.uid() != target_uid || !meta.file_type().is_socket() {
+            return None;
+        }
+        let mut stream = UnixStream::connect(sock_path).ok()?;
+        let _ = stream.set_read_timeout(Some(IPC_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IPC_TIMEOUT));
+        stream.write_all(b"j/monitors").ok()?;
+        let _ = stream.shutdown(Shutdown::Write);
+
+        let mut response = String::new();
+        stream
+            .take(MAX_IPC_RESPONSE_BYTES)
+            .read_to_string(&mut response)
+            .ok()?;
+        Some(monitors_json_has_session_lock(&response))
+    };
+
+    for sock in candidates {
+        if let Some(locked) = query_socket(&sock) {
+            return locked;
+        }
+    }
+
+    false
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn is_screen_locker_active(_target_uid: u32) -> bool {
     false
+}
+
+/// Pure parser for Hyprland `j/monitors` JSON output to detect an active `ext-session-lock`.
+pub(crate) fn monitors_json_has_session_lock(json: &str) -> bool {
+    let Ok(serde_json::Value::Array(monitors)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return false;
+    };
+    monitors.iter().any(|monitor| {
+        monitor
+            .get("solitaryBlockedBy")
+            .and_then(|v| v.as_array())
+            .is_some_and(|blockers| blockers.iter().any(|item| item.as_str() == Some("LOCK")))
+    })
 }
 
 /// Pure parser for `/proc/<pid>/status` so locker detection is unit-testable.
@@ -593,5 +692,21 @@ mod tests {
 
         let truncated_swaylock = "Name:\tswaylock-effect\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\n";
         assert!(status_matches_active_locker(truncated_swaylock, 1000));
+    }
+
+    #[test]
+    fn hyprland_monitors_json_detects_session_lock() {
+        let locked = r#"[{"id":0,"name":"eDP-1","solitaryBlockedBy":["LOCK","BAR"]}]"#;
+        assert!(monitors_json_has_session_lock(locked));
+
+        let multi_monitor_one_locked =
+            r#"[{"id":0,"solitaryBlockedBy":["WORKSPACE"]},{"id":1,"solitaryBlockedBy":["LOCK"]}]"#;
+        assert!(monitors_json_has_session_lock(multi_monitor_one_locked));
+
+        let unlocked = r#"[{"id":0,"name":"eDP-1","solitaryBlockedBy":["ALPHA","BAR"]}]"#;
+        assert!(!monitors_json_has_session_lock(unlocked));
+
+        assert!(!monitors_json_has_session_lock("[]"));
+        assert!(!monitors_json_has_session_lock("not-json"));
     }
 }

@@ -11,10 +11,13 @@ use crate::clipboard::{
 };
 use crate::crypto::fido2::{Fido2Provider, LibFido2Cli};
 use crate::crypto::kdf::{
-    derive_master_key, hash_keyfile, KdfParams, DEFAULT_ARGON2_LANES, DEFAULT_ARGON2_MEM_KIB,
-    DEFAULT_ARGON2_TIME,
+    derive_master_key, derive_passphrase_hash, hash_keyfile, KdfParams, DEFAULT_ARGON2_LANES,
+    DEFAULT_ARGON2_MEM_KIB, DEFAULT_ARGON2_TIME,
 };
-use crate::crypto::VaultHeader;
+use crate::crypto::{
+    generate_random_master_key, resolve_master_key, validate_slot_label, wrap_master_key_for_slot,
+    VaultHeader, MAX_FIDO2_SLOTS, VAULT_VERSION_V1, VAULT_VERSION_V2,
+};
 use crate::daemon::{default_socket_path, run_daemon, DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS};
 use crate::error::{Result, VaultError};
 use crate::generator::{
@@ -95,6 +98,9 @@ pub enum Commands {
         /// Require a FIDO2 hardware key (YubiKey hmac-secret) in addition to master passphrase
         #[arg(long)]
         fido2: bool,
+        /// Label for the initial enrolled FIDO2 key slot (used with --fido2, e.g. "primary")
+        #[arg(long, default_value = "primary")]
+        fido2_label: String,
         /// Require FIDO2 User Verification (PIN / biometric) during touch
         #[arg(long)]
         fido2_uv: bool,
@@ -253,6 +259,9 @@ pub enum Commands {
         /// Enroll a new FIDO2 hardware key
         #[arg(long, conflicts_with = "remove_fido2")]
         enable_fido2: bool,
+        /// Label for the newly enrolled FIDO2 key slot (used with --enable-fido2)
+        #[arg(long, default_value = "primary")]
+        fido2_label: String,
         /// Require User Verification on the newly enrolled FIDO2 key
         #[arg(long)]
         fido2_uv: bool,
@@ -277,6 +286,12 @@ pub enum Commands {
     Keyfile {
         #[command(subcommand)]
         action: KeyfileAction,
+    },
+
+    /// Manage enrolled FIDO2 / YubiKey hardware key slots (add backup keys, list, remove)
+    Fido2 {
+        #[command(subcommand)]
+        action: Fido2Action,
     },
 
     /// Run the background auto-lock daemon (syncs with Hyprlock, suspend, and idle timeout)
@@ -314,6 +329,29 @@ pub enum Commands {
 pub enum KeyfileAction {
     /// Generate a fresh 512-bit CSPRNG keyfile with 0600 permissions
     Generate { path: PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Fido2Action {
+    /// List enrolled FIDO2 / YubiKey hardware slots in this vault
+    List,
+    /// Enroll an additional FIDO2 / YubiKey hardware backup slot
+    Add {
+        /// Unique human-friendly label for this key (e.g. "backup", "usb-c")
+        #[arg(short, long)]
+        label: String,
+        /// Require FIDO2 User Verification (PIN / biometric) for this key slot
+        #[arg(long)]
+        uv: bool,
+    },
+    /// Remove an enrolled FIDO2 / YubiKey hardware slot by label
+    Remove {
+        /// Label of the FIDO2 key slot to remove
+        label: String,
+        /// Remove rolling `.bak.*` files that still contain the removed key slot
+        #[arg(long)]
+        purge_old_backups: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -400,6 +438,300 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             Ok(())
         }
 
+        Commands::Fido2 { action } => match action {
+            Fido2Action::List => {
+                let header = read_header_from_disk(&vault_path, true)?;
+                if !header.requires_fido2() {
+                    println!("No FIDO2 hardware keys enrolled.");
+                    println!("Tip: Run `omavault rekey --enable-fido2` to add a YubiKey.");
+                    return Ok(());
+                }
+                if header.version == VAULT_VERSION_V2 {
+                    println!(
+                        "Enrolled FIDO2 hardware key slots ({}/{}):",
+                        header.fido2_slots.len(),
+                        MAX_FIDO2_SLOTS
+                    );
+                    for (idx, slot) in header.fido2_slots.iter().enumerate() {
+                        let fp: String = slot.fido2.credential_id_b64.chars().take(12).collect();
+                        println!(
+                            "  {}. {:<20} uv={}  cred={}...",
+                            idx + 1,
+                            slot.label,
+                            slot.fido2.require_uv,
+                            fp
+                        );
+                    }
+                } else if let Some(meta) = &header.fido2 {
+                    let fp: String = meta.credential_id_b64.chars().take(12).collect();
+                    println!("Legacy OMAV v1 single FIDO2 key enrolled:");
+                    println!("  1. legacy-v1            uv={}  cred={}...", meta.require_uv, fp);
+                    println!(
+                        "Tip: Run `omavault fido2 add --label backup` to upgrade to OMAV v2 multi-key slots."
+                    );
+                }
+                Ok(())
+            }
+
+            Fido2Action::Add { label, uv } => {
+                validate_slot_label(&label)?;
+
+                let client = DaemonClient::new(socket_path);
+                let _ = client.lock();
+                clear_clipboard_best_effort();
+
+                let old_header = read_header_from_disk(&vault_path, true)?;
+                if !old_header.requires_fido2() {
+                    return Err(VaultError::Fido2Error(
+                        "this vault does not have FIDO2 enabled yet; run `omavault rekey --enable-fido2` first"
+                            .into(),
+                    ));
+                }
+                if old_header.version == VAULT_VERSION_V2 {
+                    if old_header.has_fido2_label(&label) {
+                        return Err(VaultError::Fido2Error(format!(
+                            "a FIDO2 key slot labeled '{label}' already exists"
+                        )));
+                    }
+                    if old_header.fido2_slots.len() >= MAX_FIDO2_SLOTS {
+                        return Err(VaultError::Fido2Error(format!(
+                            "vault already has the maximum of {MAX_FIDO2_SLOTS} FIDO2 key slots"
+                        )));
+                    }
+                }
+
+                let passphrase =
+                    prompt_passphrase("Master passphrase: ", cli.passphrase_stdin)?;
+                let kf_digest = if old_header.requires_keyfile() {
+                    let p = cli.keyfile.as_deref().ok_or(VaultError::KeyfileRequired)?;
+                    Some(hash_keyfile(p)?)
+                } else {
+                    None
+                };
+
+                eprintln!(
+                    "Touch an EXISTING enrolled YubiKey to authorize adding '{label}'..."
+                );
+                let res = resolve_master_key(
+                    &old_header,
+                    passphrase.as_bytes(),
+                    kf_digest.as_deref(),
+                    &LibFido2Cli,
+                    cli.fido2_device.as_deref(),
+                    true,
+                )?;
+                let (_, vault) = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                drop(passphrase);
+
+                wait_for_yubikey_swap(&format!(
+                    "Now plug in the NEW YubiKey to enroll as '{label}', then press Enter..."
+                ))?;
+
+                let provider = LibFido2Cli;
+                let new_meta = provider.enroll(cli.fido2_device.as_deref(), uv)?;
+                eprintln!("Touch the NEW YubiKey ('{label}') once more to verify enrollment...");
+                let new_secret =
+                    provider.get_hmac_secret(&new_meta, cli.fido2_device.as_deref())?;
+
+                if old_header.version == VAULT_VERSION_V2 {
+                    let mut updated_header = old_header.clone();
+                    let new_slot = wrap_master_key_for_slot(
+                        &updated_header,
+                        &res.master_key,
+                        &res.pw_hash,
+                        kf_digest.as_deref(),
+                        &label,
+                        new_meta,
+                        &new_secret,
+                    )?;
+                    updated_header.fido2_slots.push(new_slot);
+                    save_vault_to_disk(&vault_path, &res.master_key, &mut updated_header, &vault)?;
+                    let _ = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                    println!(
+                        "Enrolled FIDO2 key '{label}' ({}/{} slots). You can now unlock with any enrolled key: {}",
+                        updated_header.fido2_slots.len(),
+                        MAX_FIDO2_SLOTS,
+                        updated_header.fido2_labels().join(", ")
+                    );
+                } else {
+                    // Seamless upgrade from OMAV v1 single-key FIDO2 to OMAV v2 multi-key slots!
+                    let old_meta = old_header
+                        .fido2
+                        .clone()
+                        .ok_or(VaultError::Fido2Required)?;
+                    let old_secret = res
+                        .matched_fido2_secret
+                        .as_ref()
+                        .ok_or(VaultError::Fido2Required)?;
+                    let first_label = if label.eq_ignore_ascii_case("primary") {
+                        "key-1"
+                    } else {
+                        "primary"
+                    };
+
+                    let mut v2_header = VaultHeader::new_v2_fido2_shell(
+                        old_header.kdf_params,
+                        old_header.requires_keyfile(),
+                    )?;
+                    v2_header.kdf_salt = old_header.kdf_salt;
+
+                    let new_master_key = generate_random_master_key()?;
+                    let slot1 = wrap_master_key_for_slot(
+                        &v2_header,
+                        &new_master_key,
+                        &res.pw_hash,
+                        kf_digest.as_deref(),
+                        first_label,
+                        old_meta,
+                        old_secret,
+                    )?;
+                    let slot2 = wrap_master_key_for_slot(
+                        &v2_header,
+                        &new_master_key,
+                        &res.pw_hash,
+                        kf_digest.as_deref(),
+                        &label,
+                        new_meta,
+                        &new_secret,
+                    )?;
+                    v2_header.fido2_slots.push(slot1);
+                    v2_header.fido2_slots.push(slot2);
+
+                    save_vault_to_disk(&vault_path, &new_master_key, &mut v2_header, &vault)?;
+                    let _ = load_vault_from_disk(&vault_path, &new_master_key, true)?;
+                    println!(
+                        "Upgraded vault to OMAV v2 and enrolled '{label}' ({}/{} slots: {}).",
+                        v2_header.fido2_slots.len(),
+                        MAX_FIDO2_SLOTS,
+                        v2_header.fido2_labels().join(", ")
+                    );
+                }
+                Ok(())
+            }
+
+            Fido2Action::Remove {
+                label,
+                purge_old_backups,
+            } => {
+                let client = DaemonClient::new(socket_path);
+                let _ = client.lock();
+                clear_clipboard_best_effort();
+
+                let old_header = read_header_from_disk(&vault_path, true)?;
+                if old_header.version != VAULT_VERSION_V2 || !old_header.requires_fido2() {
+                    return Err(VaultError::Fido2Error(
+                        "this vault does not have multiple OMAV v2 FIDO2 slots; use `omavault rekey --remove-fido2` to disable FIDO2"
+                            .into(),
+                    ));
+                }
+                if !old_header.has_fido2_label(&label) {
+                    return Err(VaultError::Fido2Error(format!(
+                        "no FIDO2 key slot labeled '{label}' found (enrolled: {})",
+                        old_header.fido2_labels().join(", ")
+                    )));
+                }
+                if old_header.fido2_slots.len() <= 1 {
+                    return Err(VaultError::Fido2Error(
+                        "refusing to remove the last remaining FIDO2 key (use `omavault rekey --remove-fido2` to disable FIDO2 completely)"
+                            .into(),
+                    ));
+                }
+
+                let passphrase =
+                    prompt_passphrase("Master passphrase: ", cli.passphrase_stdin)?;
+                let kf_digest = if old_header.requires_keyfile() {
+                    let p = cli.keyfile.as_deref().ok_or(VaultError::KeyfileRequired)?;
+                    Some(hash_keyfile(p)?)
+                } else {
+                    None
+                };
+
+                eprintln!(
+                    "Touch one of your REMAINING enrolled YubiKeys (not '{label}') to authorize removal..."
+                );
+                let res = resolve_master_key(
+                    &old_header,
+                    passphrase.as_bytes(),
+                    kf_digest.as_deref(),
+                    &LibFido2Cli,
+                    cli.fido2_device.as_deref(),
+                    true,
+                )?;
+                let matched_idx = res
+                    .matched_slot_index
+                    .ok_or(VaultError::Fido2Required)?;
+                if old_header.fido2_slots[matched_idx]
+                    .label
+                    .eq_ignore_ascii_case(&label)
+                {
+                    return Err(VaultError::Fido2Error(format!(
+                        "you touched '{label}' (the key being removed); touch one of your other enrolled YubiKeys instead"
+                    )));
+                }
+                let (_, vault) = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                drop(passphrase);
+
+                let mut updated_header = old_header.clone();
+                let remaining_slot_clone = old_header.fido2_slots[matched_idx].clone();
+                updated_header
+                    .fido2_slots
+                    .retain(|s| !s.label.eq_ignore_ascii_case(&label));
+
+                let rotated_master = if updated_header.fido2_slots.len() == 1 {
+                    // We already hold the sole remaining key's secret in memory — rotate the
+                    // vault master key immediately with zero extra touches!
+                    let new_mk = generate_random_master_key()?;
+                    let remaining_secret = res
+                        .matched_fido2_secret
+                        .as_ref()
+                        .ok_or(VaultError::Fido2Required)?;
+                    let rewrapped = wrap_master_key_for_slot(
+                        &updated_header,
+                        &new_mk,
+                        &res.pw_hash,
+                        kf_digest.as_deref(),
+                        &remaining_slot_clone.label,
+                        remaining_slot_clone.fido2,
+                        remaining_secret,
+                    )?;
+                    updated_header.fido2_slots = vec![rewrapped];
+                    save_vault_to_disk(&vault_path, &new_mk, &mut updated_header, &vault)?;
+                    let _ = load_vault_from_disk(&vault_path, &new_mk, true)?;
+                    true
+                } else {
+                    save_vault_to_disk(
+                        &vault_path,
+                        &res.master_key,
+                        &mut updated_header,
+                        &vault,
+                    )?;
+                    let _ = load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                    false
+                };
+
+                if purge_old_backups {
+                    let removed = purge_encrypted_backups(&vault_path)?;
+                    println!(
+                        "Removed FIDO2 key '{label}' and purged {removed} old backup file(s). Remaining keys: {}",
+                        updated_header.fido2_labels().join(", ")
+                    );
+                } else {
+                    println!(
+                        "Removed FIDO2 key '{label}'. Remaining keys: {}",
+                        updated_header.fido2_labels().join(", ")
+                    );
+                }
+                if rotated_master {
+                    println!("Vault master key was automatically rotated for the remaining key.");
+                } else {
+                    eprintln!(
+                        "Note: If '{label}' was lost or stolen, run `omavault rekey --purge-old-backups` to also rotate the underlying vault master key."
+                    );
+                }
+                Ok(())
+            }
+        },
+
         Commands::Gen {
             passphrase,
             length,
@@ -482,7 +814,11 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     "omavault daemon is not running (start it with `omavault daemon` or `systemctl --user start omavaultd`)".into(),
                 ));
             }
+            let header = read_header_from_disk(&vault_path, true)?;
             let passphrase = prompt_passphrase("Master passphrase: ", cli.passphrase_stdin)?;
+            if header.requires_fido2() {
+                eprintln!("Touch your FIDO2 security key when it blinks...");
+            }
             client.unlock(
                 &vault_path,
                 passphrase,
@@ -505,10 +841,22 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     header.kdf_params.time_cost,
                     header.kdf_params.parallelism
                 );
+                let fido_desc = if header.version == VAULT_VERSION_V2 {
+                    format!(
+                        " + FIDO2 ({} {}: {})",
+                        header.fido2_slots.len(),
+                        if header.fido2_slots.len() == 1 { "key" } else { "keys" },
+                        header.fido2_labels().join(", ")
+                    )
+                } else if header.requires_fido2() {
+                    " + FIDO2 (legacy v1)".to_string()
+                } else {
+                    String::new()
+                };
                 println!(
                     "Required factors:  Passphrase{}{}",
                     if header.requires_keyfile() { " + Keyfile" } else { "" },
-                    if header.requires_fido2() { " + FIDO2" } else { "" },
+                    fido_desc,
                 );
             } else {
                 println!("Vault state:       Not initialized (run `omavault init`)");
@@ -533,6 +881,7 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
 
         Commands::Init {
             fido2,
+            fido2_label,
             fido2_uv,
             mem_mib,
             time,
@@ -542,6 +891,9 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 return Err(VaultError::VaultAlreadyExists(
                     vault_path.display().to_string(),
                 ));
+            }
+            if fido2 {
+                validate_slot_label(&fido2_label)?;
             }
 
             let params = KdfParams {
@@ -558,29 +910,50 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 None => None,
             };
 
-            let (fido2_meta, fido2_secret) = if fido2 {
+            let (mut header, master_key) = if fido2 {
                 let provider = LibFido2Cli;
                 let meta = provider.enroll(cli.fido2_device.as_deref(), fido2_uv)?;
+                eprintln!(
+                    "Touch your FIDO2 security key ('{fido2_label}') once more to finish initialization..."
+                );
                 let secret = provider.get_hmac_secret(&meta, cli.fido2_device.as_deref())?;
-                (Some(meta), Some(secret))
-            } else {
-                (None, None)
-            };
 
-            let mut header = VaultHeader::new(params, kf_digest.is_some(), fido2_meta)?;
-            let master_key = derive_master_key(
-                passphrase.as_bytes(),
-                &header.kdf_salt,
-                params,
-                kf_digest.as_deref(),
-                fido2_secret.as_deref(),
-                true,
-            )?;
+                let mut hdr = VaultHeader::new_v2_fido2_shell(params, kf_digest.is_some())?;
+                let pw_hash =
+                    derive_passphrase_hash(passphrase.as_bytes(), &hdr.kdf_salt, params, true)?;
+                let mk = generate_random_master_key()?;
+                let slot = wrap_master_key_for_slot(
+                    &hdr,
+                    &mk,
+                    &pw_hash,
+                    kf_digest.as_deref(),
+                    &fido2_label,
+                    meta,
+                    &secret,
+                )?;
+                hdr.fido2_slots.push(slot);
+                (hdr, mk)
+            } else {
+                let hdr = VaultHeader::new(params, kf_digest.is_some(), None)?;
+                let mk = derive_master_key(
+                    passphrase.as_bytes(),
+                    &hdr.kdf_salt,
+                    params,
+                    kf_digest.as_deref(),
+                    None,
+                    true,
+                )?;
+                (hdr, mk)
+            };
 
             let vault = Vault::new();
             save_vault_to_disk(&vault_path, &master_key, &mut header, &vault)?;
 
-            println!("Initialized encrypted omavault at '{}'", vault_path.display());
+            println!(
+                "Initialized encrypted OMAV v{} vault at '{}'",
+                header.version,
+                vault_path.display()
+            );
             println!(
                 "Cipher: Argon2id ({} MiB, t={}, p={}) + HKDF-SHA512 + XChaCha20-Poly1305",
                 params.mem_kib / 1024,
@@ -595,6 +968,10 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     "fallback (check RLIMIT_MEMLOCK)"
                 }
             );
+            if fido2 {
+                println!("Enrolled FIDO2 key slot: '{fido2_label}'");
+                println!("Tip: Add a backup YubiKey with: omavault fido2 add --label backup");
+            }
             Ok(())
         }
 
@@ -982,6 +1359,7 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             new_keyfile,
             remove_keyfile,
             enable_fido2,
+            fido2_label,
             fido2_uv,
             remove_fido2,
             mem_mib,
@@ -989,6 +1367,10 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             lanes,
             purge_old_backups,
         } => {
+            if enable_fido2 {
+                validate_slot_label(&fido2_label)?;
+            }
+
             // Lock daemon BEFORE reading/writing so no concurrent session can revert the rekey.
             let client = DaemonClient::new(socket_path);
             let _ = client.lock();
@@ -1008,26 +1390,24 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             } else {
                 None
             };
-            let old_fido2 = if old_header.requires_fido2() {
-                let meta = old_header.fido2.as_ref().ok_or(VaultError::Fido2Required)?;
-                Some(LibFido2Cli.get_hmac_secret(meta, cli.fido2_device.as_deref())?)
-            } else {
-                None
-            };
-
-            let old_master_key = derive_master_key(
+            if old_header.requires_fido2() {
+                eprintln!("Touch an enrolled FIDO2 security key to unlock current vault...");
+            }
+            let old_res = resolve_master_key(
+                &old_header,
                 old_pass.as_bytes(),
-                &old_header.kdf_salt,
-                old_header.kdf_params,
                 old_kf.as_deref(),
-                old_fido2.as_deref(),
+                &LibFido2Cli,
+                cli.fido2_device.as_deref(),
                 true,
             )?;
             drop(old_pass);
 
-            let (_, vault) = load_vault_from_disk(&vault_path, &old_master_key, true)?;
+            let (_, vault) = load_vault_from_disk(&vault_path, &old_res.master_key, true)?;
+            let old_matched_idx = old_res.matched_slot_index;
+            let old_fido2_secret = old_res.matched_fido2_secret;
             // Immediately wipe old master key from RAM before prompting for new credentials.
-            drop(old_master_key);
+            drop(old_res.master_key);
 
             // Preserve existing hardened KDF params whenever flags are omitted!
             let new_params = KdfParams {
@@ -1049,27 +1429,108 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 old_kf
             };
 
-            let (new_fido2_meta, new_fido2_secret) = if remove_fido2 {
-                (None, None)
+            let (mut new_header, new_master_key) = if remove_fido2
+                || (!enable_fido2 && !old_header.requires_fido2())
+            {
+                let hdr = VaultHeader::new(new_params, new_kf.is_some(), None)?;
+                let mk = derive_master_key(
+                    new_pass.as_bytes(),
+                    &hdr.kdf_salt,
+                    new_params,
+                    new_kf.as_deref(),
+                    None,
+                    true,
+                )?;
+                (hdr, mk)
             } else if enable_fido2 {
                 let provider = LibFido2Cli;
                 let meta = provider.enroll(cli.fido2_device.as_deref(), fido2_uv)?;
+                eprintln!(
+                    "Touch your FIDO2 security key ('{fido2_label}') once more to finish re-keying..."
+                );
                 let sec = provider.get_hmac_secret(&meta, cli.fido2_device.as_deref())?;
-                (Some(meta), Some(sec))
-            } else {
-                (old_header.fido2.clone(), old_fido2)
-            };
 
-            let mut new_header =
-                VaultHeader::new(new_params, new_kf.is_some(), new_fido2_meta)?;
-            let new_master_key = derive_master_key(
-                new_pass.as_bytes(),
-                &new_header.kdf_salt,
-                new_params,
-                new_kf.as_deref(),
-                new_fido2_secret.as_deref(),
-                true,
-            )?;
+                let mut hdr = VaultHeader::new_v2_fido2_shell(new_params, new_kf.is_some())?;
+                let new_pw_hash =
+                    derive_passphrase_hash(new_pass.as_bytes(), &hdr.kdf_salt, new_params, true)?;
+                let mk = generate_random_master_key()?;
+                let slot = wrap_master_key_for_slot(
+                    &hdr,
+                    &mk,
+                    &new_pw_hash,
+                    new_kf.as_deref(),
+                    &fido2_label,
+                    meta,
+                    &sec,
+                )?;
+                hdr.fido2_slots.push(slot);
+                (hdr, mk)
+            } else if old_header.version == VAULT_VERSION_V1 {
+                // Keep existing legacy single FIDO2 key while upgrading to OMAV v2 slots.
+                let old_meta = old_header.fido2.clone().ok_or(VaultError::Fido2Required)?;
+                let sec = old_fido2_secret.ok_or(VaultError::Fido2Required)?;
+                let mut hdr = VaultHeader::new_v2_fido2_shell(new_params, new_kf.is_some())?;
+                let new_pw_hash =
+                    derive_passphrase_hash(new_pass.as_bytes(), &hdr.kdf_salt, new_params, true)?;
+                let mk = generate_random_master_key()?;
+                let slot = wrap_master_key_for_slot(
+                    &hdr,
+                    &mk,
+                    &new_pw_hash,
+                    new_kf.as_deref(),
+                    "primary",
+                    old_meta,
+                    &sec,
+                )?;
+                hdr.fido2_slots.push(slot);
+                (hdr, mk)
+            } else {
+                // Re-key existing OMAV v2 multi-slot vault: rotate vault_master_key and re-wrap
+                // the active YubiKey (reusing its secret) plus any other enrolled YubiKeys.
+                let mut hdr = VaultHeader::new_v2_fido2_shell(new_params, new_kf.is_some())?;
+                let new_pw_hash =
+                    derive_passphrase_hash(new_pass.as_bytes(), &hdr.kdf_salt, new_params, true)?;
+                let mk = generate_random_master_key()?;
+                let provider = LibFido2Cli;
+
+                for (idx, old_slot) in old_header.fido2_slots.iter().enumerate() {
+                    if Some(idx) == old_matched_idx {
+                        let sec = old_fido2_secret
+                            .as_ref()
+                            .ok_or(VaultError::Fido2Required)?;
+                        let wrapped = wrap_master_key_for_slot(
+                            &hdr,
+                            &mk,
+                            &new_pw_hash,
+                            new_kf.as_deref(),
+                            &old_slot.label,
+                            old_slot.fido2.clone(),
+                            sec,
+                        )?;
+                        hdr.fido2_slots.push(wrapped);
+                    } else {
+                        let keep = prompt_rewrap_or_skip(&old_slot.label)?;
+                        if keep {
+                            eprintln!("Touch YubiKey '{}' to re-wrap its key slot...", old_slot.label);
+                            let sec = provider
+                                .get_hmac_secret(&old_slot.fido2, cli.fido2_device.as_deref())?;
+                            let wrapped = wrap_master_key_for_slot(
+                                &hdr,
+                                &mk,
+                                &new_pw_hash,
+                                new_kf.as_deref(),
+                                &old_slot.label,
+                                old_slot.fido2.clone(),
+                                &sec,
+                            )?;
+                            hdr.fido2_slots.push(wrapped);
+                        } else {
+                            eprintln!("Dropped FIDO2 key slot '{}' during rekey.", old_slot.label);
+                        }
+                    }
+                }
+                (hdr, mk)
+            };
             drop(new_pass);
 
             save_vault_to_disk(&vault_path, &new_master_key, &mut new_header, &vault)?;
@@ -1079,14 +1540,16 @@ pub fn execute(cli: Cli, hardening: HardeningStatus) -> Result<()> {
             if purge_old_backups {
                 let removed = purge_encrypted_backups(&vault_path)?;
                 println!(
-                    "Vault re-keyed ({} MiB, t={}, p={}) and purged {removed} old-key backup file(s).",
+                    "Vault re-keyed (OMAV v{}, {} MiB, t={}, p={}) and purged {removed} old-key backup file(s).",
+                    new_header.version,
                     new_params.mem_kib / 1024,
                     new_params.time_cost,
                     new_params.parallelism
                 );
             } else {
                 println!(
-                    "Vault re-keyed successfully ({} MiB, t={}, p={}).",
+                    "Vault re-keyed successfully (OMAV v{}, {} MiB, t={}, p={}).",
+                    new_header.version,
                     new_params.mem_kib / 1024,
                     new_params.time_cost,
                     new_params.parallelism
@@ -1127,29 +1590,43 @@ fn open_session(
         None
     };
 
-    let fido2_secret = if header.requires_fido2() {
-        let meta = header.fido2.as_ref().ok_or(VaultError::Fido2Required)?;
-        Some(LibFido2Cli.get_hmac_secret(meta, fido2_device)?)
-    } else {
-        None
-    };
-
-    let master_key = derive_master_key(
+    if header.requires_fido2() {
+        eprintln!("Touch your FIDO2 security key when it blinks...");
+    }
+    let res = resolve_master_key(
+        &header,
         passphrase.as_bytes(),
-        &header.kdf_salt,
-        header.kdf_params,
         kf_digest.as_deref(),
-        fido2_secret.as_deref(),
+        &LibFido2Cli,
+        fido2_device,
         true,
     )?;
 
-    let (verified_header, vault) = load_vault_from_disk(vault_path, &master_key, true)?;
+    let (verified_header, vault) = load_vault_from_disk(vault_path, &res.master_key, true)?;
     Ok(VaultSession::Standalone {
         vault_path: vault_path.to_path_buf(),
-        master_key,
+        master_key: res.master_key,
         header: verified_header,
         vault,
     })
+}
+
+fn wait_for_yubikey_swap(prompt: &str) -> Result<()> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(())
+}
+
+fn prompt_rewrap_or_skip(label: &str) -> Result<bool> {
+    eprint!(
+        "Plug in YubiKey '{label}' and press Enter to re-wrap it (or type 'skip' to drop it): "
+    );
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(!line.trim().eq_ignore_ascii_case("skip"))
 }
 
 fn read_totp_input(prompt_flag: bool, file_path: Option<&Path>) -> Result<Option<TotpConfig>> {

@@ -5,9 +5,16 @@ use std::thread;
 use std::time::Duration;
 
 use omavault::clipboard::validate_clipboard_timeout;
-use omavault::crypto::fido2::{Fido2Metadata, Fido2Provider, LibFido2Cli, MockFido2Provider};
-use omavault::crypto::kdf::{derive_master_key, hash_keyfile, KdfParams};
-use omavault::crypto::{open_vault, seal_vault, VaultHeader};
+use omavault::crypto::fido2::{
+    Fido2Metadata, Fido2Provider, LibFido2Cli, MockFido2Provider, MockTrackedFido2Key,
+};
+use omavault::crypto::kdf::{
+    derive_master_key, derive_passphrase_hash, hash_keyfile, KdfParams,
+};
+use omavault::crypto::{
+    generate_random_master_key, open_vault, resolve_master_key, seal_vault,
+    wrap_master_key_for_slot, VaultHeader, VAULT_VERSION_V2,
+};
 use omavault::daemon::{run_daemon, DaemonClient, DaemonRequest, SecretString};
 use omavault::error::VaultError;
 use omavault::generator::{
@@ -446,4 +453,101 @@ fn fido2_totp_clipboard_and_daemon_request_regression_checks() {
         fido2_device: None,
     };
     drop(req);
+}
+
+#[test]
+fn omav_v2_multi_yubikey_slots_unlock_tamper_and_revocation() {
+    let key1 = MockTrackedFido2Key::new([0x11u8; 32]);
+    let key2 = MockTrackedFido2Key::new([0x22u8; 32]);
+    let key3_unenrolled = MockTrackedFido2Key::new([0x33u8; 32]);
+
+    let meta1 = key1.enroll(None, false).expect("enroll key1");
+    let sec1 = key1.get_hmac_secret(&meta1, None).expect("assert key1");
+    let meta2 = key2.enroll(None, false).expect("enroll key2");
+    let sec2 = key2.get_hmac_secret(&meta2, None).expect("assert key2");
+
+    let params = fast_params();
+    let passphrase = b"multi-yubikey-master-passphrase!";
+    let mut header = VaultHeader::new_v2_fido2_shell(params, false).expect("v2 header");
+    let pw_hash =
+        derive_passphrase_hash(passphrase, &header.kdf_salt, params, false).expect("pw_hash");
+    let master_key = generate_random_master_key().expect("random master key");
+
+    let slot1 = wrap_master_key_for_slot(
+        &header,
+        &master_key,
+        &pw_hash,
+        None,
+        "primary",
+        meta1,
+        &sec1,
+    )
+    .expect("wrap slot1");
+    let slot2 = wrap_master_key_for_slot(
+        &header,
+        &master_key,
+        &pw_hash,
+        None,
+        "backup",
+        meta2,
+        &sec2,
+    )
+    .expect("wrap slot2");
+    header.fido2_slots.push(slot1);
+    header.fido2_slots.push(slot2);
+
+    let blob = seal_vault(&master_key, &mut header, b"{\"secret\":\"two-yubikeys\"}").expect("seal");
+    let (parsed_hdr, _) = VaultHeader::parse(&blob, false).expect("parse v2");
+    assert_eq!(parsed_hdr.version, VAULT_VERSION_V2);
+    assert_eq!(parsed_hdr.fido2_labels(), vec!["primary", "backup"]);
+
+    // 1. Unlock with YubiKey #1 succeeds.
+    let res1 = resolve_master_key(&parsed_hdr, passphrase, None, &key1, None, false)
+        .expect("unlock key1");
+    assert_eq!(res1.matched_slot_index, Some(0));
+    let (_, pt1) = open_vault(&res1.master_key, &blob, false).expect("open via key1");
+    assert_eq!(pt1.as_slice(), b"{\"secret\":\"two-yubikeys\"}");
+
+    // 2. Unlock with YubiKey #2 (backup) automatically skips slot 0 and succeeds!
+    let res2 = resolve_master_key(&parsed_hdr, passphrase, None, &key2, None, false)
+        .expect("unlock key2");
+    assert_eq!(res2.matched_slot_index, Some(1));
+    let (_, pt2) = open_vault(&res2.master_key, &blob, false).expect("open via key2");
+    assert_eq!(pt2.as_slice(), b"{\"secret\":\"two-yubikeys\"}");
+
+    // 3. Unenrolled YubiKey #3 is rejected with Fido2NoMatchingCredential.
+    let err3 = resolve_master_key(&parsed_hdr, passphrase, None, &key3_unenrolled, None, false);
+    assert!(matches!(err3, Err(VaultError::Fido2NoMatchingCredential)));
+
+    // 4. Wrong passphrase with valid YubiKey #1 fails slot unwrap AEAD.
+    let err_pw = resolve_master_key(&parsed_hdr, b"wrong-passphrase", None, &key1, None, false);
+    assert!(matches!(err_pw, Err(VaultError::AuthenticationFailed)));
+
+    // 5. Tampering any byte in the header/slot bundle breaks outer AEAD & slot validation.
+    let mut tampered_hdr = parsed_hdr.clone();
+    tampered_hdr.fido2_slots[0].label = "renamed-tamper".into();
+    let err_aad = resolve_master_key(&tampered_hdr, passphrase, None, &key1, None, false);
+    assert!(matches!(err_aad, Err(VaultError::AuthenticationFailed)));
+
+    // 6. Duplicate slot labels are rejected by header serialization.
+    let mut dup_hdr = parsed_hdr.clone();
+    dup_hdr.fido2_slots[1].label = "PRIMARY".into();
+    assert!(dup_hdr.to_bytes().is_err());
+
+    // 7. Revoking YubiKey #2 removes its slot; Key #1 still unlocks and Key #2 is rejected.
+    let mut revoked_hdr = parsed_hdr;
+    revoked_hdr.fido2_slots.retain(|s| s.label != "backup");
+    let revoked_blob =
+        seal_vault(&res1.master_key, &mut revoked_hdr, b"{\"secret\":\"after-revoke\"}")
+            .expect("seal revoked");
+    let (parsed_revoked, _) = VaultHeader::parse(&revoked_blob, false).expect("parse revoked");
+    assert_eq!(parsed_revoked.fido2_labels(), vec!["primary"]);
+
+    let res_after = resolve_master_key(&parsed_revoked, passphrase, None, &key1, None, false)
+        .expect("key1 still works");
+    let (_, pt_after) = open_vault(&res_after.master_key, &revoked_blob, false).expect("open");
+    assert_eq!(pt_after.as_slice(), b"{\"secret\":\"after-revoke\"}");
+
+    let err_revoked = resolve_master_key(&parsed_revoked, passphrase, None, &key2, None, false);
+    assert!(matches!(err_revoked, Err(VaultError::Fido2NoMatchingCredential)));
 }

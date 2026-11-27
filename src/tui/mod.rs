@@ -3,7 +3,8 @@ pub mod theme;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -24,9 +25,9 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::clipboard::{
     clear_clipboard_best_effort, copy_secret, ClipboardOptions, DEFAULT_CLIPBOARD_TIMEOUT_SECS,
 };
-use crate::crypto::fido2::{Fido2Provider, LibFido2Cli};
-use crate::crypto::kdf::{derive_master_key, hash_keyfile};
-use crate::crypto::VaultHeader;
+use crate::crypto::fido2::LibFido2Cli;
+use crate::crypto::kdf::hash_keyfile;
+use crate::crypto::{resolve_master_key, VaultHeader, VAULT_VERSION_V2};
 use crate::daemon::{DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS};
 use crate::error::{Result, VaultError};
 use crate::generator::{
@@ -72,10 +73,29 @@ enum SessionBackend {
     },
 }
 
+enum UnlockOutcome {
+    Daemon {
+        vault: Vault,
+        revision: String,
+        mlocked: bool,
+    },
+    Standalone {
+        master_key: LockedKey<32>,
+        header: Box<VaultHeader>,
+        vault: Vault,
+    },
+    Error(String),
+}
+
 enum Mode {
     Locked {
         passphrase_input: Zeroizing<String>,
         error_msg: Option<String>,
+    },
+    Unlocking {
+        started_at: Instant,
+        requires_fido2: bool,
+        rx: mpsc::Receiver<UnlockOutcome>,
     },
     Normal,
     Search,
@@ -311,104 +331,113 @@ impl App {
         };
     }
 
-    fn attempt_unlock(&mut self, passphrase: Zeroizing<String>) {
-        let client = DaemonClient::new(self.cfg.socket_path.clone());
-        if let Ok(st_before) = client.status() {
-            let _ = st_before;
-            match client.unlock(
-                &self.cfg.vault_path,
-                passphrase,
-                self.cfg.keyfile_path.clone(),
-                self.cfg.fido2_device.clone(),
-            ) {
-                Ok(()) => {
-                    let mlocked = client.status().map(|s| s.mlocked).unwrap_or(false);
-                    match client.load_vault(&self.cfg.vault_path) {
-                        Ok((vault, rev)) => {
-                            self.backend = Some(SessionBackend::Daemon {
-                                revision: Some(rev),
+    fn start_unlock(&mut self, passphrase: Zeroizing<String>) {
+        let socket_path = self.cfg.socket_path.clone();
+        let vault_path = self.cfg.vault_path.clone();
+        let keyfile_path = self.cfg.keyfile_path.clone();
+        let fido2_device = self.cfg.fido2_device.clone();
+        let requires_fido2 = self.header_preview.requires_fido2();
+
+        let (tx, rx) = mpsc::channel();
+        self.mode = Mode::Unlocking {
+            started_at: Instant::now(),
+            requires_fido2,
+            rx,
+        };
+
+        thread::spawn(move || {
+            let client = DaemonClient::new(socket_path);
+            if client.status().is_ok() {
+                let outcome = match client.unlock(&vault_path, passphrase, keyfile_path, fido2_device)
+                {
+                    Ok(()) => {
+                        let mlocked = client.status().map(|s| s.mlocked).unwrap_or(false);
+                        match client.load_vault(&vault_path) {
+                            Ok((vault, revision)) => UnlockOutcome::Daemon {
+                                vault,
+                                revision,
                                 mlocked,
-                            });
-                            self.vault = Some(vault);
-                            self.mode = Mode::Normal;
-                            self.last_activity_boot_secs = current_boot_secs();
-                            if self.vault.as_ref().is_some_and(|v| !v.entries.is_empty()) {
-                                self.list_state.select(Some(0));
-                            }
-                            self.set_toast(
-                                ToastLevel::Ok,
-                                if mlocked {
-                                    "Unlocked via omavault daemon (mlock ACTIVE)"
-                                } else {
-                                    "Unlocked via omavault daemon (mlock unavailable)"
-                                },
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            self.mode = Mode::Locked {
-                                passphrase_input: Zeroizing::new(String::with_capacity(256)),
-                                error_msg: Some(e.to_string()),
-                            };
-                            return;
+                            },
+                            Err(e) => UnlockOutcome::Error(e.to_string()),
                         }
                     }
-                }
-                Err(e) => {
-                    self.mode = Mode::Locked {
-                        passphrase_input: Zeroizing::new(String::with_capacity(256)),
-                        error_msg: Some(e.to_string()),
-                    };
-                    return;
-                }
+                    Err(e) => UnlockOutcome::Error(e.to_string()),
+                };
+                let _ = tx.send(outcome);
+                return;
             }
-        }
 
-        // Standalone unlock (no daemon running): derive MasterKey directly into LockedKey<32>.
-        let result = (|| -> Result<(LockedKey<32>, VaultHeader, Vault)> {
-            let header = read_header_from_disk(&self.cfg.vault_path, true)?;
-            let kf_digest = if header.requires_keyfile() {
-                let path = self
-                    .cfg
-                    .keyfile_path
-                    .as_ref()
-                    .ok_or(VaultError::KeyfileRequired)?;
-                Some(hash_keyfile(path)?)
-            } else {
-                None
+            // Standalone unlock (no daemon running): resolve MasterKey directly into LockedKey<32>.
+            let result = (|| -> Result<(LockedKey<32>, VaultHeader, Vault)> {
+                let header = read_header_from_disk(&vault_path, true)?;
+                let kf_digest = if header.requires_keyfile() {
+                    let path = keyfile_path.as_deref().ok_or(VaultError::KeyfileRequired)?;
+                    Some(hash_keyfile(path)?)
+                } else {
+                    None
+                };
+                let res = resolve_master_key(
+                    &header,
+                    passphrase.as_bytes(),
+                    kf_digest.as_deref(),
+                    &LibFido2Cli,
+                    fido2_device.as_deref(),
+                    true,
+                )?;
+                let (verified_header, vault) =
+                    load_vault_from_disk(&vault_path, &res.master_key, true)?;
+                Ok((res.master_key, verified_header, vault))
+            })();
+
+            let outcome = match result {
+                Ok((master_key, header, vault)) => UnlockOutcome::Standalone {
+                    master_key,
+                    header: Box::new(header),
+                    vault,
+                },
+                Err(e) => UnlockOutcome::Error(e.to_string()),
             };
-            let fido2_secret = if header.requires_fido2() {
-                let meta = header.fido2.as_ref().ok_or(VaultError::Fido2Required)?;
-                let provider = LibFido2Cli;
-                Some(provider.get_hmac_secret(meta, self.cfg.fido2_device.as_deref())?)
-            } else {
-                None
-            };
+            let _ = tx.send(outcome);
+        });
+    }
 
-            let master_key = derive_master_key(
-                passphrase.as_bytes(),
-                &header.kdf_salt,
-                header.kdf_params,
-                kf_digest.as_deref(),
-                fido2_secret.as_deref(),
-                true,
-            )?;
-            let (verified_header, vault) =
-                load_vault_from_disk(&self.cfg.vault_path, &master_key, true)?;
-            Ok((master_key, verified_header, vault))
-        })();
-
-        match result {
-            Ok((master_key, header, vault)) => {
+    fn finish_unlock(&mut self, outcome: UnlockOutcome) {
+        match outcome {
+            UnlockOutcome::Daemon {
+                vault,
+                revision,
+                mlocked,
+            } => {
+                self.backend = Some(SessionBackend::Daemon {
+                    revision: Some(revision),
+                    mlocked,
+                });
+                self.vault = Some(vault);
+                self.mode = Mode::Normal;
+                self.last_activity_boot_secs = current_boot_secs();
+                if self.vault.as_ref().is_some_and(|v| !v.entries.is_empty()) {
+                    self.list_state.select(Some(0));
+                }
+                self.set_toast(
+                    ToastLevel::Ok,
+                    if mlocked {
+                        "Unlocked via omavault daemon (mlock ACTIVE)"
+                    } else {
+                        "Unlocked via omavault daemon (mlock unavailable)"
+                    },
+                );
+            }
+            UnlockOutcome::Standalone {
+                master_key,
+                header,
+                vault,
+            } => {
                 let mlock_msg = if master_key.is_mlocked() {
                     "Unlocked (standalone · mlock ACTIVE)"
                 } else {
                     "Unlocked (standalone · mlock unavailable)"
                 };
-                self.backend = Some(SessionBackend::Standalone {
-                    master_key,
-                    header: Box::new(header),
-                });
+                self.backend = Some(SessionBackend::Standalone { master_key, header });
                 self.vault = Some(vault);
                 self.mode = Mode::Normal;
                 self.last_activity_boot_secs = current_boot_secs();
@@ -417,10 +446,10 @@ impl App {
                 }
                 self.set_toast(ToastLevel::Ok, mlock_msg);
             }
-            Err(e) => {
+            UnlockOutcome::Error(err) => {
                 self.mode = Mode::Locked {
                     passphrase_input: Zeroizing::new(String::with_capacity(256)),
-                    error_msg: Some(e.to_string()),
+                    error_msg: Some(err),
                 };
             }
         }
@@ -528,6 +557,25 @@ impl App {
             }
         }
 
+        if let Mode::Unlocking { rx, .. } = &self.mode {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    self.finish_unlock(outcome);
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.last_sleep_skew_ms = boottime_monotonic_skew_ms();
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.finish_unlock(UnlockOutcome::Error(
+                        "unlock worker exited unexpectedly".into(),
+                    ));
+                    return;
+                }
+            }
+        }
+
         if matches!(self.mode, Mode::Locked { .. }) {
             self.last_sleep_skew_ms = boottime_monotonic_skew_ms();
             return;
@@ -549,9 +597,9 @@ impl App {
         }
         self.last_sleep_skew_ms = current_skew;
 
-        // 2. Check active Hyprlock / screen locker (even in standalone mode!).
+        // 2. Check active Omarchy / Hyprland / Wayland screen lock (even in standalone mode!).
         if is_screen_locker_active(self.my_uid) {
-            self.lock_vault("screen lock (hyprlock) detected", true);
+            self.lock_vault("screen lock detected", true);
             return;
         }
 
@@ -602,7 +650,7 @@ impl App {
                         Zeroizing::new(String::with_capacity(256)),
                     );
                     *error_msg = None;
-                    self.attempt_unlock(entered);
+                    self.start_unlock(entered);
                 }
                 KeyCode::Backspace => {
                     passphrase_input.pop();
@@ -612,6 +660,11 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Unlocking { .. } => {
+                if key.code == KeyCode::Esc {
+                    self.should_quit = true;
+                }
+            }
             Mode::Search => match key.code {
                 KeyCode::Esc => {
                     self.search_query.zeroize();
@@ -958,7 +1011,12 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
         loop {
             terminal.draw(|f| draw_ui(f, &mut app)).map_err(VaultError::Io)?;
 
-            if event::poll(Duration::from_millis(250)).map_err(VaultError::Io)? {
+            let poll_ms = if matches!(app.mode, Mode::Unlocking { .. }) {
+                100
+            } else {
+                250
+            };
+            if event::poll(Duration::from_millis(poll_ms)).map_err(VaultError::Io)? {
                 if let Event::Key(key) = event::read().map_err(VaultError::Io)? {
                     if key.kind == KeyEventKind::Press {
                         app.handle_key(key);
@@ -999,21 +1057,41 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     let bg_block = Block::default().style(Style::default().bg(theme::BG_PRIMARY).fg(theme::FG_PRIMARY));
     f.render_widget(bg_block, area);
 
-    if let Mode::Locked {
-        passphrase_input,
-        error_msg,
-    } = &app.mode
-    {
-        draw_locked_screen(
-            f,
-            area,
-            &app.cfg.vault_path,
-            &app.header_preview,
-            passphrase_input.chars().count(),
-            error_msg.as_deref(),
-            &app.cfg.hardening,
-        );
-        return;
+    match &app.mode {
+        Mode::Locked {
+            passphrase_input,
+            error_msg,
+        } => {
+            draw_locked_screen(
+                f,
+                area,
+                &app.cfg.vault_path,
+                &app.header_preview,
+                passphrase_input.chars().count(),
+                error_msg.as_deref(),
+                None,
+                &app.cfg.hardening,
+            );
+            return;
+        }
+        Mode::Unlocking {
+            started_at,
+            requires_fido2,
+            ..
+        } => {
+            draw_locked_screen(
+                f,
+                area,
+                &app.cfg.vault_path,
+                &app.header_preview,
+                0,
+                None,
+                Some((*started_at, *requires_fido2)),
+                &app.cfg.hardening,
+            );
+            return;
+        }
+        _ => {}
     }
 
     let chunks = Layout::default()
@@ -1046,6 +1124,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_locked_screen(
     f: &mut Frame,
     area: Rect,
@@ -1053,17 +1132,25 @@ fn draw_locked_screen(
     header: &VaultHeader,
     input_len: usize,
     error_msg: Option<&str>,
+    unlocking: Option<(Instant, bool)>,
     hardening: &HardeningStatus,
 ) {
     let box_area = centered_rect(64, 52, area);
     f.render_widget(Clear, box_area);
 
-    let mut factors = vec!["Passphrase"];
+    let mut factors: Vec<String> = vec!["Passphrase".to_string()];
     if header.requires_keyfile() {
-        factors.push("Keyfile");
+        factors.push("Keyfile".to_string());
     }
-    if header.requires_fido2() {
-        factors.push("FIDO2 Hardware Touch");
+    if header.version == VAULT_VERSION_V2 && !header.fido2_slots.is_empty() {
+        let count = header.fido2_slots.len();
+        let noun = if count == 1 { "key" } else { "keys" };
+        factors.push(format!(
+            "FIDO2 ({count} {noun}: {})",
+            header.fido2_labels().join(", ")
+        ));
+    } else if header.requires_fido2() {
+        factors.push("FIDO2 Hardware Touch".to_string());
     }
 
     let masked = if input_len == 0 {
@@ -1085,7 +1172,8 @@ fn draw_locked_screen(
             Span::styled("  Crypto:  ", theme::muted_style()),
             Span::styled(
                 format!(
-                    "Argon2id ({} MiB, t={}, p={}) + HKDF-SHA512 + XChaCha20-Poly1305",
+                    "OMAV v{} · Argon2id ({} MiB, t={}, p={}) + HKDF-SHA512 + XChaCha20-Poly1305",
+                    header.version,
                     header.kdf_params.mem_kib / 1024,
                     header.kdf_params.time_cost,
                     header.kdf_params.parallelism
@@ -1095,34 +1183,64 @@ fn draw_locked_screen(
         ]),
         Line::from(vec![
             Span::styled("  Factors: ", theme::muted_style()),
-            Span::styled(factors.join(" + "), Style::default().fg(theme::ACCENT_MAGENTA)),
+            Span::styled(
+                factors.join(" + "),
+                Style::default().fg(theme::ACCENT_MAGENTA),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  OS Lock: ", theme::muted_style()),
             Span::styled(hardening.summary(), theme::muted_style()),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Master Passphrase:",
-            Style::default().fg(theme::ACCENT_CYAN).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!("  > {masked}_"),
-            Style::default().fg(theme::FG_PRIMARY).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
     ];
 
-    if let Some(err) = error_msg {
+    if let Some((started_at, requires_fido2)) = unlocking {
+        const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = ((started_at.elapsed().as_millis() / 100) as usize) % SPINNER.len();
+        let spin = SPINNER[frame];
+        let msg = if requires_fido2 {
+            format!("  {spin} Waiting for YubiKey touch… (plug in & tap when it blinks)")
+        } else {
+            format!("  {spin} Unlocking vault (Argon2id)…")
+        };
         lines.push(Line::from(Span::styled(
-            format!("  ! {}", sanitize_display(err)),
-            theme::danger_style(),
+            msg,
+            Style::default()
+                .fg(theme::ACCENT_CYAN)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  [Esc] Cancel & Quit",
+            theme::muted_style(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "  [Enter] Unlock   [Esc] Quit",
-            theme::muted_style(),
+            "  Master Passphrase:",
+            Style::default()
+                .fg(theme::ACCENT_CYAN)
+                .add_modifier(Modifier::BOLD),
         )));
+        lines.push(Line::from(Span::styled(
+            format!("  > {masked}_"),
+            Style::default()
+                .fg(theme::FG_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+
+        if let Some(err) = error_msg {
+            lines.push(Line::from(Span::styled(
+                format!("  ! {}", sanitize_display(err)),
+                theme::danger_style(),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  [Enter] Unlock   [Esc] Quit",
+                theme::muted_style(),
+            )));
+        }
     }
 
     let widget = Paragraph::new(lines)
