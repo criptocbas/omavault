@@ -31,6 +31,174 @@ impl io::Write for CountingWriter {
     }
 }
 
+/// How exposed decrypted secrets are to being paged out to disk.
+///
+/// Only the 32-byte master key lives in `mlock`ed memory. Decrypted entries in the TUI/CLI are
+/// ordinary heap: `mlockall` is not viable because the default `RLIMIT_MEMLOCK` (8 MiB) is far
+/// below Argon2id's 128 MiB+ working set. Whether swap can leak them depends on the swap setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapExposure {
+    /// No active swap.
+    None,
+    /// Only zram (compressed RAM): nothing is written to disk.
+    ZramOnly,
+    /// All disk-backed swap sits on dm-crypt (LUKS), possibly alongside zram.
+    Encrypted,
+    /// At least one swap area is on a plain, unencrypted block device.
+    Unencrypted(Vec<String>),
+    /// Swap whose backing could not be classified (e.g. a swap file on btrfs/zfs).
+    Unknown(Vec<String>),
+}
+
+impl SwapExposure {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::None => "none".into(),
+            Self::ZramOnly => "zram only (RAM-backed; nothing is paged to disk)".into(),
+            Self::Encrypted => "encrypted (dm-crypt/LUKS)".into(),
+            Self::Unencrypted(devs) => format!(
+                "WARNING: UNENCRYPTED swap on {} — decrypted entries could be paged to disk (use zram or LUKS-encrypted swap)",
+                devs.join(", ")
+            ),
+            Self::Unknown(devs) => format!(
+                "unverified ({}) — make sure it is on an encrypted filesystem/device",
+                devs.join(", ")
+            ),
+        }
+    }
+
+    pub fn is_unencrypted(&self) -> bool {
+        matches!(self, Self::Unencrypted(_))
+    }
+}
+
+/// Classify active swap from `/proc/swaps` and sysfs (no subprocesses).
+#[cfg(target_os = "linux")]
+pub fn swap_exposure() -> SwapExposure {
+    let Ok(swaps) = fs::read_to_string("/proc/swaps") else {
+        return SwapExposure::Unknown(vec!["/proc/swaps unreadable".into()]);
+    };
+    classify_swaps(&swaps, &|name| block_device_is_crypt(name), &|path| {
+        file_backing_block_name(path)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn swap_exposure() -> SwapExposure {
+    SwapExposure::Unknown(vec!["unsupported platform".into()])
+}
+
+/// Pure classifier (unit-testable). `is_crypt(block_name)` reports whether a block device such as
+/// `dm-3` is (or sits on) dm-crypt; `file_block(path)` maps a swap FILE to its backing block name.
+fn classify_swaps(
+    proc_swaps: &str,
+    is_crypt: &dyn Fn(&str) -> Option<bool>,
+    file_block: &dyn Fn(&str) -> Option<String>,
+) -> SwapExposure {
+    let mut any = false;
+    let mut disk_backed = false;
+    let mut unencrypted = Vec::new();
+    let mut unknown = Vec::new();
+    for line in proc_swaps.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let (Some(name), Some(kind)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        // /proc/swaps escapes spaces in paths as \040.
+        let name = name.replace("\\040", " ");
+        any = true;
+        if name.starts_with("/dev/zram") {
+            continue;
+        }
+        disk_backed = true;
+        let block = if kind == "file" {
+            file_block(&name)
+        } else {
+            std::path::Path::new(&name)
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+        };
+        match block.as_deref().map(|b| (b, is_crypt(b))) {
+            Some((_, Some(true))) => {}
+            Some((_, Some(false))) => unencrypted.push(name),
+            _ => unknown.push(name),
+        }
+    }
+    if !any {
+        SwapExposure::None
+    } else if !unencrypted.is_empty() {
+        SwapExposure::Unencrypted(unencrypted)
+    } else if !unknown.is_empty() {
+        SwapExposure::Unknown(unknown)
+    } else if disk_backed {
+        SwapExposure::Encrypted
+    } else {
+        SwapExposure::ZramOnly
+    }
+}
+
+/// Is block device `name` (e.g. `dm-2`, `nvme0n1p3`) dm-crypt, or stacked on dm-crypt
+/// (e.g. LVM on LUKS)? `Some(false)` = definitely plain; `None` = cannot tell.
+#[cfg(target_os = "linux")]
+fn block_device_is_crypt(name: &str) -> Option<bool> {
+    fn walk(name: &str, depth: u8) -> Option<bool> {
+        if depth > 6 || name.contains('/') || name.contains("..") {
+            return None;
+        }
+        let sys = std::path::Path::new("/sys/class/block").join(name);
+        if !sys.exists() {
+            return None;
+        }
+        if let Ok(uuid) = fs::read_to_string(sys.join("dm/uuid")) {
+            if uuid.trim_start().starts_with("CRYPT-") {
+                return Some(true);
+            }
+        }
+        // Device-mapper / md devices: encrypted iff some underlying device is.
+        if let Ok(slaves) = fs::read_dir(sys.join("slaves")) {
+            let mut saw_slave = false;
+            for s in slaves.flatten() {
+                saw_slave = true;
+                if walk(&s.file_name().to_string_lossy(), depth + 1) == Some(true) {
+                    return Some(true);
+                }
+            }
+            if saw_slave {
+                return Some(false);
+            }
+        }
+        Some(false)
+    }
+    walk(name, 0)
+}
+
+/// Map a swap file to the block device holding it (via `st_dev` → `/sys/dev/block/MAJ:MIN`).
+#[cfg(target_os = "linux")]
+fn file_backing_block_name(path: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = fs::metadata(path).ok()?.dev();
+    let (major, minor) = (libc::major(dev), libc::minor(dev));
+    if major == 0 {
+        return None; // anonymous device (btrfs subvolume, overlay, ...): cannot tell
+    }
+    let link = fs::read_link(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    Some(link.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Overwrite a 16 KiB region of the stack just below the caller's frame.
+///
+/// Call it right after a non-inlined function that handled key material on its stack (e.g.
+/// `hkdf`/`hmac` 0.12, which do not zeroize their internal state): this frame reuses the same
+/// addresses and wipes whatever the callee left behind. Best-effort defence in depth.
+#[inline(never)]
+pub fn scrub_stack() {
+    let mut buf = [0u8; 16 * 1024];
+    // SAFETY: `buf` is a live, writable local of exactly this size.
+    unsafe { crate::alloc::wipe(buf.as_mut_ptr(), buf.len()) };
+    std::hint::black_box(&buf);
+}
+
 /// True for characters that can alter terminal state or visually spoof text: C0/C1 controls
 /// (ANSI/OSC/CSI escapes), DEL, Unicode BiDi overrides/isolates, zero-width and tag characters.
 pub fn is_dangerous_display_char(c: char) -> bool {
@@ -840,6 +1008,49 @@ pub(crate) fn status_matches_active_locker(status: &str, target_uid: u32) -> boo
     is_alive
         && real_uid == Some(target_uid)
         && proc_name.is_some_and(|n| SCREEN_LOCKERS.contains(&n))
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+
+    const HDR: &str = "Filename\tType\tSize\tUsed\tPriority\n";
+
+    fn crypt(name: &str) -> Option<bool> {
+        match name {
+            "dm-0" => Some(true),
+            "sda2" => Some(false),
+            _ => None,
+        }
+    }
+    fn file_block(path: &str) -> Option<String> {
+        match path {
+            "/swapfile" => Some("dm-0".into()),
+            "/plain/swapfile" => Some("sda2".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn classifies_swap_setups() {
+        let c = |body: &str| classify_swaps(&format!("{HDR}{body}"), &crypt, &file_block);
+        assert_eq!(c(""), SwapExposure::None);
+        assert_eq!(
+            c("/dev/zram0 partition 100 0 100\n"),
+            SwapExposure::ZramOnly
+        );
+        assert_eq!(
+            c("/dev/zram0 partition 1 0 100\n/swapfile file 1 0 -2\n"),
+            SwapExposure::Encrypted
+        );
+        assert!(c("/plain/swapfile file 1 0 -2\n").is_unencrypted());
+        assert!(matches!(
+            c("/btrfs/swapfile file 1 0 -2\n"),
+            SwapExposure::Unknown(_)
+        ));
+        // Unencrypted wins over everything else.
+        assert!(c("/swapfile file 1 0 -2\n/plain/swapfile file 1 0 -3\n").is_unencrypted());
+    }
 }
 
 #[cfg(test)]

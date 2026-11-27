@@ -1,6 +1,7 @@
 /// Build version shown by `--version`, `status`, and the TUI: `<crate version> (<git commit>)`.
 pub const VERSION: &str = env!("OMAVAULT_VERSION");
 
+pub mod alloc;
 pub mod cli;
 pub mod clipboard;
 pub mod crypto;

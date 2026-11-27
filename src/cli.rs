@@ -32,7 +32,7 @@ use crate::generator::{
 };
 use crate::hardening::{
     fill_random, is_dangerous_display_char, sanitize_multiline, sanitize_single_line,
-    HardeningStatus, LockedKey,
+    swap_exposure, HardeningStatus, LockedKey,
 };
 use crate::procsig::signal_registered_tuis;
 use crate::totp::TotpConfig;
@@ -1077,6 +1077,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
         Commands::Status => {
             println!("omavault version:  {}", crate::VERSION);
             println!("Process hardening: {}", hardening.summary());
+            println!("Swap exposure:     {}", tty_safe(&swap_exposure().describe()));
             println!("Vault path:        {}", vault_path.display());
             if vault_path.exists() {
                 let header = read_header_from_disk(&vault_path, true)?;
@@ -2048,7 +2049,7 @@ fn read_totp_input(prompt_flag: bool, file_path: Option<&Path>) -> Result<Option
                 "TOTP secret file exceeds 4096 bytes".into(),
             ));
         }
-        let mut raw = Zeroizing::new(String::with_capacity(256));
+        let mut raw = Zeroizing::new(String::with_capacity(4097));
         file.take(4096).read_to_string(&mut raw)?;
         return Ok(Some(TotpConfig::parse(raw.trim())?));
     }
@@ -2092,7 +2093,7 @@ fn prompt_confirmed_entry_password(name: &str) -> Result<Zeroizing<String>> {
 fn prompt_passphrase(prompt: &str, from_stdin: bool) -> Result<Zeroizing<String>> {
     if from_stdin {
         const MAX_STDIN_PASS_BYTES: usize = 4096;
-        let mut buf = Zeroizing::new(Vec::with_capacity(256));
+        let mut buf = Zeroizing::new(Vec::with_capacity(MAX_STDIN_PASS_BYTES + 1));
         let mut byte = Zeroizing::new([0u8; 1]);
         let mut saw_any = false;
         loop {

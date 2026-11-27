@@ -651,7 +651,8 @@ fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<
     // can never deadlock the pipe while we poll `try_wait()`.
     let stdout_handle = child.stdout.take().map(|out| {
         thread::spawn(move || {
-            let mut buf = Zeroizing::new(Vec::new());
+            // Pre-size so the hmac-secret output never goes through growth reallocations.
+            let mut buf = Zeroizing::new(Vec::with_capacity(MAX_FIDO2_STDOUT_BYTES as usize + 1));
             let _ = out.take(MAX_FIDO2_STDOUT_BYTES).read_to_end(&mut buf);
             buf
         })

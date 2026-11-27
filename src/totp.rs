@@ -350,14 +350,17 @@ pub fn hotp_raw(
 
 fn normalize_base32(input: &str) -> Result<Zeroizing<String>> {
     // Strip whitespace and hyphens, uppercase, then strip ONLY trailing RFC 4648 '=' padding.
-    let stripped: Zeroizing<String> = Zeroizing::new(
-        input
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '-')
-            .map(|c| c.to_ascii_uppercase())
-            .collect(),
-    );
-    let cleaned = Zeroizing::new(stripped.trim_end_matches('=').to_string());
+    // Built in ONE pre-sized buffer (`.filter().collect()` loses the size hint and reallocates,
+    // leaving partial copies of the seed in freed heap).
+    let mut cleaned: Zeroizing<String> = Zeroizing::new(String::with_capacity(input.len()));
+    for c in input.chars() {
+        if !c.is_whitespace() && c != '-' {
+            cleaned.push(c.to_ascii_uppercase());
+        }
+    }
+    while cleaned.ends_with('=') {
+        cleaned.pop();
+    }
     if cleaned.is_empty() || cleaned.contains('=') {
         return Err(VaultError::InvalidTotp("invalid Base32 TOTP secret".into()));
     }

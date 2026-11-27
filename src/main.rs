@@ -1,6 +1,11 @@
 use clap::Parser;
 
+use omavault::alloc::ZeroizingAlloc;
 use omavault::cli::{execute, Cli};
+
+/// Wipe every heap block before it is freed (see `omavault::alloc`).
+#[global_allocator]
+static GLOBAL: ZeroizingAlloc = ZeroizingAlloc::system();
 use omavault::hardening::{harden_process, sanitize_single_line};
 
 fn main() {

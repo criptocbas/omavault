@@ -246,9 +246,8 @@ pub fn derive_master_key_from_pw_hash(
         ikm.extend_from_slice(f2);
     }
 
-    let hk = Hkdf::<Sha512>::new(Some(kdf_salt), &ikm);
     let mut master_raw = [0u8; 32];
-    hk.expand(HKDF_MASTER_INFO, &mut master_raw)
+    hkdf_sha512(kdf_salt, &ikm, HKDF_MASTER_INFO, &mut master_raw)
         .map_err(|_| VaultError::Crypto("HKDF-SHA512 master key expand failed".into()))?;
 
     LockedKey::new(&mut master_raw)
@@ -275,9 +274,8 @@ pub fn derive_slot_kek(
     ikm.extend_from_slice(b"F2");
     ikm.extend_from_slice(fido2_secret);
 
-    let hk = Hkdf::<Sha512>::new(Some(kdf_salt), &ikm);
     let mut kek = Zeroizing::new([0u8; 32]);
-    hk.expand(HKDF_SLOT_KEK_INFO, &mut *kek)
+    hkdf_sha512(kdf_salt, &ikm, HKDF_SLOT_KEK_INFO, &mut *kek)
         .map_err(|_| VaultError::Crypto("HKDF-SHA512 slot KEK expand failed".into()))?;
     Ok(kek)
 }
@@ -309,10 +307,31 @@ pub fn derive_payload_key(
     save_salt: &[u8; 32],
 ) -> Result<Zeroizing<[u8; 32]>> {
     master_key.expose(|mk| {
-        let hk = Hkdf::<Sha512>::new(Some(save_salt), mk);
         let mut enc_key = Zeroizing::new([0u8; 32]);
-        hk.expand(HKDF_PAYLOAD_INFO, &mut *enc_key)
+        hkdf_sha512(save_salt, mk, HKDF_PAYLOAD_INFO, &mut *enc_key)
             .map_err(|_| VaultError::Crypto("HKDF-SHA512 payload key expand failed".into()))?;
         Ok(enc_key)
     })?
+}
+
+/// HKDF-SHA512 (extract + expand) with stack hygiene.
+///
+/// `hkdf`/`hmac` 0.12 do not zeroize their internal state (the PRK and HMAC pads — equivalent to
+/// key material). The computation runs in a dedicated non-inlined frame, and the stack region it
+/// used is scrubbed immediately after it returns.
+fn hkdf_sha512(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) -> std::result::Result<(), ()> {
+    let result = hkdf_sha512_frame(salt, ikm, info, out);
+    crate::hardening::scrub_stack();
+    result
+}
+
+#[inline(never)]
+fn hkdf_sha512_frame(
+    salt: &[u8],
+    ikm: &[u8],
+    info: &[u8],
+    out: &mut [u8],
+) -> std::result::Result<(), ()> {
+    let hk = Hkdf::<Sha512>::new(Some(salt), ikm);
+    hk.expand(info, out).map_err(|_| ())
 }

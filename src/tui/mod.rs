@@ -39,7 +39,7 @@ use crate::generator::{
 };
 use crate::hardening::{
     boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, sanitize_multiline,
-    sanitize_single_line, HardeningStatus, LockedKey,
+    sanitize_single_line, swap_exposure, HardeningStatus, LockedKey,
 };
 use crate::totp::TotpConfig;
 use crate::vault::audit::{run_audit, AuditReport};
@@ -348,6 +348,14 @@ impl App {
         self.status_toast = Some((level, msg.into(), Instant::now()));
     }
 
+    /// Decrypted entries live in ordinary (swappable) heap; warn if swap could write them to disk.
+    fn warn_if_unencrypted_swap(&mut self) {
+        let swap = swap_exposure();
+        if swap.is_unencrypted() {
+            self.set_toast(ToastLevel::Warn, format!("Swap: {}", swap.describe()));
+        }
+    }
+
     /// Abort an in-flight unlock. Order matters: leaving `Mode::Unlocking` sets the worker's
     /// cancel flag FIRST, then we tell the daemon to lock (see `start_unlock`).
     fn cancel_unlock(&mut self, reason: &str) {
@@ -512,6 +520,7 @@ impl App {
                         "Unlocked via omavault daemon (mlock unavailable)"
                     },
                 );
+                self.warn_if_unencrypted_swap();
             }
             UnlockOutcome::Standalone {
                 master_key,
@@ -531,6 +540,7 @@ impl App {
                     self.list_state.select(Some(0));
                 }
                 self.set_toast(ToastLevel::Ok, mlock_msg);
+                self.warn_if_unencrypted_swap();
             }
             UnlockOutcome::Error(err) => {
                 self.mode = Mode::Locked {

@@ -36,6 +36,26 @@
 - Client connect helper retries `EAGAIN` (full backlog) and `EINTR` within its deadline.
 - Hyprland `.conf` and hypridle snippets prefer root-owned `/usr/bin/omavault` over `~/.local/bin`.
 
+### Phase 4: memory hygiene
+- **Zeroizing global allocator** (`src/alloc.rs`, registered in the binary): every heap block is
+  wiped with `explicit_bzero(3)` before it is freed, and on every reallocation. Closes the
+  red-team findings where secrets survived in freed heap: `serde_json`'s escape scratch buffer
+  (multi-line notes; master passphrases with `"`/`\` on daemon unlock), per-frame TUI sanitizing
+  copies, `get --reveal` / stdout buffers, and growth reallocations (Gemini M-5, M-6, L-9). No
+  measurable unlock slowdown (~285 ms before and after on a 64 MiB vault).
+- FIDO2 tool output, Base32 TOTP normalization, stdin passphrase and `--totp-file` buffers are
+  also pre-sized so they never reallocate, independent of the allocator.
+- HKDF-SHA512 runs in a dedicated non-inlined frame and the stack region is scrubbed afterwards
+  (`hkdf`/`hmac` 0.12 do not zeroize their PRK/HMAC state).
+- `omavault status` shows **swap exposure** (none / zram only / encrypted / unencrypted /
+  unverified) from `/proc/swaps` + sysfs (dm-crypt detection follows LVM-on-LUKS stacks); the TUI
+  warns at unlock if swap is unencrypted. SECURITY.md no longer claims decrypted entries cannot
+  reach swap (only the master key is `mlock`ed; `mlockall` is not viable under the default
+  8 MiB `RLIMIT_MEMLOCK`).
+- Tests: `tests/heap_residue_tests.rs` installs a probing allocator that checks every freed block
+  for a secret marker before and after the wipe (serde escapes, unlock request, sanitizers,
+  reallocations); mutation-checked (disabling the wipe makes it fail). Swap classifier unit tests.
+
 ### Added
 - The build version (`<crate version> (<git commit>)`) is shown on the TUI unlock screen, the
   TUI top bar, the help screen, `omavault --version`, and `omavault status`, so unreleased builds
