@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    # chrono is unmaintained (no fixed upgrade). DateTime<Utc> fields are part
+    # of the serialized vault JSON, so replacing chrono is a format change and
+    # needs a compatibility test that reads old vaults. Out of scope for v0.4.0.
+    # TODO: revisit when chrono can be replaced without breaking existing vaults.
+    "RUSTSEC-2026-0543",
+]

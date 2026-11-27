@@ -1,0 +1,34 @@
+# Supply-chain policy for `cargo deny check`.
+# The only ignored advisory is chrono, same as `.cargo/audit.toml`.
+
+[advisories]
+ignore = [
+    # chrono is unmaintained. DateTime<Utc> is part of the serialized vault
+    # JSON; replacing it needs a compatibility test that reads old vaults.
+    # TODO: revisit when chrono can be replaced without breaking existing vaults.
+    "RUSTSEC-2026-0543",
+]
+
+[licenses]
+# Filled from `cargo deny check licenses` against this lockfile. Do not add a
+# license until a crate in the graph actually uses it.
+# MPL-2.0 is option-ext, pulled by dirs-sys → directories (the XDG path crate).
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[bans]
+multiple-versions = "warn"
