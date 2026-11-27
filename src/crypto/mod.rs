@@ -522,6 +522,66 @@ fn build_slot_aad(header: &VaultHeader, label: &str, fido2: &Fido2Metadata) -> V
     aad
 }
 
+/// XChaCha20-Poly1305 in a frame that returns before the stack is scrubbed.
+///
+/// `chacha20` 0.9.1 copies the key into `hchacha`'s stack state and does not zeroize it.
+/// The cipher call is `#[inline(never)]`. `scrub_stack` runs in this function immediately
+/// after that frame returns, on both success and failure, so the next call reuses those
+/// addresses. This does not prove a particular stack byte was wiped.
+fn aead_seal(
+    key: &[u8; 32],
+    nonce: &[u8],
+    aad: &[u8],
+    msg: &[u8],
+) -> std::result::Result<Vec<u8>, ()> {
+    let result = aead_seal_frame(key, nonce, aad, msg);
+    crate::hardening::scrub_stack();
+    result
+}
+
+#[inline(never)]
+fn aead_seal_frame(
+    key: &[u8; 32],
+    nonce: &[u8],
+    aad: &[u8],
+    msg: &[u8],
+) -> std::result::Result<Vec<u8>, ()> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .encrypt(XNonce::from_slice(nonce), Payload { msg, aad })
+        .map_err(|_| ())
+}
+
+fn aead_open(
+    key: &[u8; 32],
+    nonce: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> std::result::Result<Vec<u8>, ()> {
+    let result = aead_open_frame(key, nonce, aad, ciphertext);
+    crate::hardening::scrub_stack();
+    result
+}
+
+#[inline(never)]
+fn aead_open_frame(
+    key: &[u8; 32],
+    nonce: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> std::result::Result<Vec<u8>, ()> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| ())
+}
+
 /// Wrap `master_key` into an authenticated `OMAV` v2 `Fido2KeySlot` bound to `(passphrase, [keyfile], YubiKey)`.
 pub fn wrap_master_key_for_slot(
     header: &VaultHeader,
@@ -550,16 +610,8 @@ pub fn wrap_master_key_for_slot(
     fill_random(&mut wrap_nonce)?;
     let aad = build_slot_aad(header, label, &fido2);
 
-    let cipher = XChaCha20Poly1305::new((&*kek).into());
     let wrapped = master_key.expose(|mk| {
-        cipher
-            .encrypt(
-                XNonce::from_slice(&wrap_nonce),
-                Payload {
-                    msg: mk.as_slice(),
-                    aad: &aad,
-                },
-            )
+        aead_seal(&kek, &wrap_nonce, &aad, mk.as_slice())
             .map_err(|_| VaultError::Crypto("FIDO2 key-slot wrap encryption failed".into()))
     })??;
 
@@ -602,16 +654,8 @@ pub fn unwrap_master_key_from_slot(
         .map_err(|_| VaultError::InvalidFormat("invalid Base64 slot wrapped key".into()))?;
     let aad = build_slot_aad(header, &slot.label, &slot.fido2);
 
-    let cipher = XChaCha20Poly1305::new((&*kek).into());
     let plain = Zeroizing::new(
-        cipher
-            .decrypt(
-                XNonce::from_slice(&wrap_nonce),
-                Payload {
-                    msg: &wrapped,
-                    aad: &aad,
-                },
-            )
+        aead_open(&kek, &wrap_nonce, &aad, &wrapped)
             .map_err(|_| VaultError::AuthenticationFailed)?,
     );
     if plain.len() != 32 {
@@ -731,17 +775,7 @@ pub fn seal_vault(
     }
 
     let enc_key = derive_payload_key(master_key, &header.save_salt)?;
-    let cipher = XChaCha20Poly1305::new((&*enc_key).into());
-    let nonce = XNonce::from_slice(&header.nonce);
-
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: &frame,
-                aad: &aad,
-            },
-        )
+    let ciphertext = aead_seal(&enc_key, &header.nonce, &aad, &frame)
         .map_err(|_| VaultError::Crypto("XChaCha20-Poly1305 encryption failed".into()))?;
 
     let mut blob = Vec::with_capacity(aad.len() + ciphertext.len());
@@ -761,18 +795,8 @@ pub fn open_vault(
     let ciphertext = &blob[header_len..];
 
     let enc_key = derive_payload_key(master_key, &header.save_salt)?;
-    let cipher = XChaCha20Poly1305::new((&*enc_key).into());
-    let nonce = XNonce::from_slice(&header.nonce);
-
     let frame = Zeroizing::new(
-        cipher
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: ciphertext,
-                    aad,
-                },
-            )
+        aead_open(&enc_key, &header.nonce, aad, ciphertext)
             .map_err(|_| VaultError::AuthenticationFailed)?,
     );
 
@@ -796,4 +820,27 @@ pub fn open_vault(
 
     let plaintext = Zeroizing::new(frame[4..4 + payload_len].to_vec());
     Ok((header, plaintext))
+}
+
+#[cfg(test)]
+mod aead_scrub_tests {
+    use super::*;
+
+    #[test]
+    fn aead_helpers_round_trip_and_reject_tampering() {
+        // Both the Ok and Err returns run scrub_stack before leaving the helper.
+        // Safe Rust cannot show that a particular stack byte was wiped.
+        let key = [7u8; 32];
+        let nonce = [9u8; 24];
+        let aad = b"header-aad";
+        let msg = b"secret-payload";
+        let ct = aead_seal(&key, &nonce, aad, msg).expect("seal");
+        let pt = aead_open(&key, &nonce, aad, &ct).expect("open");
+        assert_eq!(pt, msg);
+
+        let mut flipped = ct.clone();
+        flipped[0] ^= 1;
+        assert!(aead_open(&key, &nonce, aad, &flipped).is_err());
+        assert!(aead_open(&key, &nonce, b"other-aad", &ct).is_err());
+    }
 }

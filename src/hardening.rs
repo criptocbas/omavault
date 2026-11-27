@@ -78,9 +78,12 @@ pub fn swap_exposure() -> SwapExposure {
     let Ok(swaps) = fs::read_to_string("/proc/swaps") else {
         return SwapExposure::Unknown(vec!["/proc/swaps unreadable".into()]);
     };
-    classify_swaps(&swaps, &|name| block_device_is_crypt(name), &|path| {
-        file_backing_block_name(path)
-    })
+    classify_swaps(
+        &swaps,
+        &|name| block_device_is_crypt(name),
+        &|path| file_backing_block_name(path),
+        &zram_backing_dev,
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -88,12 +91,49 @@ pub fn swap_exposure() -> SwapExposure {
     SwapExposure::Unknown(vec!["unsupported platform".into()])
 }
 
+/// How a `/dev/zramN` swap should be counted, from its `backing_dev` text.
+enum ZramBacking {
+    /// Sysfs entry absent, empty, or `none`: compressed RAM, not a disk.
+    Ram,
+    /// Basename of the writeback device (`sda2`, `dm-0`).
+    Block(String),
+    /// A backing device was named, but not as a single block name.
+    Unreadable,
+}
+
+/// `raw` is the contents of `/sys/block/zramN/backing_dev`, or `None` if that file is absent.
+fn interpret_zram_backing(raw: Option<String>) -> ZramBacking {
+    let Some(raw) = raw else {
+        return ZramBacking::Ram;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return ZramBacking::Ram;
+    }
+    match std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        Some(block)
+            if !block.is_empty()
+                && !block.contains('/')
+                && !block.contains("..")
+                && !block.eq_ignore_ascii_case("none") =>
+        {
+            ZramBacking::Block(block.to_string())
+        }
+        _ => ZramBacking::Unreadable,
+    }
+}
+
 /// Pure classifier (unit-testable). `is_crypt(block_name)` reports whether a block device such as
 /// `dm-3` is (or sits on) dm-crypt; `file_block(path)` maps a swap FILE to its backing block name.
+/// `zram_backing(zramN)` returns the `backing_dev` text for that zram device, or `None` if absent.
 fn classify_swaps(
     proc_swaps: &str,
     is_crypt: &dyn Fn(&str) -> Option<bool>,
     file_block: &dyn Fn(&str) -> Option<String>,
+    zram_backing: &dyn Fn(&str) -> Option<String>,
 ) -> SwapExposure {
     let mut any = false;
     let mut disk_backed = false;
@@ -108,6 +148,26 @@ fn classify_swaps(
         let name = name.replace("\\040", " ");
         any = true;
         if name.starts_with("/dev/zram") {
+            let Some(zram) = std::path::Path::new(&name)
+                .file_name()
+                .and_then(|file| file.to_str())
+                .filter(|file| file.starts_with("zram") && !file.contains(".."))
+            else {
+                unknown.push(name);
+                continue;
+            };
+            match interpret_zram_backing(zram_backing(zram)) {
+                ZramBacking::Ram => continue,
+                ZramBacking::Unreadable => unknown.push(name),
+                ZramBacking::Block(block) => {
+                    disk_backed = true;
+                    match is_crypt(&block) {
+                        Some(true) => {}
+                        Some(false) => unencrypted.push(name),
+                        None => unknown.push(name),
+                    }
+                }
+            }
             continue;
         }
         disk_backed = true;
@@ -171,6 +231,15 @@ fn block_device_is_crypt(name: &str) -> Option<bool> {
         Some(false)
     }
     walk(name, 0)
+}
+
+/// Contents of `/sys/block/zramN/backing_dev`, or `None` when the file is absent.
+#[cfg(target_os = "linux")]
+fn zram_backing_dev(zram_name: &str) -> Option<String> {
+    if !zram_name.starts_with("zram") || zram_name.contains('/') || zram_name.contains("..") {
+        return None;
+    }
+    fs::read_to_string(format!("/sys/block/{zram_name}/backing_dev")).ok()
 }
 
 /// Map a swap file to the block device holding it (via `st_dev` → `/sys/dev/block/MAJ:MIN`).
@@ -1023,7 +1092,11 @@ mod swap_tests {
 
     #[test]
     fn classifies_swap_setups() {
-        let c = |body: &str| classify_swaps(&format!("{HDR}{body}"), &crypt, &file_block);
+        let c = |body: &str| {
+            classify_swaps(&format!("{HDR}{body}"), &crypt, &file_block, &|_: &str| {
+                None
+            })
+        };
         assert_eq!(c(""), SwapExposure::None);
         assert_eq!(
             c("/dev/zram0 partition 100 0 100\n"),
@@ -1040,6 +1113,36 @@ mod swap_tests {
         ));
         // Unencrypted wins over everything else.
         assert!(c("/swapfile file 1 0 -2\n/plain/swapfile file 1 0 -3\n").is_unencrypted());
+    }
+
+    #[test]
+    fn classifies_zram_writeback_from_backing_dev() {
+        let line = "/dev/zram0 partition 100 0 100\n";
+        let classify = |backing: fn(&str) -> Option<String>| {
+            classify_swaps(&format!("{HDR}{line}"), &crypt, &file_block, &backing)
+        };
+        assert_eq!(classify(|_: &str| None), SwapExposure::ZramOnly);
+        assert_eq!(classify(|_| Some("none".into())), SwapExposure::ZramOnly);
+        assert_eq!(
+            classify(|_| Some("  none\n".into())),
+            SwapExposure::ZramOnly
+        );
+        let plain = classify(|_| Some("sda2".into()));
+        assert!(plain.is_unencrypted(), "{plain:?}");
+        assert_eq!(classify(|_| Some("dm-0".into())), SwapExposure::Encrypted);
+        assert_eq!(
+            classify(|_| Some("/dev/dm-0".into())),
+            SwapExposure::Encrypted
+        );
+        assert!(matches!(
+            classify(|_| Some("nvme0n1p3".into())),
+            SwapExposure::Unknown(_)
+        ));
+        // A named backing device that is not a single block name is not RAM.
+        assert!(matches!(
+            classify(|_| Some("/".into())),
+            SwapExposure::Unknown(_)
+        ));
     }
 }
 

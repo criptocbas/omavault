@@ -719,6 +719,9 @@ where
     }
     let order = slot_probe_order(slots);
     let mut remembered: Option<(AssertFailureKind, VaultError)> = None;
+    // An unclassified Device failure on a UV slot may be a PIN error we did not
+    // recognize. Do not open another UV prompt on a later key.
+    let mut stop_uv = false;
     for device_idx in 0..n_devices {
         if cancel_requested() {
             return Err(cancelled_error());
@@ -726,6 +729,9 @@ where
         for &slot_idx in &order {
             if cancel_requested() {
                 return Err(cancelled_error());
+            }
+            if stop_uv && slots[slot_idx].fido2.require_uv {
+                continue;
             }
             match attempt(device_idx, slot_idx) {
                 Ok(secret) => return Ok((slot_idx, secret)),
@@ -739,6 +745,9 @@ where
                         }
                         AssertFailureKind::Device => {
                             remembered = Some(prefer_failure(remembered, (kind, err)));
+                            if slots[slot_idx].fido2.require_uv {
+                                stop_uv = true;
+                            }
                             break;
                         }
                         AssertFailureKind::StopPinProblem => return Err(err),
@@ -1523,6 +1532,36 @@ mod tests {
         assert!(matches!(err, VaultError::Fido2Error(msg) if msg == "FIDO_ERR_PIN_INVALID"));
         assert_eq!(uv_calls, 1);
         assert!(devices.iter().all(|dev| *dev == 0));
+    }
+
+    #[test]
+    fn probe_slots_stops_uv_on_later_devices_after_unclassified_device_error() {
+        // Device on a non-UV slot still moves to the next key. Device on a UV slot
+        // must not open that UV slot on the next key (an unrecognized PIN string
+        // would otherwise burn another authenticator's retries).
+        let slots = vec![test_slot("A", true), test_slot("B", false)];
+        let mut calls = Vec::new();
+        let (idx, secret) = probe_slots(2, &slots, |dev, slot_idx| {
+            calls.push((dev, slot_idx));
+            if slots[slot_idx].fido2.require_uv {
+                Err((
+                    AssertFailureKind::Device,
+                    VaultError::Fido2Error("unrecognized pin".into()),
+                ))
+            } else if dev == 0 {
+                Err((
+                    AssertFailureKind::NoCredential,
+                    VaultError::Fido2NoMatchingCredential,
+                ))
+            } else {
+                Ok(Zeroizing::new([5u8; 32]))
+            }
+        })
+        .expect("non-UV slot on the next device still matches");
+        assert_eq!(idx, 1);
+        assert_eq!(secret.as_slice(), &[5u8; 32]);
+        // B is index 1 (non-UV), A is index 0 (UV). Device 1 must not attempt A.
+        assert_eq!(calls, vec![(0, 1), (0, 0), (1, 1)]);
     }
 
     #[test]

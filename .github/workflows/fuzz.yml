@@ -15,11 +15,13 @@ jobs:
       matrix:
         target: [parse_header, parse_totp, parse_vault]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: nightly
       - name: Install libFuzzer build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang libdbus-1-dev pkg-config
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz for 60 seconds
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60

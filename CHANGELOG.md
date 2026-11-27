@@ -144,6 +144,14 @@ Phase 1 shipped as **v0.3.1** (see below). Header-changing saves (`rekey`, `fido
 - `omavault init` checks the destination directory before it asks for a passphrase or a YubiKey touch.
 - SECURITY.md and the README state the limits the code actually has (same-UID daemon access, swap, rollback history, UV/PIN slots, root and hibernation).
 
+### Round 3 hardening
+
+- TUI Esc, Ctrl-C, or quit during unlock cancels before a queued daemon session is adopted. The pre-sleep inhibitor stays until the UI finishes or the process exits, and the daemon status poll times out at 500 ms. FIDO2 labels on the lock screen and in `fido2 remove` are sanitized. A password with invisible or control characters is masked in the TUI reveal view instead of shown stripped.
+- In-process and test daemons do not clear the live clipboard. A clipboard helper whose lock is busy does not wipe a newer secret. The PKGBUILD test run uses an isolated home and runtime directory.
+- Rollback records are replaced atomically. A non-empty corrupt record is an error. `--allow-rollback` accepts that open and does not lower the high-water mark or replace the ciphertext digest, so a later save cannot make the old ciphertext replayable. A failed directory fsync fails the save before old backups are purged.
+- Control-slot replies use a 250 ms write deadline. `SaveVault` rejects terminal-control and invisible characters in passwords and custom fields before sealing. `daemon.lock` must be a single link, and `SIGUSR1` is sent only when that PID holds the flock. A loaded vault is dropped if the lock epoch moves before the reply is written.
+- XChaCha20-Poly1305 encrypt and decrypt run in a non-inlined frame, and the stack is scrubbed after each call (`chacha20` 0.9.1 does not zeroize `hchacha`). An unclassified device error on a UV slot stops further UV probes. Zram with a `backing_dev` writeback target is classified as that disk. `install.sh` skips the user unit when `/usr/lib/systemd/user/omavaultd.service` is installed, unless `--force-user-unit` is passed. CI pins `cargo-audit` 0.23.0, `cargo-fuzz` 0.13.2, and the Actions to commit SHAs.
+
 ### Also
 
 - The build version (`<crate version> (<git commit>)`) is shown on the TUI unlock screen, the
