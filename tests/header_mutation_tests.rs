@@ -27,6 +27,14 @@ use omavault::vault::storage::{
 use omavault::vault::{Entry, Vault};
 use tempfile::TempDir;
 
+/// `tempfile` uses `0o777` masked by the process umask. Under `umask 0000` that is
+/// world-writable, which the vault trust check refuses.
+fn private_tempdir() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    tmp
+}
+
 const OLD_PASS: &[u8] = b"old-master-passphrase-123";
 const NEW_PASS: &[u8] = b"new-master-passphrase-456";
 
@@ -107,7 +115,7 @@ fn v2_vault_on_disk(path: &Path, keys: &[(&str, &MockTrackedFido2Key)]) -> V2Fix
 
 #[test]
 fn rekey_writes_new_header_and_new_passphrase_unlocks_from_disk() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let (old_hdr, _old_key, mut vault) = v1_vault_on_disk(&path);
     let expected_rev = header_revision(&old_hdr);
@@ -163,7 +171,7 @@ fn rekey_writes_new_header_and_new_passphrase_unlocks_from_disk() {
 
 #[test]
 fn fido2_add_v2_persists_new_slot_and_new_key_unlocks() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let key1 = MockTrackedFido2Key::new([0x11; 32]);
     let key2 = MockTrackedFido2Key::new([0x22; 32]);
@@ -235,7 +243,7 @@ fn fido2_add_v2_persists_new_slot_and_new_key_unlocks() {
 
 #[test]
 fn fido2_remove_with_rotation_revokes_key_and_remaining_key_unlocks() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let key1 = MockTrackedFido2Key::new([0x11; 32]);
     let key2 = MockTrackedFido2Key::new([0x22; 32]);
@@ -293,7 +301,7 @@ fn fido2_remove_with_rotation_revokes_key_and_remaining_key_unlocks() {
 
 #[test]
 fn fido2_remove_no_rotate_drops_slot_from_disk() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let key1 = MockTrackedFido2Key::new([0x11; 32]);
     let key2 = MockTrackedFido2Key::new([0x22; 32]);
@@ -326,7 +334,7 @@ fn fido2_remove_no_rotate_drops_slot_from_disk() {
 
 #[test]
 fn verify_saved_vault_rejects_mismatches() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let (hdr, _key, _vault) = v1_vault_on_disk(&path);
 
@@ -343,7 +351,7 @@ fn verify_saved_vault_rejects_mismatches() {
 
 #[test]
 fn stale_revision_is_still_rejected_and_header_untouched() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let (mut hdr, key, mut vault) = v1_vault_on_disk(&path);
     let stale_rev = header_revision(&hdr);
@@ -381,7 +389,7 @@ fn stale_revision_is_still_rejected_and_header_untouched() {
 
 #[test]
 fn failed_write_leaves_caller_header_in_sync_with_disk() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let vdir = dir.path().join("vdir");
     fs::create_dir(&vdir).unwrap();
     fs::set_permissions(&vdir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -410,7 +418,7 @@ fn failed_write_leaves_caller_header_in_sync_with_disk() {
 
 #[test]
 fn create_new_vault_never_overwrites_existing_file() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let (_hdr, _key, _vault) = v1_vault_on_disk(&path);
     let original = fs::read(&path).unwrap();
@@ -484,7 +492,7 @@ fn assert_ok(out: &std::process::Output, what: &str) {
 
 #[test]
 fn e2e_cli_rekey_then_reopen_with_new_passphrase() {
-    let home = TempDir::new().unwrap();
+    let home = private_tempdir();
     let vdir = home.path().join("data").join("omavault");
     let vault = vdir.join("vault.omav");
     let old = "old-passphrase-for-e2e";

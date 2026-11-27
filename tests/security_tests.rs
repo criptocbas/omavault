@@ -29,6 +29,14 @@ use omavault::vault::{Entry, Vault};
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
+/// `tempfile` uses `0o777` masked by the process umask. Under `umask 0000` that is
+/// world-writable, which the vault and socket trust checks refuse.
+fn private_tempdir() -> TempDir {
+    let tmp = TempDir::new().expect("tempdir");
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    tmp
+}
+
 fn fast_params() -> KdfParams {
     KdfParams {
         mem_kib: 8 * 1024,
@@ -156,7 +164,7 @@ fn every_save_rotates_subkey_and_nonce_and_hides_length() {
 
 #[test]
 fn triple_factor_passphrase_keyfile_and_fido2() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let kf_path = tmp.path().join("vault.key");
     let wrong_kf_path = tmp.path().join("other.key");
     generate_keyfile(&kf_path).expect("generate keyfile");
@@ -231,7 +239,7 @@ fn triple_factor_passphrase_keyfile_and_fido2() {
 #[test]
 fn atomic_disk_storage_permissions_rolling_backups_and_purge() {
     let _ = harden_process();
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let vault_dir = tmp.path().join("omavault_private");
     let vault_path = vault_dir.join("vault.omav");
 
@@ -295,7 +303,7 @@ fn atomic_disk_storage_permissions_rolling_backups_and_purge() {
 
 #[test]
 fn rejects_symlinks_and_special_files() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let real_dir = tmp.path().join("real");
     fs::create_dir(&real_dir).unwrap();
     let sym_dir = tmp.path().join("sym_dir");
@@ -319,7 +327,7 @@ fn rejects_symlinks_and_special_files() {
 
 #[test]
 fn daemon_unlock_load_save_revision_conflict_and_lock_lifecycle() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     // Keep the daemon's rollback records out of the developer's real ~/.local/state.
     std::env::set_var("XDG_STATE_HOME", tmp.path().join("state"));
     let vault_path = tmp.path().join("vault.omav");
@@ -413,7 +421,7 @@ fn daemon_unlock_load_save_revision_conflict_and_lock_lifecycle() {
 
 #[test]
 fn daemon_client_rejects_world_accessible_socket_directory() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let unsafe_dir = tmp.path().join("unsafe_dir");
     fs::create_dir(&unsafe_dir).unwrap();
     fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o755)).unwrap();
@@ -609,7 +617,7 @@ fn v03_audit_regressions_utf8_totp_keyfile_eexist_sanitizer_and_checked_save() {
     assert!(multi.contains('\n'));
 
     // M-10: generate_keyfile on EEXIST MUST NOT delete the pre-existing keyfile.
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let kf = tmp.path().join("omavault_private").join("existing.key");
     generate_keyfile(&kf).expect("first keyfile");
     let original_bytes = fs::read(&kf).expect("read original");

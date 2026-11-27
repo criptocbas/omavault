@@ -2,6 +2,8 @@
 //!
 //! Lives in its own test binary because it signals the whole test process.
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,9 +15,17 @@ use omavault::vault::Vault;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
+/// `tempfile` uses `0o777` masked by the process umask. Under `umask 0000` that is
+/// world-writable, which the vault trust check refuses.
+fn private_tempdir() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    tmp
+}
+
 #[test]
 fn sigusr1_locks_daemon_immediately() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = private_tempdir();
     std::env::set_var("XDG_STATE_HOME", tmp.path().join("state"));
     let vault_path = tmp.path().join("vault.omav");
     let sock_path = tmp.path().join("omavault_run/daemon.sock");

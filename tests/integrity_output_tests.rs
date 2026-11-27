@@ -19,6 +19,14 @@ use omavault::vault::{Entry, Vault};
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
+/// `tempfile` uses `0o777` masked by the process umask. Under `umask 0000` that is
+/// world-writable, which the vault trust check refuses.
+fn private_tempdir() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    tmp
+}
+
 fn fast_params() -> KdfParams {
     KdfParams {
         mem_kib: 8 * 1024,
@@ -47,7 +55,7 @@ fn new_vault_on_disk(path: &Path) -> (VaultHeader, omavault::hardening::LockedKe
 
 #[test]
 fn revision_covers_whole_header_not_just_save_salt() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let (mut hdr, key, mut vault) = new_vault_on_disk(&path);
     let rev = header_revision(&hdr);
@@ -74,7 +82,7 @@ fn revision_covers_whole_header_not_just_save_salt() {
 
 #[test]
 fn saves_stamp_id_and_monotonic_generation() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let (mut hdr, key, mut vault) = new_vault_on_disk(&path);
     let id = vault.vault_id.expect("vault id assigned");
@@ -105,7 +113,7 @@ fn saves_stamp_id_and_monotonic_generation() {
 
 #[test]
 fn rollback_store_detects_restore_swap_and_downgrade() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let store = RollbackStore::in_dir(dir.path().join("seen"));
     let vpath = dir.path().join("vault.omav");
     fs::write(&vpath, b"x").unwrap();
@@ -176,7 +184,7 @@ fn seen_record_file(store_dir: &std::path::Path) -> std::path::PathBuf {
 
 #[test]
 fn corrupt_nonempty_seen_record_is_not_treated_as_unseen() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let store_dir = dir.path().join("seen");
     let store = RollbackStore::in_dir(&store_dir);
     let vpath = dir.path().join("vault.omav");
@@ -219,7 +227,7 @@ fn corrupt_nonempty_seen_record_is_not_treated_as_unseen() {
 
 #[test]
 fn allow_rollback_does_not_lower_watermark_or_allow_replay_after_save() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let store = RollbackStore::in_dir(dir.path().join("seen"));
     let path = dir.path().join("vault.omav");
@@ -375,7 +383,7 @@ fn new_slot_labels_reject_invisible_characters() {
 
 #[test]
 fn reads_refuse_untrusted_vault_files_and_directories() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let vdir = dir.path().join("v");
     fs::create_dir(&vdir).unwrap();
     fs::set_permissions(&vdir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -409,7 +417,7 @@ fn reads_refuse_untrusted_vault_files_and_directories() {
 
 #[test]
 fn hardlinked_lock_file_is_refused() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let (mut hdr, key, mut vault) = new_vault_on_disk(&path);
     let victim = dir.path().join("victim.txt");
@@ -433,7 +441,7 @@ fn hardlinked_lock_file_is_refused() {
 
 #[test]
 fn purge_removes_orphaned_temp_files() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("vault.omav");
     let _ = new_vault_on_disk(&path);
     let orphan1 = dir.path().join(".vault.omav.tmp.deadbeef");
@@ -492,8 +500,8 @@ const E2E_PASS: &str = "phase3-e2e-passphrase";
 /// Empty stdin would otherwise surface as "unexpected EOF", which does not name the directory.
 #[test]
 fn e2e_init_refuses_world_writable_parent_before_reading_stdin() {
-    let home = TempDir::new().unwrap();
-    let parent = TempDir::new().unwrap();
+    let home = private_tempdir();
+    let parent = private_tempdir();
     fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o777)).unwrap();
     let vault = parent.path().join("vault.omav");
     let out = omavault(home.path(), &vault, &["init"], "");
@@ -544,7 +552,7 @@ fn e2e_add(home: &Path, vault: &Path, name: &str) {
 
 #[test]
 fn e2e_restoring_an_older_vault_copy_is_refused() {
-    let home = TempDir::new().unwrap();
+    let home = private_tempdir();
     let vault = home.path().join("data/omavault/vault.omav");
     e2e_init(home.path(), &vault);
     e2e_add(home.path(), &vault, "first");
@@ -581,7 +589,7 @@ fn e2e_restoring_an_older_vault_copy_is_refused() {
 
 #[test]
 fn e2e_output_is_sanitized_even_when_piped() {
-    let home = TempDir::new().unwrap();
+    let home = private_tempdir();
     let vault = home.path().join("data/omavault/vault.omav");
     // Plant a malicious entry the way a pre-v0.4 vault could contain one: build the payload
     // directly (bypassing `add_entry` validation) and save it with production KDF params.
@@ -634,7 +642,7 @@ fn e2e_reveal_on_terminal_never_emits_escape_sequences() {
         eprintln!("skipping: script(1) not available");
         return;
     }
-    let home = TempDir::new().unwrap();
+    let home = private_tempdir();
     let vault = home.path().join("data/omavault/vault.omav");
     fs::create_dir_all(vault.parent().unwrap()).unwrap();
     fs::set_permissions(vault.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
