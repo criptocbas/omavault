@@ -25,6 +25,14 @@ use zeroize::Zeroizing;
 
 const PASS: &str = "daemon-lock-test-pass";
 
+/// `tempfile` uses `0o777` masked by the process umask. Under `umask 0000` that is
+/// world-writable, which the vault and socket trust checks refuse.
+fn private_tempdir() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    tmp
+}
+
 fn fast_params() -> KdfParams {
     KdfParams {
         mem_kib: 8 * 1024,
@@ -43,7 +51,7 @@ struct Harness {
 
 impl Harness {
     fn start(idle_timeout_secs: u64, max_session_secs: u64) -> Self {
-        let tmp = TempDir::new().unwrap();
+        let tmp = private_tempdir();
         let vault_path = tmp.path().join("vault.omav");
         let sock_path = tmp.path().join("omavault_run/daemon.sock");
 
@@ -157,7 +165,7 @@ struct ProcessDaemon {
 
 impl ProcessDaemon {
     fn start() -> Self {
-        let tmp = TempDir::new().unwrap();
+        let tmp = private_tempdir();
         let run = tmp.path().join("run");
         fs::create_dir(&run).unwrap();
         fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
@@ -291,8 +299,17 @@ fn save_vault_returns_new_revision() {
 }
 
 #[test]
+fn library_daemon_does_not_clear_the_live_clipboard() {
+    let cfg = DaemonConfig::new(60, false);
+    assert!(
+        !cfg.clear_clipboard_on_lock,
+        "in-process DaemonConfig::new must not touch the Wayland clipboard"
+    );
+}
+
+#[test]
 fn missing_socket_is_typed_daemon_unavailable() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = private_tempdir();
     let dir = tmp.path().join("omavault");
     fs::create_dir(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();

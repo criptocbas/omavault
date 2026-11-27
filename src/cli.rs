@@ -1018,6 +1018,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
             cfg.max_session_secs = max_session;
             cfg.hardening = hardening;
             cfg.presleep_monitor = true;
+            cfg.clear_clipboard_on_lock = true;
             run_daemon_with_config(&socket_path, cfg)
         }
 

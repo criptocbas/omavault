@@ -206,10 +206,16 @@ struct DaemonState {
     hardening: HardeningStatus,
     /// In-flight unlocks. Every lock path cancels these so a touch prompt cannot outlive it.
     unlock_cancels: Vec<Fido2Cancel>,
+    clear_clipboard_on_lock: bool,
 }
 
 impl DaemonState {
-    fn new(idle_timeout_secs: u64, max_session_secs: u64, hardening: HardeningStatus) -> Self {
+    fn new(
+        idle_timeout_secs: u64,
+        max_session_secs: u64,
+        hardening: HardeningStatus,
+        clear_clipboard_on_lock: bool,
+    ) -> Self {
         Self {
             session: None,
             idle_timeout_secs,
@@ -221,6 +227,7 @@ impl DaemonState {
             lock_epoch: 0,
             hardening,
             unlock_cancels: Vec::new(),
+            clear_clipboard_on_lock,
         }
     }
 
@@ -370,6 +377,10 @@ pub struct DaemonConfig {
     pub presleep_monitor: bool,
     /// Rollback state directory; `None` uses `$XDG_STATE_HOME/omavault/seen` (or `~/.local/state`).
     pub rollback_state_dir: Option<PathBuf>,
+    /// When false, lock and shutdown wipe the session key but do not touch `clip.state`
+    /// or the Wayland clipboard. Library and in-process tests leave this false so they
+    /// cannot clear the developer's live clipboard. The production daemon sets it true.
+    pub clear_clipboard_on_lock: bool,
 }
 
 impl DaemonConfig {
@@ -381,6 +392,7 @@ impl DaemonConfig {
             hardening: HardeningStatus::default(),
             presleep_monitor: false,
             rollback_state_dir: None,
+            clear_clipboard_on_lock: false,
         }
     }
 }
@@ -417,15 +429,19 @@ pub fn run_daemon_with_hardening(
     let mut cfg = DaemonConfig::new(idle_timeout_secs, enforce_kdf_policy);
     cfg.hardening = hardening;
     cfg.presleep_monitor = true;
+    cfg.clear_clipboard_on_lock = true;
     run_daemon_with_config(socket_path, cfg)
 }
 
 fn lock_and_clear(state: &Mutex<DaemonState>, reason: &str) {
-    {
+    let clear = {
         let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
         g.lock_inner(reason);
+        g.clear_clipboard_on_lock
+    };
+    if clear {
+        clear_clipboard_best_effort();
     }
-    clear_clipboard_best_effort();
 }
 
 /// Run the daemon with an explicit [`DaemonConfig`].
@@ -478,6 +494,7 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
         cfg.idle_timeout_secs.max(10),
         max_session,
         cfg.hardening,
+        cfg.clear_clipboard_on_lock,
     )));
     state.lock().unwrap_or_else(|e| e.into_inner()).rollback = match &cfg.rollback_state_dir {
         Some(dir) => Some(RollbackStore::in_dir(dir)),
@@ -536,7 +553,7 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
                     let should_clear = {
                         let mut g = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
                         g.shutdown_requested = true;
-                        g.lock_inner("signal shutdown")
+                        g.lock_inner("signal shutdown") && g.clear_clipboard_on_lock
                     };
                     if should_clear {
                         clear_clipboard_best_effort();
@@ -573,6 +590,7 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
                     } else if let Some(reason) = guard.expiry_reason(current_boot_secs()) {
                         clear_clip = guard.lock_inner(reason);
                     }
+                    clear_clip = clear_clip && guard.clear_clipboard_on_lock;
                     if poisoned {
                         drop(guard);
                         if clear_clip {
@@ -666,7 +684,7 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
     let should_clear = {
         let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
         g.shutdown_requested = true;
-        g.lock_inner("daemon shutdown")
+        g.lock_inner("daemon shutdown") && g.clear_clipboard_on_lock
     };
     if should_clear {
         clear_clipboard_best_effort();
@@ -744,17 +762,21 @@ fn handle_connection(
             DaemonResponse::Status(guard.status())
         }
         DaemonRequest::Lock => {
-            // Always clear clipboard on explicit Lock (even if vault was already locked or unlocking).
+            // Clear the clipboard on explicit Lock when this daemon is allowed to touch it
+            // (production). In-process tests leave the flag off.
             lock_and_clear(state, "manual lock");
             DaemonResponse::Ok
         }
         DaemonRequest::Shutdown => {
-            let _ = {
+            let clear = {
                 let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
                 guard.shutdown_requested = true;
-                guard.lock_inner("daemon shutdown")
+                guard.lock_inner("daemon shutdown");
+                guard.clear_clipboard_on_lock
             };
-            clear_clipboard_best_effort();
+            if clear {
+                clear_clipboard_best_effort();
+            }
             DaemonResponse::Ok
         }
         _ if control_only => DaemonResponse::Error {

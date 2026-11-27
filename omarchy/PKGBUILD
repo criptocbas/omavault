@@ -30,7 +30,23 @@ build() {
 check() {
     chmod u+r "$startdir/pkg"
     cd "$startdir/.."
-    cargo test --frozen
+    # Isolate from the packager's live session. In-process daemon tests must not
+    # see the real XDG_RUNTIME_DIR, HOME, or Wayland clipboard.
+    local testhome cargo_home rustup_home
+    testhome="$(mktemp -d)"
+    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+    rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+    mkdir -p "$testhome/run" "$testhome/state" "$testhome/data"
+    chmod 700 "$testhome" "$testhome/run" "$testhome/state" "$testhome/data"
+    env -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u OMAVAULT_SOCKET \
+        HOME="$testhome" \
+        CARGO_HOME="$cargo_home" \
+        RUSTUP_HOME="$rustup_home" \
+        XDG_RUNTIME_DIR="$testhome/run" \
+        XDG_STATE_HOME="$testhome/state" \
+        XDG_DATA_HOME="$testhome/data" \
+        cargo test --frozen
+    rm -rf "$testhome"
 }
 
 package() {

@@ -260,6 +260,14 @@ fn may_clear(my_gen: &str, state: Option<&(u32, String)>) -> bool {
     }
 }
 
+/// Whether the clipboard-helper watchdog should call a global `copy::clear`.
+///
+/// A failed `flock` means a newer `copy_secret` is inside the critical section. Clearing
+/// anyway would wipe that newer secret. Exiting instead drops only this helper's offer.
+fn watchdog_should_global_clear(lock_acquired: bool, owns_generation: bool) -> bool {
+    lock_acquired && owns_generation
+}
+
 /// Publish `generation` and only then signal the helper recorded before this copy.
 /// A superseded helper that locks before clearing therefore observes the new generation.
 fn commit_new_generation(
@@ -546,13 +554,15 @@ pub fn run_clipboard_server(
         match &store_wd {
             Some(store) => match store.lock(CLIP_LOCK_TIMEOUT) {
                 Ok(guard) => {
-                    if may_clear(&gen_wd, guard.read().as_ref()) {
+                    let owns = may_clear(&gen_wd, guard.read().as_ref());
+                    if watchdog_should_global_clear(true, owns) {
                         let _ = copy::clear(ClipboardType::Regular, Seat::All);
                         guard.remove_if(&gen_wd);
                     }
                 }
                 Err(_) => {
-                    let _ = copy::clear(ClipboardType::Regular, Seat::All);
+                    // Lock is busy: a newer copy is being published. Do not clear.
+                    // Closing this helper's Wayland socket withdraws only its own offer.
                 }
             },
             None => {
@@ -643,6 +653,16 @@ mod tests {
         assert!(may_clear("G1", Some(&same)));
         let other = (7u32, "G2".to_string());
         assert!(!may_clear("G1", Some(&other)));
+    }
+
+    #[test]
+    fn watchdog_does_not_clear_when_the_clip_lock_is_busy() {
+        // Busy lock: a newer `copy_secret` holds `clip.lock`. Clearing would wipe it.
+        assert!(!watchdog_should_global_clear(false, true));
+        assert!(!watchdog_should_global_clear(false, false));
+        // Held lock: clear only when this generation still owns the state.
+        assert!(watchdog_should_global_clear(true, true));
+        assert!(!watchdog_should_global_clear(true, false));
     }
 
     #[test]
