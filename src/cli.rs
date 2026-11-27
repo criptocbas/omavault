@@ -491,8 +491,13 @@ fn tty_safe(s: &str) -> String {
 }
 
 /// Sanitize stored/untrusted text for STDERR (always; `--raw` only affects stdout).
-fn err_safe(s: &str) -> String {
+fn stderr_tty_safe(s: &str) -> String {
     sanitize_single_line(s)
+}
+
+/// Sanitize stored/untrusted text for STDERR (always; `--raw` only affects stdout).
+fn err_safe(s: &str) -> String {
+    stderr_tty_safe(s)
 }
 
 pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
@@ -768,8 +773,9 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 }
                 if !old_header.has_fido2_label(&label) {
                     return Err(VaultError::Fido2Error(format!(
-                        "no FIDO2 key slot labeled '{label}' found (enrolled: {})",
-                        old_header.fido2_labels().join(", ")
+                        "no FIDO2 key slot labeled '{}' found (enrolled: {})",
+                        stderr_tty_safe(&label),
+                        stderr_tty_safe(&old_header.fido2_labels().join(", "))
                     )));
                 }
                 if old_header.fido2_slots.len() <= 1 {
@@ -788,7 +794,8 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 };
 
                 eprintln!(
-                    "Touch one of your REMAINING enrolled YubiKeys (not '{label}') to authorize removal..."
+                    "Touch one of your REMAINING enrolled YubiKeys (not '{}') to authorize removal...",
+                    stderr_tty_safe(&label)
                 );
                 let res = resolve_master_key(
                     &old_header,
@@ -804,7 +811,8 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     .eq_ignore_ascii_case(&label)
                 {
                     return Err(VaultError::Fido2Error(format!(
-                        "you touched '{label}' (the key being removed); touch one of your other enrolled YubiKeys instead"
+                        "you touched '{}' (the key being removed); touch one of your other enrolled YubiKeys instead",
+                        stderr_tty_safe(&label)
                     )));
                 }
                 let (_, mut vault) = load_vault_from_disk(&vault_path, &res.master_key, true)?;
@@ -2218,5 +2226,12 @@ mod tests {
     #[test]
     fn verify_cli_flags() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn stderr_tty_safe_strips_bidi_from_fido2_labels() {
+        let shown = super::stderr_tty_safe("primary\u{202e}evil");
+        assert!(!shown.contains('\u{202e}'));
+        assert_eq!(shown, "primaryevil");
     }
 }

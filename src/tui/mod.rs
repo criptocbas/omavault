@@ -33,8 +33,8 @@ use crate::generator::{
     passphrase_entropy_bits, strength_label, PassphraseOptions, PasswordOptions,
 };
 use crate::hardening::{
-    boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, sanitize_multiline,
-    sanitize_single_line, swap_exposure, HardeningStatus, LockedKey,
+    boottime_monotonic_skew_ms, boottime_secs, is_dangerous_display_char, is_screen_locker_active,
+    sanitize_multiline, sanitize_single_line, swap_exposure, HardeningStatus, LockedKey,
 };
 use crate::procsig::TuiRegistration;
 use crate::sleep::SleepMonitor;
@@ -47,6 +47,12 @@ use crate::vault::storage::{
 use crate::vault::{Entry, Vault};
 
 const SUSPEND_SKEW_THRESHOLD_MS: u64 = 2000;
+/// Bound for the TUI watchdog's `Status` poll. The full IPC frame deadline is 10 s, which is
+/// long enough for a wedged socket to stall the UI thread past a pre-sleep wipe.
+const DAEMON_STATUS_POLL: Duration = Duration::from_millis(500);
+/// Shown instead of a stripped password when reveal would not match the bytes `y` copies.
+const HIDDEN_DANGEROUS_PASSWORD: &str =
+    "[hidden: contains invisible/control chars — use 'y' to copy]";
 
 pub struct TuiConfig {
     pub vault_path: PathBuf,
@@ -275,6 +281,9 @@ struct App {
     last_watchdog_check: Instant,
     my_uid: u32,
     should_quit: bool,
+    /// Quit was requested while `Mode::Unlocking`. Process exit must lock `omavaultd` even if
+    /// the mode is no longer `Unlocking` (the queued outcome must not be adopted).
+    quit_during_unlock: bool,
 }
 
 fn current_boot_secs() -> u64 {
@@ -309,6 +318,7 @@ impl App {
             last_watchdog_check: Instant::now(),
             my_uid,
             should_quit: false,
+            quit_during_unlock: false,
         };
 
         // If the auto-lock daemon is already unlocked for this vault, attach seamlessly
@@ -747,7 +757,7 @@ impl App {
         // 4. Synchronize with omavaultd if running in daemon-backed mode.
         if let Some(SessionBackend::Daemon { mlocked, .. }) = self.backend.as_mut() {
             let client = DaemonClient::new(self.cfg.socket_path.clone());
-            match client.status() {
+            match client.status_timeout(DAEMON_STATUS_POLL) {
                 Ok(st) if st.unlocked => {
                     *mlocked = st.mlocked;
                     self.daemon_remaining_secs = Some(st.remaining_secs);
@@ -769,10 +779,16 @@ impl App {
         self.last_activity_boot_secs = current_boot_secs();
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            // Cancel before the event loop's `on_tick` can adopt a queued unlock.
+            if matches!(self.mode, Mode::Unlocking { .. }) {
+                self.quit_during_unlock = true;
+                self.cancel_unlock("quit during unlock");
+            }
             self.should_quit = true;
             return;
         }
 
+        let mut quit_unlock = false;
         match &mut self.mode {
             Mode::Locked {
                 passphrase_input,
@@ -797,7 +813,7 @@ impl App {
             },
             Mode::Unlocking { .. } => {
                 if key.code == KeyCode::Esc {
-                    self.should_quit = true;
+                    quit_unlock = true;
                 }
             }
             Mode::Search => match key.code {
@@ -935,6 +951,12 @@ impl App {
                 }
             }
             Mode::Normal => self.handle_normal_key(key),
+        }
+        if quit_unlock {
+            // Drop `Unlocking` (and its queued outcome) before the event loop ticks.
+            self.quit_during_unlock = true;
+            self.cancel_unlock("quit during unlock");
+            self.should_quit = true;
         }
     }
 
@@ -1168,22 +1190,26 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
     let _registration = TuiRegistration::register(&app.cfg.socket_path);
 
     // Pre-sleep lock for this process's own secrets (standalone key + any decrypted entries).
-    // The callback blocks (bounded) until the UI thread confirms the wipe, so the logind delay
-    // inhibitor is held until secrets are gone.
+    // The callback waits until the UI thread confirms the wipe. logind's `InhibitDelayMaxSec`
+    // is the cap for a stalled UI thread — a fixed 2 s timeout would release the inhibitor
+    // while keys are still in RAM. `sleep_exit` is set on the way out so dropping the monitor
+    // (which joins this thread) cannot deadlock if the UI thread is the one shutting down.
     let sleep_request = Arc::new(AtomicBool::new(false));
     let sleep_done = Arc::new(AtomicBool::new(false));
+    let sleep_exit = Arc::new(AtomicBool::new(false));
     let _sleep_monitor = {
         let req = Arc::clone(&sleep_request);
         let done = Arc::clone(&sleep_done);
+        let exit = Arc::clone(&sleep_exit);
         SleepMonitor::spawn(move || {
             done.store(false, Ordering::SeqCst);
             req.store(true, Ordering::SeqCst);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(20));
-            }
+            wait_until_sleep_or_exit(&done, &exit);
         })
     };
+    // Declared after the monitor so this drops first and unblocks the callback before
+    // `SleepMonitor`'s join.
+    let _sleep_exit_guard = SleepExitGuard(Arc::clone(&sleep_exit));
 
     // From here on the TUI owns the terminal: background warnings must not write to stderr.
     crate::error::set_stderr_warnings(false);
@@ -1222,19 +1248,34 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
             if signal_lock.swap(false, Ordering::SeqCst) {
                 app.emergency_lock("emergency lock (omavault lock)");
             }
-            app.on_tick();
-
-            if app.should_quit || signal_quit.load(Ordering::SeqCst) {
+            // Quit must win over a queued `UnlockOutcome` sitting in the channel. `on_tick`
+            // adopts that outcome and would move the mode to `Normal`, skipping the exit lock.
+            let signal_quit_now = signal_quit.load(Ordering::SeqCst);
+            if preempt_unlock_on_quit(&mut app.mode, app.should_quit, signal_quit_now) {
+                app.quit_during_unlock = true;
+                let client = DaemonClient::new(app.cfg.socket_path.clone());
+                let _ = client.lock();
+                clear_clipboard_best_effort();
+            }
+            if app.should_quit || signal_quit_now {
                 break;
             }
+            app.on_tick();
         }
         Ok(())
     })();
 
-    // If the user cancelled/quit while an unlock was still in flight, immediately signal `omavaultd`
-    // to bump `lock_epoch` so the background unlock cannot silently leave the daemon unlocked!
-    if matches!(app.mode, Mode::Unlocking { .. }) {
-        app.cancel_unlock("quit during unlock");
+    // If quit started during unlock, lock the daemon even when the mode is no longer
+    // `Unlocking` (cancel already ran, or a queued outcome was discarded). An unlock that
+    // is still in flight is cancelled here as well.
+    if app.quit_during_unlock || matches!(app.mode, Mode::Unlocking { .. }) {
+        if matches!(app.mode, Mode::Unlocking { .. }) {
+            app.cancel_unlock("quit during unlock");
+        } else {
+            let client = DaemonClient::new(app.cfg.socket_path.clone());
+            let _ = client.lock();
+            clear_clipboard_best_effort();
+        }
     }
 
     // Overwrite ratatui screen buffer and wipe RAM before TuiGuard restores terminal & clears clipboard.
@@ -1249,6 +1290,62 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
 /// Sanitize untrusted entry strings for single-line TUI display (strips ANSI/OSC/BiDi/zero-width).
 fn sanitize_display(s: &str) -> String {
     sanitize_single_line(s)
+}
+
+/// Block until the UI thread has wiped secrets, or until process exit.
+/// There is no short timeout: logind `InhibitDelayMaxSec` bounds a stalled UI.
+fn wait_until_sleep_or_exit(done: &AtomicBool, exit_requested: &AtomicBool) {
+    while !done.load(Ordering::SeqCst) && !exit_requested.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Sets the pre-sleep exit flag on drop, including panic unwind, so `SleepMonitor`'s
+/// join cannot deadlock on a callback that is waiting for the UI thread.
+struct SleepExitGuard(Arc<AtomicBool>);
+
+impl Drop for SleepExitGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// If quit was requested during `Unlocking`, replace that mode with `Locked`.
+/// Dropping `Unlocking` sets the worker cancel flag and discards any queued outcome,
+/// so `on_tick` cannot adopt it. Returns whether a preemption happened.
+fn preempt_unlock_on_quit(mode: &mut Mode, should_quit: bool, signal_quit: bool) -> bool {
+    if !(should_quit || signal_quit) || !matches!(mode, Mode::Unlocking { .. }) {
+        return false;
+    }
+    *mode = Mode::Locked {
+        passphrase_input: Zeroizing::new(String::with_capacity(256)),
+        error_msg: Some("quit during unlock".into()),
+    };
+    true
+}
+
+/// Lock-screen factor text for v2 slots. Labels come from the unauthenticated header,
+/// so they are sanitized before display.
+fn fido2_factor_label(header: &VaultHeader) -> String {
+    let count = header.fido2_slots.len();
+    let noun = if count == 1 { "key" } else { "keys" };
+    let labels = header
+        .fido2_labels()
+        .into_iter()
+        .map(sanitize_display)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("FIDO2 ({count} {noun}: {labels})")
+}
+
+/// Reveal text for a password. Dangerous characters are not stripped into a different
+/// password than the one `y` copies; the line says to copy instead.
+fn revealed_password_text(password: &str) -> String {
+    if password.chars().any(is_dangerous_display_char) {
+        HIDDEN_DANGEROUS_PASSWORD.to_string()
+    } else {
+        sanitize_display(password)
+    }
 }
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
@@ -1343,12 +1440,7 @@ fn draw_locked_screen(
         factors.push("Keyfile".to_string());
     }
     if header.version == VAULT_VERSION_V2 && !header.fido2_slots.is_empty() {
-        let count = header.fido2_slots.len();
-        let noun = if count == 1 { "key" } else { "keys" };
-        factors.push(format!(
-            "FIDO2 ({count} {noun}: {})",
-            header.fido2_labels().join(", ")
-        ));
+        factors.push(fido2_factor_label(header));
     } else if header.requires_fido2() {
         factors.push("FIDO2 Hardware Touch".to_string());
     }
@@ -1575,7 +1667,7 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
     let bits = estimate_entropy_bits(&entry.password);
     let label = strength_label(bits);
     let pw_display = if app.reveal_password {
-        sanitize_display(&entry.password)
+        revealed_password_text(&entry.password)
     } else if entry.password.is_empty() {
         "(empty)".to_string()
     } else {
@@ -2133,5 +2225,121 @@ mod tests {
         gen.regenerate();
         assert!(gen.error.is_none());
         assert_eq!(gen.preview.chars().count(), gen.length);
+    }
+
+    #[test]
+    fn quit_during_unlock_discards_queued_outcome_and_sets_cancel_flag() {
+        let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        tx.send(UnlockOutcome::Daemon {
+            vault: Vault::new(),
+            revision: "rev".into(),
+            mlocked: false,
+        })
+        .unwrap();
+        let mut mode = Mode::Unlocking {
+            started_at: Instant::now(),
+            requires_fido2: false,
+            rx,
+            _cancel: CancelOnDrop(Arc::clone(&cancelled)),
+        };
+
+        // The outcome is already queued, which is the window where `on_tick` would
+        // call `finish_unlock` and move to `Normal`.
+        assert!(preempt_unlock_on_quit(&mut mode, true, false));
+        assert!(
+            !matches!(mode, Mode::Normal),
+            "quit must not adopt the queued unlock"
+        );
+        assert!(matches!(mode, Mode::Locked { .. }));
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "leaving Unlocking must set the worker cancel flag"
+        );
+
+        // A still-in-flight unlock with quit not requested is left alone, outcome intact.
+        let (tx2, rx2) = mpsc::channel();
+        let cancelled2 = Arc::new(AtomicBool::new(false));
+        tx2.send(UnlockOutcome::Error("nope".into())).unwrap();
+        let mut still = Mode::Unlocking {
+            started_at: Instant::now(),
+            requires_fido2: false,
+            rx: rx2,
+            _cancel: CancelOnDrop(Arc::clone(&cancelled2)),
+        };
+        assert!(!preempt_unlock_on_quit(&mut still, false, false));
+        assert!(!cancelled2.load(Ordering::SeqCst));
+        assert!(matches!(still, Mode::Unlocking { .. }));
+        if let Mode::Unlocking { rx, .. } = &still {
+            assert!(matches!(rx.try_recv(), Ok(UnlockOutcome::Error(_))));
+        }
+    }
+
+    #[test]
+    fn pre_sleep_wait_follows_done_or_exit_not_a_short_timeout() {
+        let done = AtomicBool::new(false);
+        let exit = AtomicBool::new(false);
+        let started = Instant::now();
+        exit.store(true, Ordering::SeqCst);
+        wait_until_sleep_or_exit(&done, &exit);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let done = AtomicBool::new(true);
+        let exit = AtomicBool::new(false);
+        let started = Instant::now();
+        wait_until_sleep_or_exit(&done, &exit);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // No fixed cap: the waiter stays blocked across what used to be a 2 s timeout
+        // until one of the two flags is set.
+        let done = Arc::new(AtomicBool::new(false));
+        let exit = Arc::new(AtomicBool::new(false));
+        let done_t = Arc::clone(&done);
+        let exit_t = Arc::clone(&exit);
+        let handle = thread::spawn(move || wait_until_sleep_or_exit(&done_t, &exit_t));
+        thread::sleep(Duration::from_millis(50));
+        assert!(!handle.is_finished());
+        done.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_status_poll_is_bounded_well_under_the_ipc_frame_deadline() {
+        assert_eq!(DAEMON_STATUS_POLL, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn lock_screen_fido2_labels_are_sanitized() {
+        use crate::crypto::fido2::Fido2Metadata;
+        use crate::crypto::kdf::KdfParams;
+        use crate::crypto::Fido2KeySlot;
+
+        let mut header = VaultHeader::new_v2_fido2_shell(KdfParams::default(), false).unwrap();
+        header.fido2_slots.push(Fido2KeySlot {
+            label: "primary\u{202e}evil".into(),
+            fido2: Fido2Metadata {
+                rp_id: "omavault.local".into(),
+                credential_id_b64: String::new(),
+                hmac_salt_b64: String::new(),
+                require_uv: false,
+            },
+            wrap_nonce_b64: String::new(),
+            wrapped_key_b64: String::new(),
+        });
+        let line = fido2_factor_label(&header);
+        assert!(!line.contains('\u{202e}'));
+        assert!(line.contains("primaryevil"));
+        assert!(line.contains("FIDO2 (1 key:"));
+    }
+
+    #[test]
+    fn reveal_does_not_show_a_stripped_password() {
+        let clean = revealed_password_text("correct horse");
+        assert_eq!(clean, "correct horse");
+
+        let spoofed = revealed_password_text("secret\u{202e}terces");
+        assert_eq!(spoofed, HIDDEN_DANGEROUS_PASSWORD);
+        assert!(!spoofed.contains('\u{202e}'));
+        assert!(!spoofed.contains("secret"));
     }
 }

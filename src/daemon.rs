@@ -1226,7 +1226,13 @@ impl DaemonClient {
     }
 
     pub fn status(&self) -> Result<DaemonStatus> {
-        match self.request(&DaemonRequest::Status)? {
+        self.status_timeout(IPC_FRAME_DEADLINE)
+    }
+
+    /// Like [`Self::status`], but the response read is bounded by `response_deadline`.
+    /// The TUI watchdog uses a short bound so a wedged socket cannot stall the UI thread.
+    pub fn status_timeout(&self, response_deadline: Duration) -> Result<DaemonStatus> {
+        match self.request_with_deadline(&DaemonRequest::Status, response_deadline)? {
             DaemonResponse::Status(s) => Ok(s),
             DaemonResponse::Error { message } => Err(VaultError::Daemon(message)),
             _ => Err(VaultError::Daemon("unexpected response to status".into())),
