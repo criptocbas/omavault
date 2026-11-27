@@ -6,17 +6,17 @@ A bulletproof, memory-hardened, keyboard-first password manager crafted in Rust 
 
 | Layer | Technology | Protection |
 |---|---|---|
-| **Password KDF** | **Argon2id** (`128 MiB` RAM, `t=4`, `p=4`, enforced `64 MiB`/`t=3` floor) | Resists GPU/ASIC brute-force & blocks header downgrade attacks |
-| **Multi-Factor Combiner** | **HKDF-SHA512** (domain-separated `PW` + `KF` + `F2`) | Combines master passphrase + optional 512-bit keyfile + optional FIDO2/YubiKey `hmac-secret` |
+| **Password KDF** | **Argon2id** (`128 MiB` RAM, `t=4`, `p=4`, enforced `64 MiB`/`t=3` floor, `1 GiB`/`t=16` ceiling) | Resists GPU/ASIC brute-force & blocks header downgrade / DoS attacks |
+| **Multi-Key Hardware 2FA** | **`OMAV` v2 Key Slots (`1..=8` YubiKeys)** via `libfido2` `hmac-secret` + HKDF-SHA512 + XChaCha20-Poly1305 | Every unlock requires **both** master passphrase + physical YubiKey touch; add backup keys (`fido2 add`), revoke lost keys with automatic `master_key` + `kdf_salt` rotation (`fido2 remove`), and strict CBOR `rpIdHash` + `UP`/`UV`/`AT`/`ED` verification |
 | **Per-Save Key Rotation** | **HKDF-SHA512** (`master_key`, fresh 32-byte `save_salt`) | Every single save uses a brand-new 256-bit encryption subkey |
 | **Authenticated Encryption** | **XChaCha20-Poly1305** (256-bit key, fresh 192-bit nonce, full-header AAD) | Constant-time software AEAD with zero nonce-collision risk; any 1-bit tamper fails MAC |
 | **Traffic / Size Privacy** | **4 KiB CSPRNG random padding** inside AEAD ciphertext | Hides entry lengths and minor edit sizes |
-| **RAM Hardening** | `mmap` + `mlock` + `MADV_DONTDUMP` + `MADV_WIPEONFORK` + `mprotect(PROT_NONE)` + `zeroize` | Master key never swaps to disk, never dumps, wipes on fork, and stays unreadable (`PROT_NONE`) when idle |
-| **Process Hardening** | `prctl(PR_SET_DUMPABLE, 0)`, `RLIMIT_CORE=0`, `umask(0o077)` | Blocks non-root `ptrace` attachment and core dumps from line 1 of `main()` |
-| **Omarchy Clipboard Shield** | Native Wayland **`wl-clipboard-rs` `sensitive(true)`** (`x-kde-passwordManagerHint`) | Excludes copied passwords from Omarchy's universal clipboard history (`Super + Ctrl + V`), supports `--paste-once`, and safely auto-clears after 15s |
-| **Auto-Lock Daemon** | `omavaultd` over `0600` `$XDG_RUNTIME_DIR` socket with `SO_PEERCRED` UID verification | Locks & wipes RAM automatically on inactivity timeout, **Omarchy/Hyprland session lock (`ext-session-lock` IPC + `hyprlock`)**, **lid-close/suspend** (`CLOCK_BOOTTIME - CLOCK_MONOTONIC` skew), or `Super + Ctrl + Shift + L` |
-| **Hyprland Screen Privacy** | `no_screen_share = true` (Lua) / `windowrule = no_screen_share on` | Blocks screen-sharing portals & screenshots from capturing the floating TUI window |
-| **Disk Durability** | `0700` dir / `0600` temp file + `fsync` + atomic `rename` + encrypted `.bak.1..5` | Crash-safe writes; vault is never world-readable or half-written |
+| **RAM Hardening** | `mmap` + `mlock` + `MADV_DONTDUMP` + `MADV_WIPEONFORK` + `mprotect(PROT_NONE)` + exact-size `Zeroizing` buffers | Master key never swaps to disk, never dumps, wipes on fork, stays `PROT_NONE` when idle, and avoids unzeroized heap reallocations |
+| **Process & Sandbox Hardening** | `prctl(PR_SET_DUMPABLE, 0)`, `RLIMIT_CORE=0`, `umask(0o077)`, `overflow-checks = true`, `systemd` `SystemCallFilter` seccomp + `MemoryDenyWriteExecute` | Blocks non-root `ptrace`, core dumps, W^X JIT, and disallowed syscalls from line 1 of `main()` |
+| **Omarchy Clipboard Shield** | Native Wayland **`wl-clipboard-rs` `sensitive(true)`** (`x-kde-passwordManagerHint`) | Excludes copied secrets from Omarchy 4.5's `omarchy.clipboard` (`Super + Ctrl + V`), supports `--paste-once`, and fail-closed auto-clears after 15s or on lock |
+| **Auto-Lock Daemon** | `omavaultd` over `0600` `$XDG_RUNTIME_DIR` socket with mutual `SO_PEERCRED` UID verification & priority control lane | Locks & wipes RAM automatically on inactivity timeout, **Omarchy/Hyprland `ext-session-lock` IPC**, **pre-sleep/hibernate (`systemd-logind` `PrepareForSleep`)**, **post-wake `CLOCK_BOOTTIME` skew**, `SIGUSR1`, or `Super + Ctrl + Shift + L` |
+| **Hyprland & Terminal Privacy** | `no_screen_share = true`, `stay_focused = true`, `foot` with `scrollback.lines=0`, `main.selection-target=none`, `security.osc52=disabled` | Blocks screenshots & screen-sharing portals from capturing the TUI and prevents secrets from leaking into scrollback, primary selection, or OSC-52 |
+| **Disk Durability** | `0700` dir / `0600` temp file + `O_NOFOLLOW | O_NONBLOCK` + revision-checked `flock` + `fsync` + atomic `rename` + encrypted `.bak.1..5` | Crash-safe, concurrency-safe writes; old-key backups are automatically purged on `rekey` and `fido2 remove` |
 
 ---
 
@@ -28,7 +28,12 @@ chmod +x omarchy/install.sh
 ./omarchy/install.sh
 ```
 
-Or build an Arch package with `makepkg -si` inside `omarchy/`.
+Or — **recommended for maximum hardening** — build and install as a root-owned Arch package (`/usr/bin/omavault` and `/usr/lib/systemd/user/omavaultd.service`) so unprivileged same-user processes cannot modify the binary:
+
+```bash
+cd omarchy
+makepkg -si
+```
 
 ### Omarchy 4.5+ (Lua Hyprland config)
 
@@ -38,7 +43,11 @@ Add this single line to `~/.config/hypr/hyprland.lua`:
 require("hypr.omavault")
 ```
 
-Then validate with `hyprctl reload && hyprctl configerrors`. The Lua module launches `omavault tui` in `foot` (with `scrollback.lines=0`, falling back to `ghostty`/`alacritty`) and rebinds `Super + Shift + /` (`SUPER + SHIFT + SLASH`, replacing Omarchy's default 1Password shortcut) plus `Super + Ctrl + Shift + L` for instant locking. `omavaultd` automatically detects Omarchy's `omarchy-shell` lock screen over Hyprland IPC.
+Then validate with `hyprctl reload && hyprctl configerrors`. The Lua module:
+- Launches `omavault tui` in `foot` with scrollback, primary selection, and OSC-52 clipboard writes all disabled (falling back cleanly to hardened `ghostty` / `alacritty`).
+- Applies `float = true`, `center = true`, `stay_focused = true`, and `no_screen_share = true` to `^org\.omarchy\.omavault$`.
+- Rebinds **`Super + Shift + /`** (`SUPER + SHIFT + SLASH`, replacing Omarchy's default 1Password shortcut) to open `omavault`, and binds **`Super + Ctrl + Shift + L`** to lock immediately.
+- `omavaultd` automatically detects Omarchy's `omarchy-shell` lock screen over Hyprland IPC and pre-sleep events via `systemd-logind`.
 
 ### Legacy Hyprland (`.conf`)
 
@@ -48,9 +57,9 @@ Add this single line to `~/.config/hypr/hyprland.conf`:
 source = ~/.config/hypr/omavault.conf
 ```
 
-Optionally, add the lock hooks from `omarchy/hypridle-hook.conf` to `~/.config/hypr/hypridle.conf` for instantaneous pre-sleep locking.
+Optionally, add the lock hooks from `omarchy/hypridle-hook.conf` to `~/.config/hypr/hypridle.conf`.
 
-For **YubiKey / FIDO2 hardware 2FA**, install `libfido2`:
+For **YubiKey / FIDO2 hardware 2FA**, ensure `libfido2` is installed:
 
 ```bash
 sudo pacman -S libfido2
@@ -77,12 +86,15 @@ omavault init --fido2 --fido2-label primary
 omavault fido2 add --label backup
 omavault fido2 list
 
-# Remove a lost/stolen YubiKey using your remaining key
-omavault fido2 remove backup --purge-old-backups
+# Revoke a lost/stolen YubiKey using your remaining key
+# (rotates vault_master_key + kdf_salt and purges old-key backups by default)
+omavault fido2 remove backup
 
 # Maximum paranoia: Triple-factor (Passphrase + Keyfile + YubiKey FIDO2)
 omavault init --keyfile /run/media/$USER/USB/omavault.key --fido2 --fido2-label primary
 ```
+
+> **Backup tip:** Enrolling 2 YubiKeys protects against losing a YubiKey. Back up `~/.local/share/omavault/vault.omav` offline or to cloud storage to also protect against laptop loss/SSD failure — the file is authenticated XChaCha20-Poly1305 + Argon2id + YubiKey-bound ciphertext.
 
 ### 2. Launch the Omarchy TUI
 
@@ -98,7 +110,7 @@ omavault
 - `y` — copy password to Wayland secret clipboard (invisible to Omarchy clipboard history, clears in 15s)
 - `u` — copy username (secret-tagged)
 - `t` — copy live 2FA TOTP code (secret-tagged)
-- `r` — toggle password visibility in inspector
+- `r` — toggle password & sensitive notes visibility in inspector (`Ctrl+R` inside editor)
 - `a` / `e` / `d` — add / edit / delete entry (`Ctrl+G` inside editor generates a 24-char CSPRNG password)
 - `g` — CSPRNG password & Diceware passphrase generator
 - `A` — local password security audit (weak, reused, stale, missing 2FA)
@@ -117,20 +129,21 @@ omavault get github.com --copy --paste-once
 # Get live TOTP code
 omavault totp github.com --copy
 
-# Generate a 10-word Diceware passphrase
-omavault gen --passphrase --words 10 --copy
+# Generate a 12-word Diceware passphrase (105.6 bits entropy; min 10 words)
+omavault gen --passphrase --words 12 --copy
 
 # Run local security audit
 omavault audit
 
-# Rotate master passphrase / upgrade Argon2id memory to 256 MiB / enroll FIDO2 & purge old-key backups
-omavault rekey --mem-mib 256 --enable-fido2 --purge-old-backups
+# Rotate master passphrase / upgrade Argon2id memory to 256 MiB / enroll FIDO2
+# (automatically purges old-key backups after verifying the new vault; pass --keep-old-backups to retain them)
+omavault rekey --mem-mib 256 --enable-fido2
 
-# Check hardening, crypto parameters, and daemon status
+# Check process & daemon hardening, crypto parameters, enrolled YubiKeys, and daemon status
 omavault status
 
-# Lock immediately
+# Lock immediately (exits non-zero if a running daemon fails to lock)
 omavault lock
 ```
 
-See [SECURITY.md](SECURITY.md) for the complete binary specification, key hierarchy, and threat model.
+See [SECURITY.md](SECURITY.md) for the complete binary specification, key hierarchy, FIDO2 verification model, and threat model.
