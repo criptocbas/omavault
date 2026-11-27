@@ -13,6 +13,7 @@ use omavault::vault::rollback::RollbackStore;
 use omavault::vault::storage::{
     create_new_vault_on_disk, ensure_private_dir_strict, load_vault_from_disk,
     purge_encrypted_backups, read_header_from_disk, save_vault_to_disk_checked,
+    save_vault_with_rollback,
 };
 use omavault::vault::{Entry, Vault};
 use tempfile::TempDir;
@@ -139,9 +140,16 @@ fn rollback_store_detects_restore_swap_and_downgrade() {
         Err(VaultError::RollbackDetected(_))
     ));
 
-    // --allow-rollback accepts once and resets the record.
+    // --allow-rollback accepts this open and does not lower the watermark.
     store.check(&vpath, &old, true).unwrap();
-    store.check(&vpath, &old, false).unwrap();
+    assert!(
+        matches!(
+            store.check(&vpath, &old, false),
+            Err(VaultError::RollbackDetected(_))
+        ),
+        "allow-rollback must not make the older generation the new baseline"
+    );
+    store.check(&vpath, &v, false).unwrap();
 
     // Records are private.
     let mode = fs::metadata(dir.path().join("seen"))
@@ -149,6 +157,157 @@ fn rollback_store_detects_restore_swap_and_downgrade() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o077, 0);
+}
+
+fn seen_record_file(store_dir: &std::path::Path) -> std::path::PathBuf {
+    fs::read_dir(store_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.is_file()
+                && !p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .ends_with(".lock")
+        })
+        .expect("seen record")
+}
+
+#[test]
+fn corrupt_nonempty_seen_record_is_not_treated_as_unseen() {
+    let dir = TempDir::new().unwrap();
+    let store_dir = dir.path().join("seen");
+    let store = RollbackStore::in_dir(&store_dir);
+    let vpath = dir.path().join("vault.omav");
+    fs::write(&vpath, b"ciphertext-a").unwrap();
+    let mut vault = Vault::new();
+    vault.generation = 4;
+    store.check(&vpath, &vault, false).unwrap();
+
+    let record = seen_record_file(&store_dir);
+    fs::write(&record, b"{not-json").unwrap();
+
+    let mut older = vault.clone();
+    older.generation = 1;
+    let err = store.check(&vpath, &older, false).unwrap_err();
+    assert!(
+        !matches!(err, VaultError::RollbackDetected(_)),
+        "a corrupt record must not be read as a normal generation mismatch"
+    );
+    assert!(
+        err.to_string().contains("corrupt"),
+        "corrupt record must be an error, not a first open: {err}"
+    );
+    assert_eq!(
+        fs::read(&record).unwrap(),
+        b"{not-json",
+        "opening must not replace a corrupt record with the vault just opened"
+    );
+    assert!(store.check(&vpath, &vault, false).is_err());
+    assert_eq!(fs::read(&record).unwrap(), b"{not-json");
+
+    // An empty record is still "nothing seen yet" and may be initialized.
+    fs::write(&record, b" \n").unwrap();
+    store.check(&vpath, &vault, false).unwrap();
+    let rewritten = fs::read_to_string(&record).unwrap();
+    assert!(
+        rewritten.contains("\"max_generation\":4"),
+        "empty record should be initialized, got {rewritten}"
+    );
+}
+
+#[test]
+fn allow_rollback_does_not_lower_watermark_or_allow_replay_after_save() {
+    let dir = TempDir::new().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let store = RollbackStore::in_dir(dir.path().join("seen"));
+    let path = dir.path().join("vault.omav");
+    let (mut hdr, key, mut vault) = new_vault_on_disk(&path);
+    assert_eq!(vault.generation, 1);
+    store.record(&path, &vault).unwrap();
+    let gen1 = fs::read(&path).unwrap();
+
+    save_vault_with_rollback(
+        &path,
+        &key,
+        &mut hdr,
+        &mut vault,
+        None,
+        false,
+        true,
+        Some(&store),
+    )
+    .unwrap();
+    assert_eq!(vault.generation, 2);
+    store.record(&path, &vault).unwrap();
+    let gen2 = fs::read(&path).unwrap();
+    assert_ne!(gen1, gen2);
+    assert_eq!(store.high_water(&path).unwrap(), 2);
+
+    // A different ciphertext that still claims this generation is a swap.
+    fs::write(&path, b"not-the-generation-2-ciphertext").unwrap();
+    assert!(matches!(
+        store.check(&path, &vault, false),
+        Err(VaultError::RollbackDetected(_))
+    ));
+    store.check(&path, &vault, true).unwrap();
+    assert_eq!(
+        store.high_water(&path).unwrap(),
+        2,
+        "allow-rollback must not replace the ciphertext identity"
+    );
+    fs::write(&path, &gen2).unwrap();
+    store.check(&path, &vault, false).unwrap();
+
+    // Restoring the older authentic file is allowed once and does not lower the watermark.
+    fs::write(&path, &gen1).unwrap();
+    let (mut hdr, mut old) = load_vault_from_disk(&path, &key, false).unwrap();
+    assert_eq!(old.generation, 1);
+    store.check(&path, &old, true).unwrap();
+    assert!(
+        matches!(
+            store.check(&path, &old, false),
+            Err(VaultError::RollbackDetected(_))
+        ),
+        "the older ciphertext must stay refused"
+    );
+    assert_eq!(store.high_water(&path).unwrap(), 2);
+
+    save_vault_with_rollback(
+        &path,
+        &key,
+        &mut hdr,
+        &mut old,
+        None,
+        false,
+        true,
+        Some(&store),
+    )
+    .unwrap();
+    assert_eq!(
+        old.generation, 3,
+        "the next save must be max(seen, opened) + 1"
+    );
+    store.record(&path, &old).unwrap();
+    assert_eq!(store.high_water(&path).unwrap(), 3);
+    let gen3 = fs::read(&path).unwrap();
+
+    fs::write(&path, &gen1).unwrap();
+    let (_, replay1) = load_vault_from_disk(&path, &key, false).unwrap();
+    assert!(matches!(
+        store.check(&path, &replay1, false),
+        Err(VaultError::RollbackDetected(_))
+    ));
+    fs::write(&path, &gen2).unwrap();
+    let (_, replay2) = load_vault_from_disk(&path, &key, false).unwrap();
+    assert!(matches!(
+        store.check(&path, &replay2, false),
+        Err(VaultError::RollbackDetected(_))
+    ));
+    fs::write(&path, &gen3).unwrap();
+    let (_, current) = load_vault_from_disk(&path, &key, false).unwrap();
+    store.check(&path, &current, false).unwrap();
 }
 
 // ------------------------------------------------------------------ 3.1 input validation
@@ -395,8 +554,15 @@ fn e2e_restoring_an_older_vault_copy_is_refused() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Accepted once; the record is reset so normal use continues.
-    assert!(get(&[]).status.success());
+    // Accepted for this open only. The high-water mark stays, so a later open
+    // of the same restored file is still refused.
+    let out = get(&[]);
+    assert!(
+        !out.status.success(),
+        "allow-rollback must not permanently lower the watermark: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ROLLBACK DETECTED"));
 }
 
 #[test]

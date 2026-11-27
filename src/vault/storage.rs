@@ -16,6 +16,7 @@ use crate::crypto::{
 };
 use crate::error::{Result, VaultError};
 use crate::hardening::{fill_random, CountingWriter, LockedKey};
+use crate::vault::rollback::{next_save_generation, RollbackStore};
 use crate::vault::Vault;
 
 const MAX_BACKUPS: usize = 5;
@@ -259,14 +260,19 @@ fn atomic_write_unlocked(
         tmp_guard.disarm();
     }
 
-    if let Ok(dir_file) = OpenOptions::new()
+    // A failed directory sync means the new name may not survive a crash. Surface that
+    // to rekey / fido2 remove so they do not purge the old-key backups.
+    sync_parent_dir(parent)?;
+
+    Ok(())
+}
+
+fn sync_parent_dir(parent: &Path) -> Result<()> {
+    let dir_file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(parent)
-    {
-        let _ = dir_file.sync_all();
-    }
-
+        .open(parent)?;
+    dir_file.sync_all()?;
     Ok(())
 }
 
@@ -432,6 +438,31 @@ pub fn save_vault_to_disk_checked(
     enforce_kdf_policy: bool,
     create_backup: bool,
 ) -> Result<()> {
+    save_vault_with_rollback(
+        path,
+        master_key,
+        header,
+        vault,
+        expected_revision,
+        enforce_kdf_policy,
+        create_backup,
+        None,
+    )
+}
+
+/// Like [`save_vault_to_disk_checked`], but stamp the generation from `rollback` when the
+/// caller (the daemon) is not using the process-wide state directory.
+#[allow(clippy::too_many_arguments)] // same arguments as `save_vault_to_disk_checked`, plus the store
+pub fn save_vault_with_rollback(
+    path: &Path,
+    master_key: &LockedKey<32>,
+    header: &mut VaultHeader,
+    vault: &mut Vault,
+    expected_revision: Option<&str>,
+    enforce_kdf_policy: bool,
+    create_backup: bool,
+    rollback: Option<&RollbackStore>,
+) -> Result<()> {
     let parent = resolve_parent(path)?;
     ensure_private_dir(parent)?;
     let _lock = FileLockGuard::acquire(path)?;
@@ -445,7 +476,8 @@ pub fn save_vault_to_disk_checked(
         }
     }
 
-    let restore = stamp_generation(vault);
+    let seen_max = observed_high_water(path, rollback)?;
+    let restore = stamp_generation(vault, seen_max);
     let written = (|| -> Result<VaultHeader> {
         let plaintext = serialize_vault_exact(vault)?;
         let mut next_header = header.clone();
@@ -478,14 +510,25 @@ impl GenerationRestore {
     }
 }
 
-/// Assign a vault ID if missing and bump the monotonic generation for this save.
-fn stamp_generation(vault: &mut Vault) -> GenerationRestore {
+/// Highest generation already published for `path` (0 when this path has no record).
+fn observed_high_water(path: &Path, rollback: Option<&RollbackStore>) -> Result<u64> {
+    if let Some(store) = rollback {
+        return store.high_water(path);
+    }
+    match RollbackStore::from_env() {
+        Some(store) => store.high_water(path),
+        None => Ok(0),
+    }
+}
+
+/// Assign a vault ID if missing and stamp `max(seen, current) + 1`.
+fn stamp_generation(vault: &mut Vault, seen_max: u64) -> GenerationRestore {
     let restore = GenerationRestore {
         vault_id: vault.vault_id,
         generation: vault.generation,
     };
     vault.vault_id.get_or_insert_with(uuid::Uuid::new_v4);
-    vault.generation = vault.generation.saturating_add(1);
+    vault.generation = next_save_generation(seen_max, vault.generation);
     restore
 }
 
@@ -516,7 +559,8 @@ pub fn create_new_vault_on_disk(
         return Err(VaultError::VaultAlreadyExists(path.display().to_string()));
     }
 
-    let restore = stamp_generation(vault);
+    let seen_max = observed_high_water(path, None)?;
+    let restore = stamp_generation(vault, seen_max);
     let written = (|| -> Result<VaultHeader> {
         let plaintext = serialize_vault_exact(vault)?;
         let mut next_header = header.clone();
@@ -670,4 +714,22 @@ pub fn generate_keyfile(path: &Path) -> Result<()> {
 #[allow(dead_code)]
 fn _os_bytes(s: OsString) -> Vec<u8> {
     s.into_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_dir_sync_failure_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        fs::write(&file, b"x").unwrap();
+        let err = sync_parent_dir(&file).unwrap_err();
+        assert!(
+            matches!(err, VaultError::Io(_)),
+            "directory fsync errors must propagate, got {err}"
+        );
+        sync_parent_dir(dir.path()).expect("a real directory syncs");
+    }
 }

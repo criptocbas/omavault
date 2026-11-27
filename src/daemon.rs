@@ -26,7 +26,7 @@ use crate::sleep::{SleepMonitor, SleepMonitorState};
 use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault, RollbackStore};
 use crate::vault::storage::{
     ensure_private_dir, ensure_private_dir_strict, load_vault_from_disk, read_header_from_disk,
-    save_vault_to_disk_checked,
+    save_vault_with_rollback,
 };
 use crate::vault::Vault;
 
@@ -1090,7 +1090,8 @@ fn handle_heavy_request(
                 .clone()
                 .unwrap_or_else(|| header_revision(&header_copy));
 
-            match save_vault_to_disk_checked(
+            let rollback = rollback_store(state);
+            match save_vault_with_rollback(
                 &canonical,
                 &key_clone,
                 &mut header_copy,
@@ -1098,10 +1099,11 @@ fn handle_heavy_request(
                 Some(&effective_rev),
                 enforce_kdf_policy,
                 true,
+                rollback.as_ref(),
             ) {
                 Ok(()) => {
                     let revision = header_revision(&header_copy);
-                    record_saved_vault(rollback_store(state).as_ref(), &canonical, vault);
+                    record_saved_vault(rollback.as_ref(), &canonical, vault);
                     if let Ok(mut guard) = state.lock() {
                         if guard.lock_epoch == start_epoch {
                             if let Some(session) = guard.session.as_mut() {
