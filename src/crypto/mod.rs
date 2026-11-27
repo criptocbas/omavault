@@ -406,7 +406,9 @@ impl VaultHeader {
             ));
         }
         let ct_len = data.len() - header_len;
-        if ct_len > MAX_CIPHERTEXT_SIZE || (ct_len - AEAD_TAG_LEN) % PADDING_BLOCK_SIZE != 0 {
+        if ct_len > MAX_CIPHERTEXT_SIZE
+            || !(ct_len - AEAD_TAG_LEN).is_multiple_of(PADDING_BLOCK_SIZE)
+        {
             return Err(VaultError::InvalidFormat(
                 "invalid vault ciphertext length or alignment".into(),
             ));
@@ -774,7 +776,7 @@ pub fn open_vault(
             .map_err(|_| VaultError::AuthenticationFailed)?,
     );
 
-    if frame.len() < 4 || frame.len() % PADDING_BLOCK_SIZE != 0 {
+    if frame.len() < 4 || !frame.len().is_multiple_of(PADDING_BLOCK_SIZE) {
         return Err(VaultError::InvalidFormat(
             "decrypted frame invalid alignment".into(),
         ));
