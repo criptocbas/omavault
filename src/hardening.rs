@@ -796,7 +796,7 @@ fn is_hyprland_session_locked(target_uid: u32) -> bool {
                 Some((modified, sock))
             })
             .collect();
-        discovered.sort_by(|a, b| b.0.cmp(&a.0));
+        discovered.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         for (_, sock) in discovered.into_iter().take(4) {
             if !candidates.contains(&sock) {
                 candidates.push(sock);

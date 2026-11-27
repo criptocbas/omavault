@@ -412,21 +412,23 @@ enum VaultSession {
     Standalone {
         vault_path: PathBuf,
         master_key: LockedKey<32>,
-        header: VaultHeader,
-        vault: Vault,
+        header: Box<VaultHeader>,
+        vault: Box<Vault>,
     },
 }
 
 impl VaultSession {
     fn vault(&self) -> &Vault {
         match self {
-            Self::Daemon { vault, .. } | Self::Standalone { vault, .. } => vault,
+            Self::Daemon { vault, .. } => vault,
+            Self::Standalone { vault, .. } => vault.as_ref(),
         }
     }
 
     fn vault_mut(&mut self) -> &mut Vault {
         match self {
-            Self::Daemon { vault, .. } | Self::Standalone { vault, .. } => vault,
+            Self::Daemon { vault, .. } => vault,
+            Self::Standalone { vault, .. } => vault.as_mut(),
         }
     }
 
@@ -1949,8 +1951,8 @@ fn open_session(
     Ok(VaultSession::Standalone {
         vault_path: vault_path.to_path_buf(),
         master_key: res.master_key,
-        header: verified_header,
-        vault,
+        header: Box::new(verified_header),
+        vault: Box::new(vault),
     })
 }
 
