@@ -362,8 +362,15 @@ fn stale_revision_is_still_rejected_and_header_untouched() {
     .unwrap();
 
     let before = hdr.to_bytes().unwrap();
-    let err =
-        save_vault_to_disk_checked(&path, &key, &mut hdr, &mut vault, Some(&stale_rev), false, true);
+    let err = save_vault_to_disk_checked(
+        &path,
+        &key,
+        &mut hdr,
+        &mut vault,
+        Some(&stale_rev),
+        false,
+        true,
+    );
     assert!(err.is_err(), "stale revision must be rejected");
     assert_eq!(
         hdr.to_bytes().unwrap(),
@@ -384,7 +391,8 @@ fn failed_write_leaves_caller_header_in_sync_with_disk() {
 
     // Make the directory read-only so creating the temp file fails (e.g. like ENOSPC/EROFS).
     fs::set_permissions(&vdir, fs::Permissions::from_mode(0o500)).unwrap();
-    let res = save_vault_to_disk_checked(&path, &key, &mut hdr, &mut vault, Some(&rev), false, true);
+    let res =
+        save_vault_to_disk_checked(&path, &key, &mut hdr, &mut vault, Some(&rev), false, true);
     fs::set_permissions(&vdir, fs::Permissions::from_mode(0o700)).unwrap();
 
     if unsafe { libc::geteuid() } == 0 {

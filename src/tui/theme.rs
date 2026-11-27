@@ -51,7 +51,5 @@ pub fn warn_style() -> Style {
 }
 
 pub fn danger_style() -> Style {
-    Style::default()
-        .fg(ACCENT_RED)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD)
 }

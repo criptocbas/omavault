@@ -215,8 +215,13 @@ pub fn derive_passphrase_hash(
         params.validate_upper_bounds()?;
     }
 
-    let argon2_params = Params::new(params.mem_kib, params.time_cost, params.parallelism, Some(32))
-        .map_err(|e| VaultError::Crypto(format!("invalid Argon2id params: {e}")))?;
+    let argon2_params = Params::new(
+        params.mem_kib,
+        params.time_cost,
+        params.parallelism,
+        Some(32),
+    )
+    .map_err(|e| VaultError::Crypto(format!("invalid Argon2id params: {e}")))?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
     let mut pw_hash = Zeroizing::new([0u8; 32]);
@@ -319,7 +324,12 @@ pub fn derive_payload_key(
 /// `hkdf`/`hmac` 0.12 do not zeroize their internal state (the PRK and HMAC pads — equivalent to
 /// key material). The computation runs in a dedicated non-inlined frame, and the stack region it
 /// used is scrubbed immediately after it returns.
-fn hkdf_sha512(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) -> std::result::Result<(), ()> {
+fn hkdf_sha512(
+    salt: &[u8],
+    ikm: &[u8],
+    info: &[u8],
+    out: &mut [u8],
+) -> std::result::Result<(), ()> {
     let result = hkdf_sha512_frame(salt, ikm, info, out);
     crate::hardening::scrub_stack();
     result

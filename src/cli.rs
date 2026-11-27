@@ -1,9 +1,9 @@
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
@@ -38,16 +38,17 @@ use crate::procsig::signal_registered_tuis;
 use crate::totp::TotpConfig;
 use crate::tui::{run_tui, TuiConfig};
 use crate::vault::audit::run_audit;
-use crate::vault::storage::{
-    default_vault_path, generate_keyfile, load_vault_from_disk, purge_encrypted_backups,
-    create_new_vault_on_disk, read_header_from_disk, save_vault_to_disk_checked,
-    verify_saved_vault,
-};
 use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault};
+use crate::vault::storage::{
+    create_new_vault_on_disk, default_vault_path, generate_keyfile, load_vault_from_disk,
+    purge_encrypted_backups, read_header_from_disk, save_vault_to_disk_checked, verify_saved_vault,
+};
 use crate::vault::{Entry, Vault};
 
 fn parse_clip_timeout(s: &str) -> std::result::Result<u64, String> {
-    let val: u64 = s.parse().map_err(|_| "invalid timeout integer".to_string())?;
+    let val: u64 = s
+        .parse()
+        .map_err(|_| "invalid timeout integer".to_string())?;
     if !(MIN_CLIPBOARD_TIMEOUT_SECS..=MAX_CLIPBOARD_TIMEOUT_SECS).contains(&val) {
         return Err(format!(
             "timeout must be between {MIN_CLIPBOARD_TIMEOUT_SECS} and {MAX_CLIPBOARD_TIMEOUT_SECS} seconds"
@@ -552,7 +553,10 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 } else if let Some(meta) = &header.fido2 {
                     let fp: String = meta.credential_id_b64.chars().take(12).collect();
                     println!("Legacy OMAV v1 single FIDO2 key enrolled:");
-                    println!("  1. legacy-v1            uv={}  cred={}...", meta.require_uv, fp);
+                    println!(
+                        "  1. legacy-v1            uv={}  cred={}...",
+                        meta.require_uv, fp
+                    );
                     println!(
                         "Tip: Run `omavault fido2 add --label backup` to upgrade to OMAV v2 multi-key slots."
                     );
@@ -587,8 +591,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     }
                 }
 
-                let passphrase =
-                    prompt_passphrase("Master passphrase: ", cli.passphrase_stdin)?;
+                let passphrase = prompt_passphrase("Master passphrase: ", cli.passphrase_stdin)?;
                 let kf_digest = if old_header.requires_keyfile() {
                     let p = cli.keyfile.as_deref().ok_or(VaultError::KeyfileRequired)?;
                     Some(hash_keyfile(p)?)
@@ -596,9 +599,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     None
                 };
 
-                eprintln!(
-                    "Touch an EXISTING enrolled YubiKey to authorize adding '{label}'..."
-                );
+                eprintln!("Touch an EXISTING enrolled YubiKey to authorize adding '{label}'...");
                 let res = resolve_master_key(
                     &old_header,
                     passphrase.as_bytes(),
@@ -673,10 +674,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     );
                 } else {
                     // Seamless upgrade from OMAV v1 single-key FIDO2 to OMAV v2 multi-key slots!
-                    let old_meta = old_header
-                        .fido2
-                        .clone()
-                        .ok_or(VaultError::Fido2Required)?;
+                    let old_meta = old_header.fido2.clone().ok_or(VaultError::Fido2Required)?;
                     let old_secret = res
                         .matched_fido2_secret
                         .as_ref()
@@ -778,8 +776,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     ));
                 }
 
-                let passphrase =
-                    prompt_passphrase("Master passphrase: ", cli.passphrase_stdin)?;
+                let passphrase = prompt_passphrase("Master passphrase: ", cli.passphrase_stdin)?;
                 let kf_digest = if old_header.requires_keyfile() {
                     let p = cli.keyfile.as_deref().ok_or(VaultError::KeyfileRequired)?;
                     Some(hash_keyfile(p)?)
@@ -798,9 +795,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     cli.fido2_device.as_deref(),
                     true,
                 )?;
-                let matched_idx = res
-                    .matched_slot_index
-                    .ok_or(VaultError::Fido2Required)?;
+                let matched_idx = res.matched_slot_index.ok_or(VaultError::Fido2Required)?;
                 if old_header.fido2_slots[matched_idx]
                     .label
                     .eq_ignore_ascii_case(&label)
@@ -966,7 +961,10 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     exclude_ambiguous: no_ambiguous,
                     ..PasswordOptions::default()
                 };
-                (generate_password(&opts)?, generated_password_entropy_bits(&opts))
+                (
+                    generate_password(&opts)?,
+                    generated_password_entropy_bits(&opts),
+                )
             };
             // On an interactive terminal, printing would leave the secret in scrollback, so the
             // default is the secret-tagged clipboard; pipes/scripts still get stdout.
@@ -1077,7 +1075,10 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
         Commands::Status => {
             println!("omavault version:  {}", crate::VERSION);
             println!("Process hardening: {}", hardening.summary());
-            println!("Swap exposure:     {}", tty_safe(&swap_exposure().describe()));
+            println!(
+                "Swap exposure:     {}",
+                tty_safe(&swap_exposure().describe())
+            );
             println!("Vault path:        {}", vault_path.display());
             if vault_path.exists() {
                 let header = read_header_from_disk(&vault_path, true)?;
@@ -1092,7 +1093,11 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                     format!(
                         " + FIDO2 ({} {}: {})",
                         header.fido2_slots.len(),
-                        if header.fido2_slots.len() == 1 { "key" } else { "keys" },
+                        if header.fido2_slots.len() == 1 {
+                            "key"
+                        } else {
+                            "keys"
+                        },
                         tty_safe(&header.fido2_labels().join(", "))
                     )
                 } else if header.requires_fido2() {
@@ -1102,7 +1107,11 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 };
                 println!(
                     "Required factors:  Passphrase{}{}",
-                    if header.requires_keyfile() { " + Keyfile" } else { "" },
+                    if header.requires_keyfile() {
+                        " + Keyfile"
+                    } else {
+                        ""
+                    },
                     fido_desc,
                 );
             } else {
@@ -1609,7 +1618,10 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 report.missing_totp.len()
             );
             if !report.weak_passwords.is_empty() {
-                println!("\nWeak / empty passwords ({}):", report.weak_passwords.len());
+                println!(
+                    "\nWeak / empty passwords ({}):",
+                    report.weak_passwords.len()
+                );
                 for w in &report.weak_passwords {
                     println!(
                         "  - {} ({:.0} bits · {} · len {})",
@@ -1621,14 +1633,21 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
                 }
             }
             if !report.reused_groups.is_empty() {
-                println!("\nReused passwords ({} groups):", report.reused_groups.len());
+                println!(
+                    "\nReused passwords ({} groups):",
+                    report.reused_groups.len()
+                );
                 for g in &report.reused_groups {
-                    let safe_names: Vec<String> = g.entry_names.iter().map(|n| tty_safe(n)).collect();
+                    let safe_names: Vec<String> =
+                        g.entry_names.iter().map(|n| tty_safe(n)).collect();
                     println!("  - {}", safe_names.join(", "));
                 }
             }
             if !report.stale_entries.is_empty() {
-                println!("\nPasswords older than 1 year ({}):", report.stale_entries.len());
+                println!(
+                    "\nPasswords older than 1 year ({}):",
+                    report.stale_entries.len()
+                );
                 for (name, days) in &report.stale_entries {
                     println!("  - {} ({days} days)", tty_safe(name));
                 }
@@ -1788,9 +1807,7 @@ pub fn execute(mut cli: Cli, hardening: HardeningStatus) -> Result<()> {
 
                 for (idx, old_slot) in old_header.fido2_slots.iter().enumerate() {
                     if Some(idx) == old_matched_idx {
-                        let sec = old_fido2_secret
-                            .as_ref()
-                            .ok_or(VaultError::Fido2Required)?;
+                        let sec = old_fido2_secret.as_ref().ok_or(VaultError::Fido2Required)?;
                         verify_secret = Some((old_slot.label.clone(), sec.clone()));
                         let wrapped = wrap_master_key_for_slot(
                             &hdr,
@@ -1972,11 +1989,14 @@ fn print_revealed_secret(value: &str, is_notes: bool) -> Result<()> {
 /// Read an interactive confirmation line directly from `/dev/tty`, flushing any buffered
 /// stray input (e.g. accidental YubiKey OTP keyboard bursts) first and refusing non-TTY EOF.
 fn read_clean_tty_line(prompt: &str) -> Result<String> {
-    let tty = OpenOptions::new().read(true).open("/dev/tty").map_err(|e| {
-        VaultError::Fido2Error(format!(
-            "interactive TTY (/dev/tty) required for YubiKey swap prompt: {e}"
-        ))
-    })?;
+    let tty = OpenOptions::new()
+        .read(true)
+        .open("/dev/tty")
+        .map_err(|e| {
+            VaultError::Fido2Error(format!(
+                "interactive TTY (/dev/tty) required for YubiKey swap prompt: {e}"
+            ))
+        })?;
     unsafe {
         let _ = libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH);
     }

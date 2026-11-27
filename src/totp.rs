@@ -120,7 +120,9 @@ impl TotpConfig {
     pub fn parse(input: &str) -> Result<Self> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
-            return Err(VaultError::InvalidTotp("TOTP secret cannot be empty".into()));
+            return Err(VaultError::InvalidTotp(
+                "TOTP secret cannot be empty".into(),
+            ));
         }
         let cfg = if trimmed
             .as_bytes()
@@ -413,8 +415,7 @@ mod tests {
     fn rfc6238_official_test_vectors() {
         let seed_sha1 = b"12345678901234567890";
         let seed_sha256 = b"12345678901234567890123456789012";
-        let seed_sha512 =
-            b"1234567890123456789012345678901234567890123456789012345678901234";
+        let seed_sha512 = b"1234567890123456789012345678901234567890123456789012345678901234";
 
         let vectors: &[(u64, &str, &str, &str)] = &[
             (59, "94287082", "46119246", "90693936"),

@@ -21,7 +21,9 @@ pub enum VaultError {
     #[error("KDF parameters violate security policy: {0}")]
     WeakKdfParameters(String),
 
-    #[error("authentication failed: wrong master passphrase, keyfile, hardware key, or tampered vault")]
+    #[error(
+        "authentication failed: wrong master passphrase, keyfile, hardware key, or tampered vault"
+    )]
     AuthenticationFailed,
 
     #[error("keyfile required to unlock this vault (pass --keyfile <path>)")]

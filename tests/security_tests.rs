@@ -8,9 +8,7 @@ use omavault::clipboard::validate_clipboard_timeout;
 use omavault::crypto::fido2::{
     Fido2Metadata, Fido2Provider, LibFido2Cli, MockFido2Provider, MockTrackedFido2Key,
 };
-use omavault::crypto::kdf::{
-    derive_master_key, derive_passphrase_hash, hash_keyfile, KdfParams,
-};
+use omavault::crypto::kdf::{derive_master_key, derive_passphrase_hash, hash_keyfile, KdfParams};
 use omavault::crypto::{
     generate_random_master_key, header_revision, open_vault, resolve_master_key, seal_vault,
     wrap_master_key_for_slot, VaultHeader, VAULT_VERSION_V2,
@@ -93,8 +91,15 @@ fn production_kdf_roundtrip_and_tamper_resistance() {
 fn rejects_kdf_downgrade_and_dos_upper_bounds() {
     let weak = fast_params();
     let mut header = VaultHeader::new(weak, false, None).expect("header");
-    let key = derive_master_key(b"strong-passphrase", &header.kdf_salt, weak, None, None, false)
-        .expect("key");
+    let key = derive_master_key(
+        b"strong-passphrase",
+        &header.kdf_salt,
+        weak,
+        None,
+        None,
+        false,
+    )
+    .expect("key");
     let blob = seal_vault(&key, &mut header, b"payload").expect("seal");
 
     // Production policy rejects weak KDF downgrade.
@@ -125,9 +130,15 @@ fn rejects_kdf_downgrade_and_dos_upper_bounds() {
 fn every_save_rotates_subkey_and_nonce_and_hides_length() {
     let params = fast_params();
     let mut header = VaultHeader::new(params, false, None).expect("header");
-    let key =
-        derive_master_key(b"passphrase-rotation-test", &header.kdf_salt, params, None, None, false)
-            .expect("key");
+    let key = derive_master_key(
+        b"passphrase-rotation-test",
+        &header.kdf_salt,
+        params,
+        None,
+        None,
+        false,
+    )
+    .expect("key");
 
     let blob1 = seal_vault(&key, &mut header, b"short").expect("seal1");
     let salt1 = header.save_salt;
@@ -226,8 +237,15 @@ fn atomic_disk_storage_permissions_rolling_backups_and_purge() {
 
     let params = fast_params();
     let mut header = VaultHeader::new(params, false, None).expect("header");
-    let key = derive_master_key(b"storage-test-pass", &header.kdf_salt, params, None, None, false)
-        .expect("key");
+    let key = derive_master_key(
+        b"storage-test-pass",
+        &header.kdf_salt,
+        params,
+        None,
+        None,
+        false,
+    )
+    .expect("key");
 
     let mut vault = Vault::new();
     let mut entry = Entry::new(
@@ -309,9 +327,15 @@ fn daemon_unlock_load_save_revision_conflict_and_lock_lifecycle() {
 
     let params = fast_params();
     let mut header = VaultHeader::new(params, false, None).expect("header");
-    let key =
-        derive_master_key(b"daemon-master-pass!", &header.kdf_salt, params, None, None, false)
-            .expect("key");
+    let key = derive_master_key(
+        b"daemon-master-pass!",
+        &header.kdf_salt,
+        params,
+        None,
+        None,
+        false,
+    )
+    .expect("key");
     let mut vault = Vault::new();
     save_vault_to_disk(&vault_path, &key, &mut header, &mut vault).expect("init save");
 
@@ -327,7 +351,10 @@ fn daemon_unlock_load_save_revision_conflict_and_lock_lifecycle() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(client.is_available(), "daemon socket failed to become ready");
+    assert!(
+        client.is_available(),
+        "daemon socket failed to become ready"
+    );
     assert_eq!(
         fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -410,10 +437,18 @@ fn vault_rename_collision_and_audit_empty_passwords() {
         .add_entry(Entry::new("empty-acct".into(), "u2".into(), String::new()))
         .unwrap();
     vault
-        .add_entry(Entry::new("forum-a".into(), "u3".into(), "Password123!".into()))
+        .add_entry(Entry::new(
+            "forum-a".into(),
+            "u3".into(),
+            "Password123!".into(),
+        ))
         .unwrap();
     vault
-        .add_entry(Entry::new("forum-b".into(), "u4".into(), "Password123!".into()))
+        .add_entry(Entry::new(
+            "forum-b".into(),
+            "u4".into(),
+            "Password123!".into(),
+        ))
         .unwrap();
 
     // Rename collision MUST be rejected.
@@ -486,34 +521,28 @@ fn omav_v2_multi_yubikey_slots_unlock_tamper_and_revocation() {
         &sec1,
     )
     .expect("wrap slot1");
-    let slot2 = wrap_master_key_for_slot(
-        &header,
-        &master_key,
-        &pw_hash,
-        None,
-        "backup",
-        meta2,
-        &sec2,
-    )
-    .expect("wrap slot2");
+    let slot2 =
+        wrap_master_key_for_slot(&header, &master_key, &pw_hash, None, "backup", meta2, &sec2)
+            .expect("wrap slot2");
     header.fido2_slots.push(slot1);
     header.fido2_slots.push(slot2);
 
-    let blob = seal_vault(&master_key, &mut header, b"{\"secret\":\"two-yubikeys\"}").expect("seal");
+    let blob =
+        seal_vault(&master_key, &mut header, b"{\"secret\":\"two-yubikeys\"}").expect("seal");
     let (parsed_hdr, _) = VaultHeader::parse(&blob, false).expect("parse v2");
     assert_eq!(parsed_hdr.version, VAULT_VERSION_V2);
     assert_eq!(parsed_hdr.fido2_labels(), vec!["primary", "backup"]);
 
     // 1. Unlock with YubiKey #1 succeeds.
-    let res1 = resolve_master_key(&parsed_hdr, passphrase, None, &key1, None, false)
-        .expect("unlock key1");
+    let res1 =
+        resolve_master_key(&parsed_hdr, passphrase, None, &key1, None, false).expect("unlock key1");
     assert_eq!(res1.matched_slot_index, Some(0));
     let (_, pt1) = open_vault(&res1.master_key, &blob, false).expect("open via key1");
     assert_eq!(pt1.as_slice(), b"{\"secret\":\"two-yubikeys\"}");
 
     // 2. Unlock with YubiKey #2 (backup) automatically skips slot 0 and succeeds!
-    let res2 = resolve_master_key(&parsed_hdr, passphrase, None, &key2, None, false)
-        .expect("unlock key2");
+    let res2 =
+        resolve_master_key(&parsed_hdr, passphrase, None, &key2, None, false).expect("unlock key2");
     assert_eq!(res2.matched_slot_index, Some(1));
     let (_, pt2) = open_vault(&res2.master_key, &blob, false).expect("open via key2");
     assert_eq!(pt2.as_slice(), b"{\"secret\":\"two-yubikeys\"}");
@@ -540,9 +569,12 @@ fn omav_v2_multi_yubikey_slots_unlock_tamper_and_revocation() {
     // 7. Revoking YubiKey #2 removes its slot; Key #1 still unlocks and Key #2 is rejected.
     let mut revoked_hdr = parsed_hdr;
     revoked_hdr.fido2_slots.retain(|s| s.label != "backup");
-    let revoked_blob =
-        seal_vault(&res1.master_key, &mut revoked_hdr, b"{\"secret\":\"after-revoke\"}")
-            .expect("seal revoked");
+    let revoked_blob = seal_vault(
+        &res1.master_key,
+        &mut revoked_hdr,
+        b"{\"secret\":\"after-revoke\"}",
+    )
+    .expect("seal revoked");
     let (parsed_revoked, _) = VaultHeader::parse(&revoked_blob, false).expect("parse revoked");
     assert_eq!(parsed_revoked.fido2_labels(), vec!["primary"]);
 
@@ -552,7 +584,10 @@ fn omav_v2_multi_yubikey_slots_unlock_tamper_and_revocation() {
     assert_eq!(pt_after.as_slice(), b"{\"secret\":\"after-revoke\"}");
 
     let err_revoked = resolve_master_key(&parsed_revoked, passphrase, None, &key2, None, false);
-    assert!(matches!(err_revoked, Err(VaultError::Fido2NoMatchingCredential)));
+    assert!(matches!(
+        err_revoked,
+        Err(VaultError::Fido2NoMatchingCredential)
+    ));
 }
 
 #[test]
@@ -592,13 +627,28 @@ fn v03_audit_regressions_utf8_totp_keyfile_eexist_sanitizer_and_checked_save() {
     let vault_path = tmp.path().join("omavault_private").join("checked.omav");
     let params = fast_params();
     let mut hdr = VaultHeader::new(params, false, None).expect("hdr");
-    let mk = derive_master_key(b"checked-save-pass!", &hdr.kdf_salt, params, None, None, false)
-        .expect("mk");
+    let mk = derive_master_key(
+        b"checked-save-pass!",
+        &hdr.kdf_salt,
+        params,
+        None,
+        None,
+        false,
+    )
+    .expect("mk");
     let mut v1 = Vault::new();
     save_vault_to_disk(&vault_path, &mk, &mut hdr, &mut v1).expect("save 1");
     let stale_rev = header_revision(&hdr);
-    save_vault_to_disk_checked(&vault_path, &mk, &mut hdr, &mut v1, Some(&stale_rev), false, true)
-        .expect("save 2 with matching revision");
+    save_vault_to_disk_checked(
+        &vault_path,
+        &mk,
+        &mut hdr,
+        &mut v1,
+        Some(&stale_rev),
+        false,
+        true,
+    )
+    .expect("save 2 with matching revision");
     // Re-using stale_rev MUST fail.
     assert!(save_vault_to_disk_checked(
         &vault_path,

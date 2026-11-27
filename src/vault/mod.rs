@@ -42,7 +42,14 @@ impl fmt::Debug for CustomField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CustomField")
             .field("label", &self.label)
-            .field("value", if self.secret { &"[REDACTED]" } else { &self.value })
+            .field(
+                "value",
+                if self.secret {
+                    &"[REDACTED]"
+                } else {
+                    &self.value
+                },
+            )
             .field("secret", &self.secret)
             .finish()
     }
@@ -180,8 +187,11 @@ fn contains_ascii_icase(haystack: &str, needle: &str) -> bool {
     if n.len() > h.len() {
         return false;
     }
-    h.windows(n.len())
-        .any(|win| win.iter().zip(n.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+    h.windows(n.len()).any(|win| {
+        win.iter()
+            .zip(n.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
 }
 
 /// Normalize Windows line endings in multi-line fields (pasted notes) before validation.
@@ -307,8 +317,7 @@ impl Vault {
             return Err(VaultError::DuplicateEntry(entry.name.clone()));
         }
         self.entries.push(entry);
-        self.entries
-            .sort_by_key(|a| a.name.to_ascii_lowercase());
+        self.entries.sort_by_key(|a| a.name.to_ascii_lowercase());
         self.updated_at = Utc::now();
         Ok(())
     }
@@ -351,8 +360,7 @@ impl Vault {
         candidate.updated_at = Utc::now();
         self.entries[target_idx] = candidate;
 
-        self.entries
-            .sort_by_key(|a| a.name.to_ascii_lowercase());
+        self.entries.sort_by_key(|a| a.name.to_ascii_lowercase());
         self.updated_at = Utc::now();
         Ok(())
     }

@@ -272,7 +272,11 @@ impl HardeningStatus {
         format!(
             "ptrace-block:{} core-dump-off:{} umask-077:{}",
             if self.dumpable_disabled { "ON" } else { "OFF" },
-            if self.core_dumps_disabled { "ON" } else { "OFF" },
+            if self.core_dumps_disabled {
+                "ON"
+            } else {
+                "OFF"
+            },
             if self.umask_restricted { "ON" } else { "OFF" },
         )
     }
@@ -365,13 +369,8 @@ impl<const N: usize> LockedKey<N> {
         bytes.zeroize();
 
         // Fail closed if we cannot seal the secret page to PROT_NONE.
-        let rc = unsafe {
-            libc::mprotect(
-                secret_ptr as *mut libc::c_void,
-                secret_len,
-                libc::PROT_NONE,
-            )
-        };
+        let rc =
+            unsafe { libc::mprotect(secret_ptr as *mut libc::c_void, secret_len, libc::PROT_NONE) };
         if rc != 0 {
             unsafe {
                 let slice = slice::from_raw_parts_mut(secret_ptr, secret_len);
@@ -520,9 +519,7 @@ impl<const N: usize> LockedKey<N> {
                         self.key.sealed.store(true, Ordering::Release);
                     } else {
                         self.key.sealed.store(false, Ordering::Release);
-                        eprintln!(
-                            "omavault security warning: mprotect(PROT_NONE) re-seal failed"
-                        );
+                        eprintln!("omavault security warning: mprotect(PROT_NONE) re-seal failed");
                     }
                 }
             }
@@ -581,13 +578,8 @@ impl<const N: usize> LockedKey<N> {
             return Err(e);
         }
 
-        let rc = unsafe {
-            libc::mprotect(
-                secret_ptr as *mut libc::c_void,
-                secret_len,
-                libc::PROT_NONE,
-            )
-        };
+        let rc =
+            unsafe { libc::mprotect(secret_ptr as *mut libc::c_void, secret_len, libc::PROT_NONE) };
         if rc != 0 {
             unsafe {
                 let slice = slice::from_raw_parts_mut(secret_ptr, secret_len);
@@ -671,8 +663,7 @@ fn page_size() -> usize {
 
 /// Fill a byte slice with cryptographically secure randomness from the OS CSPRNG.
 pub fn fill_random(dest: &mut [u8]) -> Result<()> {
-    getrandom::getrandom(dest)
-        .map_err(|e| VaultError::Crypto(format!("OS CSPRNG failure: {e}")))
+    getrandom::getrandom(dest).map_err(|e| VaultError::Crypto(format!("OS CSPRNG failure: {e}")))
 }
 
 /// Read `CLOCK_BOOTTIME` in whole seconds (advances during system suspend, unlike `Instant`).
@@ -873,8 +864,8 @@ fn connect_unix_with_timeout(
         return None;
     }
 
-    let addr_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
-        as libc::socklen_t;
+    let addr_len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
     let close_fd = |fd: libc::c_int| unsafe {
@@ -918,8 +909,7 @@ fn connect_unix_with_timeout(
                     }
                     let wait_ms = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as i32;
                     let poll_rc = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
-                    if poll_rc < 0
-                        && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    if poll_rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
                     {
                         continue;
                     }
@@ -1105,14 +1095,16 @@ mod tests {
 
     #[test]
     fn proc_status_parser_handles_dumpable_zero_and_zombies() {
-        let active_hyprlock = "Name:\thyprlock\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\n";
+        let active_hyprlock =
+            "Name:\thyprlock\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\n";
         assert!(status_matches_active_locker(active_hyprlock, 1000));
         assert!(!status_matches_active_locker(active_hyprlock, 1001));
 
         let zombie_hyprlock = "Name:\thyprlock\nState:\tZ (zombie)\nUid:\t1000\t1000\t1000\t1000\n";
         assert!(!status_matches_active_locker(zombie_hyprlock, 1000));
 
-        let truncated_swaylock = "Name:\tswaylock-effect\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\n";
+        let truncated_swaylock =
+            "Name:\tswaylock-effect\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\n";
         assert!(status_matches_active_locker(truncated_swaylock, 1000));
     }
 
