@@ -13,17 +13,17 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::clipboard::clear_clipboard_best_effort;
-use crate::crypto::fido2::LibFido2Cli;
+use crate::crypto::fido2::{with_cancel, Fido2Cancel, LibFido2Cli};
 use crate::crypto::kdf::hash_keyfile;
 use crate::crypto::{header_revision, resolve_master_key, VaultHeader};
 use crate::error::{Result, VaultError};
-use crate::procsig::{signal_daemon_lock, write_pid_into};
-use crate::sleep::{SleepMonitor, SleepMonitorState};
-use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault, RollbackStore};
 use crate::hardening::{
     boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, CountingWriter,
     HardeningStatus, LockedKey,
 };
+use crate::procsig::{signal_daemon_lock, write_pid_into};
+use crate::sleep::{SleepMonitor, SleepMonitorState};
+use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault, RollbackStore};
 use crate::vault::storage::{
     ensure_private_dir, ensure_private_dir_strict, load_vault_from_disk, read_header_from_disk,
     save_vault_to_disk_checked,
@@ -204,6 +204,8 @@ struct DaemonState {
     /// `SaveVault` operations can never race past a concurrent `Lock` and silently re-unlock.
     lock_epoch: u64,
     hardening: HardeningStatus,
+    /// In-flight unlocks. Every lock path cancels these so a touch prompt cannot outlive it.
+    unlock_cancels: Vec<Fido2Cancel>,
 }
 
 impl DaemonState {
@@ -218,6 +220,7 @@ impl DaemonState {
             shutdown_requested: false,
             lock_epoch: 0,
             hardening,
+            unlock_cancels: Vec::new(),
         }
     }
 
@@ -225,6 +228,9 @@ impl DaemonState {
     /// Returns `true` if a session was active (or clipboard should be cleared).
     fn lock_inner(&mut self, reason: &str) -> bool {
         self.lock_epoch = self.lock_epoch.wrapping_add(1);
+        for token in self.unlock_cancels.drain(..) {
+            token.cancel();
+        }
         let had_session = self.session.take().is_some();
         if had_session {
             self.last_lock_reason = Some(reason.to_string());
@@ -460,8 +466,8 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
     unsafe {
         libc::umask(old_umask);
     }
-    let listener = bind_res
-        .map_err(|e| VaultError::Daemon(format!("failed binding daemon socket: {e}")))?;
+    let listener =
+        bind_res.map_err(|e| VaultError::Daemon(format!("failed binding daemon socket: {e}")))?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
@@ -607,8 +613,7 @@ pub fn run_daemon_with_config(socket_path: &Path, cfg: DaemonConfig) -> Result<(
                     eprintln!("omavaultd: rejected IPC connection with mismatched peer UID");
                     continue;
                 }
-                let (pool, control_only) = if try_acquire(&general_workers, MAX_GENERAL_WORKERS)
-                {
+                let (pool, control_only) = if try_acquire(&general_workers, MAX_GENERAL_WORKERS) {
                     (Arc::clone(&general_workers), false)
                 } else if try_acquire(&control_workers, RESERVED_CONTROL_WORKERS) {
                     (Arc::clone(&control_workers), true)
@@ -773,6 +778,24 @@ fn handle_connection(
     }
 }
 
+struct UnlockCancelGuard<'a> {
+    state: &'a Mutex<DaemonState>,
+    token: Fido2Cancel,
+}
+
+impl Drop for UnlockCancelGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let token = &self.token;
+        guard
+            .unlock_cancels
+            .retain(|registered| !registered.same_token(token));
+    }
+}
+
 fn handle_heavy_request(
     mut req: DaemonRequest,
     state: &Arc<Mutex<DaemonState>>,
@@ -798,8 +821,10 @@ fn handle_heavy_request(
 
             // Capture current lock_epoch BEFORE slow Argon2id / FIDO2 touch so any concurrent
             // `omavault lock`, TUI cancel, suspend, or screen lock aborts this unlock cleanly.
-            let start_epoch = {
-                let Ok(guard) = state.lock() else {
+            // The cancel token is registered in the same critical section, so a lock that
+            // arrives during Argon2 is visible to the first `fido2-assert` poll.
+            let (start_epoch, cancel) = {
+                let Ok(mut guard) = state.lock() else {
                     return DaemonResponse::Error {
                         message: "daemon state lock poisoned".into(),
                     };
@@ -809,7 +834,13 @@ fn handle_heavy_request(
                         message: "daemon shutting down".into(),
                     };
                 }
-                guard.lock_epoch
+                let cancel = Fido2Cancel::new();
+                guard.unlock_cancels.push(cancel.clone());
+                (guard.lock_epoch, cancel)
+            };
+            let _cancel_guard = UnlockCancelGuard {
+                state,
+                token: cancel.clone(),
             };
 
             let vault_path_owned = vault_path.clone();
@@ -828,14 +859,16 @@ fn handle_heavy_request(
                     None
                 };
 
-                let resolution = resolve_master_key(
-                    &header,
-                    pass_owned.as_bytes(),
-                    kf_digest.as_deref(),
-                    &LibFido2Cli,
-                    fido2_dev_owned.as_deref(),
-                    enforce_kdf_policy,
-                )?;
+                let resolution = with_cancel(&cancel, || {
+                    resolve_master_key(
+                        &header,
+                        pass_owned.as_bytes(),
+                        kf_digest.as_deref(),
+                        &LibFido2Cli,
+                        fido2_dev_owned.as_deref(),
+                        enforce_kdf_policy,
+                    )
+                })?;
                 // Drop & zeroize plaintext passphrase IMMEDIATELY after key derivation.
                 drop(pass_owned);
                 let master_key = resolution.master_key;
@@ -926,12 +959,18 @@ fn handle_heavy_request(
                     message: "load cancelled: vault was locked concurrently".into(),
                 };
             }
-            let loaded = load_vault_from_disk(&canonical, &key_clone, enforce_kdf_policy)
-                .and_then(|(hdr, vault)| {
+            let loaded = load_vault_from_disk(&canonical, &key_clone, enforce_kdf_policy).and_then(
+                |(hdr, vault)| {
                     // The file may have been swapped for an older copy while unlocked.
-                    enforce_rollback_policy(rollback_store(state).as_ref(), &canonical, &vault, false)?;
+                    enforce_rollback_policy(
+                        rollback_store(state).as_ref(),
+                        &canonical,
+                        &vault,
+                        false,
+                    )?;
                     Ok((hdr, vault))
-                });
+                },
+            );
             drop(key_clone);
             match loaded {
                 Ok((hdr, vault)) => {
@@ -1274,7 +1313,9 @@ impl DaemonClient {
         })? {
             DaemonResponse::Vault { vault, revision } => Ok((vault, revision)),
             DaemonResponse::Error { message } => Err(VaultError::Daemon(message)),
-            _ => Err(VaultError::Daemon("unexpected response to load_vault".into())),
+            _ => Err(VaultError::Daemon(
+                "unexpected response to load_vault".into(),
+            )),
         }
     }
 
@@ -1294,7 +1335,9 @@ impl DaemonClient {
             DaemonResponse::Saved { revision } => Ok(Some(revision)),
             DaemonResponse::Ok => Ok(None),
             DaemonResponse::Error { message } => Err(VaultError::Daemon(message)),
-            _ => Err(VaultError::Daemon("unexpected response to save_vault".into())),
+            _ => Err(VaultError::Daemon(
+                "unexpected response to save_vault".into(),
+            )),
         }
     }
 
@@ -1350,7 +1393,9 @@ fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     serde_json::to_writer(&mut counter, value)
         .map_err(|_| VaultError::Serialization("failed measuring IPC frame".into()))?;
     if counter.bytes > MAX_IPC_FRAME_BYTES {
-        return Err(VaultError::Daemon("IPC payload exceeds maximum size".into()));
+        return Err(VaultError::Daemon(
+            "IPC payload exceeds maximum size".into(),
+        ));
     }
     let mut payload = Zeroizing::new(Vec::with_capacity(counter.bytes));
     serde_json::to_writer(&mut *payload, value)
@@ -1364,7 +1409,11 @@ fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
 
 /// `write_all` bounded by ONE overall monotonic deadline (not per-syscall), so a peer that
 /// reads a byte every few seconds cannot keep a plaintext response pinned in daemon memory.
-fn write_all_with_deadline(stream: &mut UnixStream, mut buf: &[u8], deadline: Instant) -> Result<()> {
+fn write_all_with_deadline(
+    stream: &mut UnixStream,
+    mut buf: &[u8],
+    deadline: Instant,
+) -> Result<()> {
     while !buf.is_empty() {
         let now = Instant::now();
         if now >= deadline {
@@ -1424,7 +1473,9 @@ fn read_frame_with_deadlines(
         let want = remaining.min(chunk.len());
         let n = read_some_with_deadline(stream, &mut chunk[..want], deadline)?;
         if n == 0 {
-            return Err(VaultError::Daemon("unexpected EOF reading IPC frame".into()));
+            return Err(VaultError::Daemon(
+                "unexpected EOF reading IPC frame".into(),
+            ));
         }
         if out.len() + n > out.capacity() {
             let mut grown = Zeroizing::new(Vec::with_capacity(total_len));
@@ -1445,7 +1496,9 @@ fn read_exact_with_deadline(
     while !buf.is_empty() {
         let n = read_some_with_deadline(stream, buf, deadline)?;
         if n == 0 {
-            return Err(VaultError::Daemon("unexpected EOF reading IPC header".into()));
+            return Err(VaultError::Daemon(
+                "unexpected EOF reading IPC header".into(),
+            ));
         }
         buf = &mut buf[n..];
     }

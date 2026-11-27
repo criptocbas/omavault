@@ -68,6 +68,8 @@ For **YubiKey / FIDO2 hardware 2FA**, ensure `libfido2` is installed:
 sudo pacman -S libfido2
 ```
 
+UV/PIN-required keys cannot be unlocked through the `omavaultd` service (`fido2-assert` reads the PIN from `/dev/tty`). Stop the daemon (`systemctl --user stop omavaultd`) and use the standalone CLI or TUI for those keys.
+
 ---
 
 ## Quick Usage

@@ -36,6 +36,27 @@
 - Client connect helper retries `EAGAIN` (full backlog) and `EINTR` within its deadline.
 - Hyprland `.conf` and hypridle snippets prefer root-owned `/usr/bin/omavault` over `~/.local/bin`.
 
+### Phase 6: FIDO2 robustness
+- **M-7:** slot probing tries non-UV slots before UV slots on each device, and continues after
+  "no credentials" or "this key cannot do UV". A PIN slot no longer hides a valid non-UV slot
+  on the same key. A wrong PIN, a blocked PIN, or a refused touch stops the probe immediately
+  and does not burn further PIN retries.
+- **L-4:** every `fido2-*` child runs in its own process group. The parent sets
+  `PR_SET_PDEATHSIG(SIGTERM)` and aborts the exec if it died before the child installed the
+  signal. A guard kills the group on timeout, cancellation, panic, or any early return.
+- Cancelling an unlock (TUI Esc / lock hotkey, `omavault lock`, sleep, screen lock, `SIGUSR1`)
+  stops a pending `fido2-assert` instead of leaving the key blinking until touch or the 45 s
+  timeout.
+- **L-5:** legacy v1 vaults try every connected key, not only the first.
+- **L-6:** a UV slot tries `-t pin=true` and, only when the key has no PIN or rejects that
+  option, retries once with `-t uv=true`. Both attempts still require the authenticator-data
+  UV flag.
+- **L-8:** an out-of-range slot index returns `Fido2NoMatchingCredential` instead of panicking,
+  and `to_bytes` rejects KDF parameters above the ceiling.
+- **Limit:** UV/PIN slots still cannot be unlocked through `omavaultd`. `fido2-assert -t pin=true`
+  reads the PIN from `/dev/tty`, which the service does not have. Those slots work in the
+  standalone CLI/TUI (`systemctl --user stop omavaultd`, or no daemon).
+
 ### Phase 5: clipboard races
 - **H-3:** `copy_secret` holds `clip.lock` across spawn, readiness, state publish, and the signal
   to the previous helper. The new generation is written to `clip.state` before the old helper is

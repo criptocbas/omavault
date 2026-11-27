@@ -57,7 +57,10 @@ pub const MAX_VAULT_FILE_BYTES: u64 =
 /// characters, and no BiDi overrides / zero-width / tag characters that could spoof terminal output.
 pub fn validate_slot_label(label: &str) -> Result<()> {
     validate_slot_label_lenient(label)?;
-    if label.chars().any(crate::hardening::is_dangerous_display_char) {
+    if label
+        .chars()
+        .any(crate::hardening::is_dangerous_display_char)
+    {
         return Err(VaultError::Fido2Error(
             "FIDO2 key label cannot contain BiDi control, zero-width, or other invisible characters"
                 .into(),
@@ -101,9 +104,9 @@ impl Fido2KeySlot {
     pub fn validate(&self) -> Result<()> {
         validate_slot_label_lenient(&self.label)?;
         self.fido2.validate()?;
-        let nonce = BASE64
-            .decode(self.wrap_nonce_b64.as_bytes())
-            .map_err(|_| VaultError::InvalidFormat("invalid Base64 FIDO2 slot wrap nonce".into()))?;
+        let nonce = BASE64.decode(self.wrap_nonce_b64.as_bytes()).map_err(|_| {
+            VaultError::InvalidFormat("invalid Base64 FIDO2 slot wrap nonce".into())
+        })?;
         if nonce.len() != SLOT_WRAP_NONCE_LEN {
             return Err(VaultError::InvalidFormat(
                 "FIDO2 slot wrap nonce must be 24 bytes".into(),
@@ -273,6 +276,7 @@ impl VaultHeader {
 
     /// Serialize header bytes (which also serve verbatim as AEAD AAD).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.kdf_params.validate_upper_bounds()?;
         if (self.flags & !KNOWN_FLAGS_MASK) != 0 {
             return Err(VaultError::InvalidFormat(format!(
                 "unknown vault header flags: 0x{:04x}",
@@ -417,10 +421,10 @@ impl VaultHeader {
                             "FIDO2 flag set but metadata missing".into(),
                         ));
                     }
-                    let meta: Fido2Metadata =
-                        serde_json::from_slice(&data[FIXED_HEADER_LEN..header_len]).map_err(
-                            |_| VaultError::InvalidFormat("corrupt FIDO2 metadata".into()),
-                        )?;
+                    let meta: Fido2Metadata = serde_json::from_slice(
+                        &data[FIXED_HEADER_LEN..header_len],
+                    )
+                    .map_err(|_| VaultError::InvalidFormat("corrupt FIDO2 metadata".into()))?;
                     meta.validate()?;
                     (Some(meta), Vec::new())
                 } else {
@@ -680,13 +684,12 @@ pub fn resolve_master_key<P: Fido2Provider>(
             }
             let (slot_idx, fido2_secret) =
                 fido2_provider.assert_matching_slot(&header.fido2_slots, fido2_device)?;
-            let master_key = unwrap_master_key_from_slot(
-                header,
-                &header.fido2_slots[slot_idx],
-                &pw_hash,
-                keyfile_digest,
-                &fido2_secret,
-            )?;
+            let slot = header
+                .fido2_slots
+                .get(slot_idx)
+                .ok_or(VaultError::Fido2NoMatchingCredential)?;
+            let master_key =
+                unwrap_master_key_from_slot(header, slot, &pw_hash, keyfile_digest, &fido2_secret)?;
             Ok(UnlockResolution {
                 master_key,
                 matched_slot_index: Some(slot_idx),
@@ -772,7 +775,9 @@ pub fn open_vault(
     );
 
     if frame.len() < 4 || frame.len() % PADDING_BLOCK_SIZE != 0 {
-        return Err(VaultError::InvalidFormat("decrypted frame invalid alignment".into()));
+        return Err(VaultError::InvalidFormat(
+            "decrypted frame invalid alignment".into(),
+        ));
     }
     let payload_len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
     if payload_len > MAX_PAYLOAD_SIZE || 4 + payload_len > frame.len() {

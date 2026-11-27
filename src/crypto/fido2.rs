@@ -1,9 +1,12 @@
+use std::cell::RefCell;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -100,8 +103,8 @@ pub trait Fido2Provider {
             return Err(VaultError::Fido2Required);
         }
         let mut last_err = VaultError::Fido2NoMatchingCredential;
-        for (idx, slot) in slots.iter().enumerate() {
-            match self.get_hmac_secret(&slot.fido2, device) {
+        for idx in slot_probe_order(slots) {
+            match self.get_hmac_secret(&slots[idx].fido2, device) {
                 Ok(secret) => return Ok((idx, secret)),
                 Err(VaultError::Fido2NoMatchingCredential) => continue,
                 Err(e) => {
@@ -112,6 +115,84 @@ pub trait Fido2Provider {
         }
         Err(last_err)
     }
+}
+
+/// Cancel token for one in-flight FIDO2 operation.
+///
+/// Installed on the calling thread with [`with_cancel`]. The provider trait stays
+/// unchanged, so existing `&LibFido2Cli` call sites do not grow a new argument.
+#[derive(Clone, Debug)]
+pub struct Fido2Cancel(Arc<AtomicBool>);
+
+impl Default for Fido2Cancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fido2Cancel {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Share a flag that already exists (the TUI's unlock-cancel `Arc`).
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// `true` when both handles point at the same flag, including after `clone`.
+    pub fn same_token(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+thread_local! {
+    static CURRENT_CANCEL: RefCell<Option<Fido2Cancel>> = const { RefCell::new(None) };
+}
+
+const FIDO2_CANCELLED_MSG: &str = "FIDO2 operation cancelled";
+
+fn cancelled_error() -> VaultError {
+    VaultError::Fido2Error(FIDO2_CANCELLED_MSG.into())
+}
+
+fn is_cancelled_error(err: &VaultError) -> bool {
+    matches!(err, VaultError::Fido2Error(msg) if msg == FIDO2_CANCELLED_MSG)
+}
+
+fn cancel_requested() -> bool {
+    CURRENT_CANCEL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|cancel| cancel.is_cancelled())
+    })
+}
+
+/// Run `f` with `cancel` visible to FIDO2 waits on this thread.
+///
+/// Restores the previous token on return and on unwind. Daemon and TUI threads are reused.
+pub fn with_cancel<R>(cancel: &Fido2Cancel, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Fido2Cancel>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CURRENT_CANCEL.with(|slot| {
+                *slot.borrow_mut() = previous;
+            });
+        }
+    }
+
+    let previous = CURRENT_CANCEL.with(|slot| slot.borrow_mut().replace(cancel.clone()));
+    let _restore = Restore(previous);
+    f()
 }
 
 /// Production FIDO2 provider backed by Arch/Omarchy's `libfido2` CLI tools
@@ -177,9 +258,9 @@ impl LibFido2Cli {
                 "FIDO2 device path must be a character device".into(),
             ));
         }
-        let canonical_str = canonical.to_str().ok_or_else(|| {
-            VaultError::Fido2Error("FIDO2 device path is not valid UTF-8".into())
-        })?;
+        let canonical_str = canonical
+            .to_str()
+            .ok_or_else(|| VaultError::Fido2Error("FIDO2 device path is not valid UTF-8".into()))?;
         let is_hidraw = canonical_str
             .strip_prefix("/dev/hidraw")
             .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
@@ -194,16 +275,17 @@ impl LibFido2Cli {
 
     /// Auto-detect all connected FIDO2 HID devices via `fido2-token -L`.
     pub fn discover_devices() -> Result<Vec<String>> {
+        if cancel_requested() {
+            return Err(cancelled_error());
+        }
         let bin = Self::resolve_tool("fido2-token")?;
         let mut cmd = Command::new(bin);
         cmd.arg("-L")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        apply_pdeathsig(&mut cmd);
-        let child = cmd.spawn().map_err(|e| {
-            VaultError::Fido2Error(format!("failed to execute `fido2-token`: {e}"))
-        })?;
+        let child = spawn_grouped(&mut cmd)
+            .map_err(|e| VaultError::Fido2Error(format!("failed to execute `fido2-token`: {e}")))?;
 
         let output = wait_with_timeout(child, Duration::from_secs(10), "fido2-token")?;
         if !output.status.success() {
@@ -241,15 +323,12 @@ impl LibFido2Cli {
 
     /// Auto-detect the first connected FIDO2 HID device via `fido2-token -L`.
     pub fn discover_device() -> Result<String> {
-        Self::discover_devices()?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                VaultError::Fido2Error(
-                    "no FIDO2 hardware authenticator detected (plug in your YubiKey / FIDO2 token)"
-                        .into(),
-                )
-            })
+        Self::discover_devices()?.into_iter().next().ok_or_else(|| {
+            VaultError::Fido2Error(
+                "no FIDO2 hardware authenticator detected (plug in your YubiKey / FIDO2 token)"
+                    .into(),
+            )
+        })
     }
 
     fn resolve_device(device: Option<&str>) -> Result<String> {
@@ -266,13 +345,52 @@ impl LibFido2Cli {
         }
     }
 
-    fn assert_on_device(
+    /// Assert `meta` on one device path that already passed [`Self::validate_device_path`].
+    ///
+    /// Callers receive a [`VaultError`]. Slot probing uses the classified helper so it can
+    /// tell a missing credential from a PIN failure.
+    pub fn assert_on_device(
         &self,
         meta: &Fido2Metadata,
         dev: &str,
         print_prompt: bool,
     ) -> Result<Zeroizing<[u8; 32]>> {
+        self.assert_on_device_classified(meta, dev, print_prompt)
+            .map_err(|(_, err)| err)
+    }
+
+    /// Like [`Self::assert_on_device`], but the slot loop can branch on the failure kind.
+    ///
+    /// A UV slot tries `-t pin=true` first. Only `SlotNeedsOtherUv` (no PIN, or the option
+    /// is rejected) retries once with `-t uv=true`. Both attempts still require the UV flag.
+    fn assert_on_device_classified(
+        &self,
+        meta: &Fido2Metadata,
+        dev: &str,
+        print_prompt: bool,
+    ) -> AssertOutcome {
+        if !meta.require_uv {
+            return self.assert_once(meta, dev, print_prompt, AssertUvMode::None);
+        }
+        match self.assert_once(meta, dev, print_prompt, AssertUvMode::Pin) {
+            Err((kind, _)) if should_retry_with_uv(kind) => {
+                self.assert_once(meta, dev, false, AssertUvMode::Biometric)
+            }
+            other => other,
+        }
+    }
+
+    fn assert_once(
+        &self,
+        meta: &Fido2Metadata,
+        dev: &str,
+        print_prompt: bool,
+        uv_mode: AssertUvMode,
+    ) -> AssertOutcome {
         meta.validate()?;
+        if cancel_requested() {
+            return Err(cancelled_error().into());
+        }
         let bin = Self::resolve_tool("fido2-assert")?;
 
         let mut client_data_hash = [0u8; 32];
@@ -286,17 +404,21 @@ impl LibFido2Cli {
 
         let mut cmd = Command::new(bin);
         cmd.arg("-G").arg("-h").arg("-t").arg("up=true");
-        if meta.require_uv {
-            // `-t pin=true` prompts for PIN & requests user verification on PIN-based tokens
-            // (e.g., YubiKey 5 Series), matching `fido2-cred -v` behavior consistently.
-            cmd.arg("-t").arg("pin=true");
+        match uv_mode {
+            AssertUvMode::None => {}
+            AssertUvMode::Pin => {
+                // PIN-based tokens (YubiKey 5). Biometric tokens retry with `uv=true`.
+                cmd.arg("-t").arg("pin=true");
+            }
+            AssertUvMode::Biometric => {
+                cmd.arg("-t").arg("uv=true");
+            }
         }
         cmd.arg("--")
             .arg(dev)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        apply_pdeathsig(&mut cmd);
 
         if print_prompt {
             eprintln!(
@@ -305,8 +427,7 @@ impl LibFido2Cli {
             );
         }
 
-        let mut child = cmd
-            .spawn()
+        let mut child = spawn_grouped(&mut cmd)
             .map_err(|e| VaultError::Fido2Error(format!("failed to launch `fido2-assert`: {e}")))?;
 
         write_stdin_or_reap(&mut child, stdin_payload.as_bytes(), "fido2-assert")?;
@@ -315,17 +436,11 @@ impl LibFido2Cli {
         let stdout_bytes = output.stdout;
 
         if !output.status.success() {
-            let stderr_text = String::from_utf8_lossy(&output.stderr);
-            if is_no_credentials_stderr(&stderr_text) {
-                return Err(VaultError::Fido2NoMatchingCredential);
-            }
-            let detail = sanitize_stderr_snippet(&stderr_text);
-            let msg = if detail.is_empty() {
-                format!("`fido2-assert` failed with status {}", output.status)
-            } else {
-                format!("`fido2-assert` failed: {detail}")
-            };
-            return Err(VaultError::Fido2Error(msg));
+            return Err(failure_from_stderr(
+                "fido2-assert",
+                &output.stderr,
+                output.status,
+            ));
         }
 
         let stdout_str = std::str::from_utf8(&stdout_bytes)
@@ -337,13 +452,15 @@ impl LibFido2Cli {
         if lines.len() != 5 {
             return Err(VaultError::Fido2Error(
                 "unexpected `fido2-assert` output line count".into(),
-            ));
+            )
+            .into());
         }
 
         if lines[0].trim() != expected_cdh_b64 || lines[1].trim() != meta.rp_id {
             return Err(VaultError::Fido2Error(
                 "FIDO2 assertion failed challenge/RP verification".into(),
-            ));
+            )
+            .into());
         }
         verify_authdata_flags(lines[2].trim(), &meta.rp_id, meta.require_uv, false, true)?;
 
@@ -356,32 +473,283 @@ impl LibFido2Cli {
             return Err(VaultError::Fido2Error(format!(
                 "expected 32-byte HMAC secret from authenticator, got {} bytes",
                 decoded.len()
-            )));
+            ))
+            .into());
         }
 
         let mut secret = Zeroizing::new([0u8; 32]);
         secret.copy_from_slice(&decoded);
         Ok(secret)
     }
+
     /// Probe all connected FIDO2 devices (or an explicit device) for a specific credential.
+    ///
+    /// Stops on a PIN/UV failure or cancellation. Other failures are remembered and the next
+    /// device is tried, so one key's transport error does not hide another key.
     pub fn assert_on_any_device(
         &self,
         meta: &Fido2Metadata,
         device: Option<&str>,
     ) -> Result<Zeroizing<[u8; 32]>> {
+        if cancel_requested() {
+            return Err(cancelled_error());
+        }
         let devices = Self::resolve_devices(device)?;
-        let mut last_err = VaultError::Fido2NoMatchingCredential;
+        let mut remembered: Option<(AssertFailureKind, VaultError)> = None;
         for dev in &devices {
-            match self.assert_on_device(meta, dev, false) {
+            if cancel_requested() {
+                return Err(cancelled_error());
+            }
+            match self.assert_on_device_classified(meta, dev, false) {
                 Ok(secret) => return Ok(secret),
-                Err(VaultError::Fido2NoMatchingCredential) => continue,
-                Err(e) => {
-                    last_err = e;
+                Err((kind, err)) => {
+                    if is_cancelled_error(&err) || kind == AssertFailureKind::StopPinProblem {
+                        return Err(err);
+                    }
+                    remembered = Some(prefer_failure(remembered, (kind, err)));
                 }
             }
         }
-        Err(last_err)
+        Err(remembered
+            .map(|(_, err)| err)
+            .unwrap_or(VaultError::Fido2NoMatchingCredential))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssertFailureKind {
+    NoCredential,
+    SlotNeedsOtherUv,
+    StopPinProblem,
+    Device,
+}
+
+struct AssertFailureCode {
+    kind: AssertFailureKind,
+    /// Symbolic libfido2 name, compared as one underscore-preserving token.
+    name: &'static str,
+    /// Standalone hex token. `0x35` must not match `0x350`.
+    hex: &'static str,
+}
+
+/// libfido2 1.17 codes from `/usr/include/fido/err.h`.
+const ASSERT_FAILURE_CODES: &[AssertFailureCode] = &[
+    AssertFailureCode {
+        kind: AssertFailureKind::NoCredential,
+        name: "fido_err_no_credentials",
+        hex: "0x2e",
+    },
+    // This key cannot perform UV for the slot.
+    AssertFailureCode {
+        kind: AssertFailureKind::SlotNeedsOtherUv,
+        name: "fido_err_pin_not_set",
+        hex: "0x35",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::SlotNeedsOtherUv,
+        name: "fido_err_unsupported_option",
+        hex: "0x2b",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::SlotNeedsOtherUv,
+        name: "fido_err_invalid_option",
+        hex: "0x2c",
+    },
+    // Wrong PIN, blocked PIN, or a refused touch. Do not open another prompt.
+    AssertFailureCode {
+        kind: AssertFailureKind::StopPinProblem,
+        name: "fido_err_pin_invalid",
+        hex: "0x31",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::StopPinProblem,
+        name: "fido_err_pin_blocked",
+        hex: "0x32",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::StopPinProblem,
+        name: "fido_err_pin_auth_invalid",
+        hex: "0x33",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::StopPinProblem,
+        name: "fido_err_pin_auth_blocked",
+        hex: "0x34",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::StopPinProblem,
+        name: "fido_err_pin_required",
+        hex: "0x36",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::StopPinProblem,
+        name: "fido_err_uv_blocked",
+        hex: "0x3c",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::StopPinProblem,
+        name: "fido_err_uv_invalid",
+        hex: "0x3f",
+    },
+    AssertFailureCode {
+        kind: AssertFailureKind::StopPinProblem,
+        name: "fido_err_operation_denied",
+        hex: "0x27",
+    },
+];
+
+type AssertOutcome = std::result::Result<Zeroizing<[u8; 32]>, (AssertFailureKind, VaultError)>;
+
+enum AssertUvMode {
+    None,
+    Pin,
+    Biometric,
+}
+
+fn kind_rank(kind: AssertFailureKind) -> u8 {
+    match kind {
+        AssertFailureKind::StopPinProblem => 3,
+        AssertFailureKind::SlotNeedsOtherUv => 2,
+        AssertFailureKind::Device => 1,
+        AssertFailureKind::NoCredential => 0,
+    }
+}
+
+fn prefer_failure(
+    remembered: Option<(AssertFailureKind, VaultError)>,
+    next: (AssertFailureKind, VaultError),
+) -> (AssertFailureKind, VaultError) {
+    match remembered {
+        Some((kind, err)) if kind_rank(kind) >= kind_rank(next.0) => (kind, err),
+        _ => next,
+    }
+}
+
+/// Retry PIN-mode UV exactly once, and only when the key cannot do PIN UV.
+fn should_retry_with_uv(kind: AssertFailureKind) -> bool {
+    matches!(kind, AssertFailureKind::SlotNeedsOtherUv)
+}
+
+fn classify_assert_stderr(stderr: &str) -> AssertFailureKind {
+    let lower = stderr.to_ascii_lowercase();
+    let mut best: Option<AssertFailureKind> = None;
+    if is_no_credentials_stderr(&lower) {
+        best = Some(AssertFailureKind::NoCredential);
+    }
+    // Keep '_' inside symbolic names. Hex tokens still split on '_', matching
+    // `is_no_credentials_stderr`, so `0x2e` is never a prefix of `0x2e8a`.
+    let name_tokens: Vec<&str> = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| !token.is_empty())
+        .collect();
+    let hex_tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    for code in ASSERT_FAILURE_CODES {
+        let hit = name_tokens.contains(&code.name) || hex_tokens.contains(&code.hex);
+        if hit {
+            best = Some(match best {
+                Some(prev) if kind_rank(prev) >= kind_rank(code.kind) => prev,
+                _ => code.kind,
+            });
+        }
+    }
+    best.unwrap_or(AssertFailureKind::Device)
+}
+
+impl From<VaultError> for (AssertFailureKind, VaultError) {
+    fn from(err: VaultError) -> Self {
+        (AssertFailureKind::Device, err)
+    }
+}
+
+fn failure_from_stderr(
+    tool: &str,
+    stderr: &[u8],
+    status: ExitStatus,
+) -> (AssertFailureKind, VaultError) {
+    let stderr_text = String::from_utf8_lossy(stderr);
+    let kind = classify_assert_stderr(&stderr_text);
+    let err = if kind == AssertFailureKind::NoCredential {
+        VaultError::Fido2NoMatchingCredential
+    } else {
+        let detail = sanitize_stderr_snippet(&stderr_text);
+        let msg = if detail.is_empty() {
+            format!("`{tool}` failed with status {status}")
+        } else {
+            format!("`{tool}` failed: {detail}")
+        };
+        VaultError::Fido2Error(msg)
+    };
+    (kind, err)
+}
+
+/// Non-UV slots first, then UV slots. Indices are the original positions in `slots`.
+fn slot_probe_order(slots: &[Fido2KeySlot]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(slots.len());
+    order.extend(
+        slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| !slot.fido2.require_uv)
+            .map(|(idx, _)| idx),
+    );
+    order.extend(
+        slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.fido2.require_uv)
+            .map(|(idx, _)| idx),
+    );
+    order
+}
+
+/// `attempt(device_idx, slot_idx)` performs one assertion.
+fn probe_slots<F>(
+    n_devices: usize,
+    slots: &[Fido2KeySlot],
+    mut attempt: F,
+) -> Result<(usize, Zeroizing<[u8; 32]>)>
+where
+    F: FnMut(usize, usize) -> AssertOutcome,
+{
+    if cancel_requested() {
+        return Err(cancelled_error());
+    }
+    let order = slot_probe_order(slots);
+    let mut remembered: Option<(AssertFailureKind, VaultError)> = None;
+    for device_idx in 0..n_devices {
+        if cancel_requested() {
+            return Err(cancelled_error());
+        }
+        for &slot_idx in &order {
+            if cancel_requested() {
+                return Err(cancelled_error());
+            }
+            match attempt(device_idx, slot_idx) {
+                Ok(secret) => return Ok((slot_idx, secret)),
+                Err((kind, err)) => {
+                    if is_cancelled_error(&err) {
+                        return Err(err);
+                    }
+                    match kind {
+                        AssertFailureKind::NoCredential | AssertFailureKind::SlotNeedsOtherUv => {
+                            remembered = Some(prefer_failure(remembered, (kind, err)));
+                        }
+                        AssertFailureKind::Device => {
+                            remembered = Some(prefer_failure(remembered, (kind, err)));
+                            break;
+                        }
+                        AssertFailureKind::StopPinProblem => return Err(err),
+                    }
+                }
+            }
+        }
+    }
+    Err(remembered
+        .map(|(_, err)| err)
+        .unwrap_or(VaultError::Fido2NoMatchingCredential))
 }
 
 fn is_no_credentials_stderr(stderr: &str) -> bool {
@@ -390,7 +758,9 @@ fn is_no_credentials_stderr(stderr: &str) -> bool {
         return true;
     }
     // Match `0x2e` only as a standalone hex token (never prefixes like `0x2e8a`).
-    lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| tok == "0x2e")
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == "0x2e")
 }
 
 fn sanitize_stderr_snippet(stderr: &str) -> String {
@@ -437,14 +807,15 @@ impl Fido2Provider for LibFido2Cli {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        apply_pdeathsig(&mut cmd);
+        if cancel_requested() {
+            return Err(cancelled_error());
+        }
 
         eprintln!(
             "Touch your FIDO2 security key to enroll it with omavault (RP: {DEFAULT_RP_ID}, UV: {require_uv})..."
         );
 
-        let mut child = cmd
-            .spawn()
+        let mut child = spawn_grouped(&mut cmd)
             .map_err(|e| VaultError::Fido2Error(format!("failed to launch `fido2-cred`: {e}")))?;
 
         write_stdin_or_reap(&mut child, stdin_payload.as_bytes(), "fido2-cred")?;
@@ -492,8 +863,7 @@ impl Fido2Provider for LibFido2Cli {
         meta: &Fido2Metadata,
         device: Option<&str>,
     ) -> Result<Zeroizing<[u8; 32]>> {
-        let dev = Self::resolve_device(device)?;
-        self.assert_on_device(meta, &dev, false)
+        self.assert_on_any_device(meta, device)
     }
 
     fn assert_matching_slot(
@@ -504,23 +874,13 @@ impl Fido2Provider for LibFido2Cli {
         if slots.is_empty() {
             return Err(VaultError::Fido2Required);
         }
-        let devices = Self::resolve_devices(device)?;
-        let mut last_err = VaultError::Fido2NoMatchingCredential;
-        for dev in &devices {
-            for (idx, slot) in slots.iter().enumerate() {
-                match self.assert_on_device(&slot.fido2, dev, false) {
-                    Ok(secret) => return Ok((idx, secret)),
-                    Err(VaultError::Fido2NoMatchingCredential) => continue,
-                    Err(e) => {
-                        // Record non-matching error for this device and keep probing remaining
-                        // connected devices rather than aborting multi-device fallback prematurely.
-                        last_err = e;
-                        break;
-                    }
-                }
-            }
+        if cancel_requested() {
+            return Err(cancelled_error());
         }
-        Err(last_err)
+        let devices = Self::resolve_devices(device)?;
+        probe_slots(devices.len(), slots, |device_idx, slot_idx| {
+            self.assert_on_device_classified(&slots[slot_idx].fido2, &devices[device_idx], false)
+        })
     }
 }
 
@@ -583,13 +943,70 @@ fn verify_authdata_flags(
 fn apply_pdeathsig(cmd: &mut Command) {
     #[cfg(target_os = "linux")]
     unsafe {
-        cmd.pre_exec(|| {
+        let parent = libc::getpid();
+        cmd.pre_exec(move || {
             let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
             Ok(())
         });
     }
     #[cfg(not(target_os = "linux"))]
     let _ = cmd;
+}
+
+/// Owns a `fido2-*` child that lives in its own process group.
+///
+/// `spawn` can return before the child finishes `setpgid(0, 0)`, so a group-only
+/// signal can miss. Drop kills the group and the pid, and refuses `pgid <= 0`
+/// (`kill(-0)` would signal the caller).
+struct ChildGuard {
+    child: Child,
+    pgid: i32,
+    done: bool,
+}
+
+impl ChildGuard {
+    fn kill_group(&mut self) {
+        if self.done {
+            return;
+        }
+        if self.pgid > 0 {
+            unsafe {
+                libc::kill(-self.pgid, libc::SIGKILL);
+                libc::kill(self.pgid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.wait();
+        self.done = true;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            self.kill_group();
+        }
+    }
+}
+
+fn spawn_grouped(cmd: &mut Command) -> std::io::Result<ChildGuard> {
+    apply_pdeathsig(cmd);
+    let mut child = cmd.process_group(0).spawn()?;
+    let pgid = i32::try_from(child.id()).unwrap_or(-1);
+    if pgid <= 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other(
+            "refusing to track a FIDO2 child with a non-positive process group",
+        ));
+    }
+    Ok(ChildGuard {
+        child,
+        pgid,
+        done: false,
+    })
 }
 
 struct BoundedOutput {
@@ -611,15 +1028,14 @@ fn unwrap_cbor_bstr(data: &[u8]) -> Option<&[u8]> {
     let (hdr_len, bstr_len) = match ai {
         0..=23 => (1usize, ai as usize),
         24 => (2, *data.get(1)? as usize),
-        25 => (3, u16::from_be_bytes([*data.get(1)?, *data.get(2)?]) as usize),
+        25 => (
+            3,
+            u16::from_be_bytes([*data.get(1)?, *data.get(2)?]) as usize,
+        ),
         26 => (
             5,
-            u32::from_be_bytes([
-                *data.get(1)?,
-                *data.get(2)?,
-                *data.get(3)?,
-                *data.get(4)?,
-            ]) as usize,
+            u32::from_be_bytes([*data.get(1)?, *data.get(2)?, *data.get(3)?, *data.get(4)?])
+                as usize,
         ),
         _ => return None,
     };
@@ -631,12 +1047,11 @@ fn unwrap_cbor_bstr(data: &[u8]) -> Option<&[u8]> {
     }
 }
 
-fn write_stdin_or_reap(child: &mut Child, data: &[u8], tool: &str) -> Result<()> {
-    if let Some(mut stdin) = child.stdin.take() {
+fn write_stdin_or_reap(guard: &mut ChildGuard, data: &[u8], tool: &str) -> Result<()> {
+    if let Some(mut stdin) = guard.child.stdin.take() {
         if let Err(e) = stdin.write_all(data) {
             if e.kind() != std::io::ErrorKind::BrokenPipe {
-                let _ = child.kill();
-                let _ = child.wait();
+                guard.kill_group();
                 return Err(VaultError::Fido2Error(format!(
                     "failed writing to `{tool}`: {e}"
                 )));
@@ -646,10 +1061,27 @@ fn write_stdin_or_reap(child: &mut Child, data: &[u8], tool: &str) -> Result<()>
     Ok(())
 }
 
-fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<BoundedOutput> {
+fn join_drained(
+    stdout_handle: Option<thread::JoinHandle<Zeroizing<Vec<u8>>>>,
+    stderr_handle: Option<thread::JoinHandle<Vec<u8>>>,
+) -> (Zeroizing<Vec<u8>>, Vec<u8>) {
+    let stdout = stdout_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_else(|| Zeroizing::new(Vec::new()));
+    let stderr = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    (stdout, stderr)
+}
+
+fn wait_with_timeout(
+    mut guard: ChildGuard,
+    timeout: Duration,
+    tool: &str,
+) -> Result<BoundedOutput> {
     // Drain piped stdout/stderr concurrently on bounded reader threads so >64 KiB child output
     // can never deadlock the pipe while we poll `try_wait()`.
-    let stdout_handle = child.stdout.take().map(|out| {
+    let stdout_handle = guard.child.stdout.take().map(|out| {
         thread::spawn(move || {
             // Pre-size so the hmac-secret output never goes through growth reallocations.
             let mut buf = Zeroizing::new(Vec::with_capacity(MAX_FIDO2_STDOUT_BYTES as usize + 1));
@@ -657,7 +1089,7 @@ fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<
             buf
         })
     });
-    let stderr_handle = child.stderr.take().map(|err| {
+    let stderr_handle = guard.child.stderr.take().map(|err| {
         thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = err.take(MAX_FIDO2_STDERR_BYTES).read_to_end(&mut buf);
@@ -667,18 +1099,21 @@ fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<
 
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
+        if cancel_requested() {
+            guard.kill_group();
+            join_drained(stdout_handle, stderr_handle);
+            return Err(cancelled_error());
+        }
+        match guard.child.try_wait() {
+            Ok(Some(status)) => {
+                // Already reaped. Drop must not wait again.
+                guard.done = true;
+                break status;
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(h) = stdout_handle {
-                        let _ = h.join();
-                    }
-                    if let Some(h) = stderr_handle {
-                        let _ = h.join();
-                    }
+                    guard.kill_group();
+                    join_drained(stdout_handle, stderr_handle);
                     return Err(VaultError::Fido2Error(format!(
                         "`{tool}` timed out after {}s",
                         timeout.as_secs()
@@ -687,14 +1122,8 @@ fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<
                 thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(h) = stdout_handle {
-                    let _ = h.join();
-                }
-                if let Some(h) = stderr_handle {
-                    let _ = h.join();
-                }
+                guard.kill_group();
+                join_drained(stdout_handle, stderr_handle);
                 return Err(VaultError::Fido2Error(format!(
                     "failed waiting on `{tool}`: {e}"
                 )));
@@ -702,13 +1131,7 @@ fn wait_with_timeout(mut child: Child, timeout: Duration, tool: &str) -> Result<
         }
     };
 
-    let stdout = stdout_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_else(|| Zeroizing::new(Vec::new()));
-    let stderr = stderr_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-
+    let (stdout, stderr) = join_drained(stdout_handle, stderr_handle);
     Ok(BoundedOutput {
         status,
         stdout,
@@ -875,23 +1298,439 @@ mod tests {
         raw.extend_from_slice(&rp_hash);
         raw.push(0x01 | 0x04 | 0x40 | 0x80); // UP | UV | AT | ED
         raw.extend_from_slice(&[0u8; 4]); // signCount
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, true, true, true).is_ok());
+        assert!(
+            verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, true, true, true).is_ok()
+        );
 
         // Clear UV bit: passes when require_uv=false, fails when require_uv=true.
         raw[2 + 32] = 0x01 | 0x80; // UP | ED
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, false, true).is_ok());
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, true, false, true).is_err());
+        assert!(
+            verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, false, true).is_ok()
+        );
+        assert!(
+            verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, true, false, true).is_err()
+        );
 
         // Missing AT on enrollment fails; missing ED fails.
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, true, true).is_err());
+        assert!(
+            verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, true, true).is_err()
+        );
         raw[2 + 32] = 0x01; // UP only, missing ED
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, false, true).is_err());
+        assert!(
+            verify_authdata_flags(&BASE64.encode(&raw), DEFAULT_RP_ID, false, false, true).is_err()
+        );
 
         // Wrong rpIdHash fails.
         raw[2 + 32] = 0x01 | 0x80;
-        assert!(verify_authdata_flags(&BASE64.encode(&raw), "other.local", false, false, true).is_err());
+        assert!(
+            verify_authdata_flags(&BASE64.encode(&raw), "other.local", false, false, true).is_err()
+        );
 
         // Non-CBOR raw authdata (without major type 2 header) MUST fail closed.
-        assert!(verify_authdata_flags(&BASE64.encode(&raw[2..]), DEFAULT_RP_ID, false, false, true).is_err());
+        assert!(verify_authdata_flags(
+            &BASE64.encode(&raw[2..]),
+            DEFAULT_RP_ID,
+            false,
+            false,
+            true
+        )
+        .is_err());
+    }
+
+    fn test_slot(label: &str, require_uv: bool) -> Fido2KeySlot {
+        Fido2KeySlot {
+            label: label.into(),
+            fido2: Fido2Metadata {
+                rp_id: DEFAULT_RP_ID.into(),
+                credential_id_b64: BASE64.encode(label.as_bytes()),
+                hmac_salt_b64: BASE64.encode(&[0u8; 32]),
+                require_uv,
+            },
+            wrap_nonce_b64: String::new(),
+            wrapped_key_b64: String::new(),
+        }
+    }
+
+    fn assert_pid_gone(pid: i32) {
+        assert!(pid > 0, "refusing to signal a non-positive pid");
+        let started = Instant::now();
+        loop {
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc == -1 {
+                let err = std::io::Error::last_os_error().raw_os_error();
+                assert_eq!(err, Some(libc::ESRCH), "kill({pid}, 0) errno {err:?}");
+                return;
+            }
+            if started.elapsed() > Duration::from_secs(1) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                panic!("pid {pid} still alive after 1s");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn assert_on_device_rejects_bad_metadata_before_spawn() {
+        let meta = Fido2Metadata {
+            rp_id: "evil.example".into(),
+            credential_id_b64: BASE64.encode(&[1u8; 32]),
+            hmac_salt_b64: BASE64.encode(&[2u8; 32]),
+            require_uv: false,
+        };
+        let err = match LibFido2Cli.assert_on_device(&meta, "/dev/hidraw0", false) {
+            Err(err) => err,
+            Ok(_) => panic!("bad metadata was accepted"),
+        };
+        assert!(matches!(err, VaultError::Fido2Error(_)));
+    }
+
+    #[test]
+    fn classifies_assert_stderr_by_code() {
+        let cases = [
+            ("FIDO_ERR_NO_CREDENTIALS", AssertFailureKind::NoCredential),
+            ("fido_err_no_credentials", AssertFailureKind::NoCredential),
+            ("0x2e", AssertFailureKind::NoCredential),
+            ("no credentials", AssertFailureKind::NoCredential),
+            ("FIDO_ERR_PIN_NOT_SET", AssertFailureKind::SlotNeedsOtherUv),
+            ("0x35", AssertFailureKind::SlotNeedsOtherUv),
+            (
+                "FIDO_ERR_UNSUPPORTED_OPTION",
+                AssertFailureKind::SlotNeedsOtherUv,
+            ),
+            ("0x2b", AssertFailureKind::SlotNeedsOtherUv),
+            (
+                "FIDO_ERR_INVALID_OPTION",
+                AssertFailureKind::SlotNeedsOtherUv,
+            ),
+            ("0x2c", AssertFailureKind::SlotNeedsOtherUv),
+            ("FIDO_ERR_PIN_INVALID", AssertFailureKind::StopPinProblem),
+            ("0x31", AssertFailureKind::StopPinProblem),
+            ("FIDO_ERR_PIN_BLOCKED", AssertFailureKind::StopPinProblem),
+            ("0x32", AssertFailureKind::StopPinProblem),
+            (
+                "FIDO_ERR_PIN_AUTH_INVALID",
+                AssertFailureKind::StopPinProblem,
+            ),
+            ("0x33", AssertFailureKind::StopPinProblem),
+            (
+                "FIDO_ERR_PIN_AUTH_BLOCKED",
+                AssertFailureKind::StopPinProblem,
+            ),
+            ("0x34", AssertFailureKind::StopPinProblem),
+            ("FIDO_ERR_PIN_REQUIRED", AssertFailureKind::StopPinProblem),
+            ("0x36", AssertFailureKind::StopPinProblem),
+            ("FIDO_ERR_UV_BLOCKED", AssertFailureKind::StopPinProblem),
+            ("0x3c", AssertFailureKind::StopPinProblem),
+            ("0x3C", AssertFailureKind::StopPinProblem),
+            ("FIDO_ERR_UV_INVALID", AssertFailureKind::StopPinProblem),
+            ("0x3f", AssertFailureKind::StopPinProblem),
+            (
+                "FIDO_ERR_OPERATION_DENIED",
+                AssertFailureKind::StopPinProblem,
+            ),
+            ("0x27", AssertFailureKind::StopPinProblem),
+            ("something else entirely", AssertFailureKind::Device),
+            ("0x350", AssertFailureKind::Device),
+            ("0x2e8a", AssertFailureKind::Device),
+            ("code 0x350", AssertFailureKind::Device),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(classify_assert_stderr(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn uv_retry_only_when_slot_needs_other_uv() {
+        assert!(should_retry_with_uv(AssertFailureKind::SlotNeedsOtherUv));
+        assert!(!should_retry_with_uv(AssertFailureKind::StopPinProblem));
+        assert!(!should_retry_with_uv(AssertFailureKind::NoCredential));
+        assert!(!should_retry_with_uv(AssertFailureKind::Device));
+    }
+
+    #[test]
+    fn probe_slots_matches_non_uv_slot_after_uv_option_failure() {
+        // Stored UV-first. A PIN/option failure on A must not hide non-UV slot B (M-7).
+        let slots = vec![test_slot("A", true), test_slot("B", false)];
+        let (idx, secret) = probe_slots(1, &slots, |_dev, slot_idx| {
+            if slots[slot_idx].fido2.require_uv {
+                Err((
+                    AssertFailureKind::SlotNeedsOtherUv,
+                    VaultError::Fido2Error("FIDO_ERR_PIN_NOT_SET".into()),
+                ))
+            } else {
+                Ok(Zeroizing::new([9u8; 32]))
+            }
+        })
+        .expect("non-UV slot matches");
+        assert_eq!(idx, 1);
+        assert_eq!(secret.as_slice(), &[9u8; 32]);
+    }
+
+    #[test]
+    fn probe_slots_continues_to_the_next_slot_after_other_uv() {
+        // Non-UV misses, the first UV slot cannot do PIN, a later UV slot still matches.
+        let slots = vec![
+            test_slot("A", true),
+            test_slot("B", false),
+            test_slot("C", true),
+        ];
+        let (idx, secret) = probe_slots(1, &slots, |_dev, slot_idx| {
+            match slots[slot_idx].label.as_str() {
+                "B" => Err((
+                    AssertFailureKind::NoCredential,
+                    VaultError::Fido2NoMatchingCredential,
+                )),
+                "A" => Err((
+                    AssertFailureKind::SlotNeedsOtherUv,
+                    VaultError::Fido2Error("FIDO_ERR_PIN_NOT_SET".into()),
+                )),
+                "C" => Ok(Zeroizing::new([3u8; 32])),
+                other => panic!("unexpected slot {other}"),
+            }
+        })
+        .expect("later UV slot matches");
+        assert_eq!(idx, 2);
+        assert_eq!(secret.as_slice(), &[3u8; 32]);
+    }
+
+    #[test]
+    fn probe_slots_stops_on_pin_problem_without_another_uv_attempt() {
+        let slots = vec![
+            test_slot("A", true),
+            test_slot("B", false),
+            test_slot("C", true),
+        ];
+        let mut uv_calls = 0;
+        let mut devices = Vec::new();
+        let err = probe_slots(2, &slots, |dev, slot_idx| {
+            devices.push(dev);
+            if slots[slot_idx].fido2.require_uv {
+                uv_calls += 1;
+                Err((
+                    AssertFailureKind::StopPinProblem,
+                    VaultError::Fido2Error("FIDO_ERR_PIN_INVALID".into()),
+                ))
+            } else {
+                Err((
+                    AssertFailureKind::NoCredential,
+                    VaultError::Fido2NoMatchingCredential,
+                ))
+            }
+        })
+        .expect_err("pin failure stops the probe");
+        assert!(matches!(err, VaultError::Fido2Error(msg) if msg == "FIDO_ERR_PIN_INVALID"));
+        assert_eq!(uv_calls, 1);
+        assert!(devices.iter().all(|dev| *dev == 0));
+    }
+
+    #[test]
+    fn probe_slots_continues_on_the_next_device_after_a_device_error() {
+        let slots = vec![test_slot("B", false)];
+        let mut seen = Vec::new();
+        let (idx, secret) = probe_slots(2, &slots, |dev, _slot_idx| {
+            seen.push(dev);
+            if dev == 0 {
+                Err((
+                    AssertFailureKind::Device,
+                    VaultError::Fido2Error("io error".into()),
+                ))
+            } else {
+                Ok(Zeroizing::new([4u8; 32]))
+            }
+        })
+        .expect("device 1 matches");
+        assert_eq!(idx, 0);
+        assert_eq!(seen, vec![0, 1]);
+        assert_eq!(secret.as_slice(), &[4u8; 32]);
+    }
+
+    #[test]
+    fn probe_slots_tries_non_uv_before_uv_on_each_device() {
+        let slots = vec![
+            test_slot("A", true),
+            test_slot("B", false),
+            test_slot("C", true),
+        ];
+        let mut order = Vec::new();
+        let err = probe_slots(2, &slots, |dev, slot_idx| {
+            order.push((dev, slot_idx));
+            Err((
+                AssertFailureKind::NoCredential,
+                VaultError::Fido2NoMatchingCredential,
+            ))
+        })
+        .expect_err("nothing matches");
+        assert!(matches!(err, VaultError::Fido2NoMatchingCredential));
+        assert_eq!(order, vec![(0, 1), (0, 0), (0, 2), (1, 1), (1, 0), (1, 2)]);
+    }
+
+    #[test]
+    fn probe_slots_prefers_the_most_informative_remembered_error() {
+        let slots = vec![test_slot("B", false)];
+        let err = probe_slots(2, &slots, |dev, _slot_idx| {
+            if dev == 0 {
+                Err((
+                    AssertFailureKind::SlotNeedsOtherUv,
+                    VaultError::Fido2Error("no pin".into()),
+                ))
+            } else {
+                Err((
+                    AssertFailureKind::Device,
+                    VaultError::Fido2Error("io error".into()),
+                ))
+            }
+        })
+        .expect_err("no match");
+        assert!(matches!(err, VaultError::Fido2Error(msg) if msg == "no pin"));
+    }
+
+    #[test]
+    fn probe_slots_does_not_treat_cancel_as_a_device_error() {
+        let slots = vec![test_slot("B", false)];
+        let mut calls = 0;
+        let err = probe_slots(2, &slots, |_dev, _slot_idx| {
+            calls += 1;
+            Err((AssertFailureKind::Device, cancelled_error()))
+        })
+        .expect_err("cancel stops the probe");
+        assert_eq!(calls, 1);
+        assert!(is_cancelled_error(&err));
+
+        let cancel = Fido2Cancel::new();
+        cancel.cancel();
+        let err = with_cancel(&cancel, || {
+            probe_slots(1, &slots, |_dev, _slot_idx| {
+                panic!("must not attempt an assertion after cancel");
+            })
+        })
+        .expect_err("already cancelled");
+        assert!(is_cancelled_error(&err));
+    }
+
+    #[test]
+    fn child_guard_kills_process_group_on_drop() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = spawn_grouped(&mut cmd).expect("spawn sleep");
+        let pid = guard.pgid;
+        drop(guard);
+        assert_pid_gone(pid);
+    }
+
+    #[test]
+    fn child_guard_kills_process_group_on_unwind() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let pid = std::sync::atomic::AtomicI32::new(0);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = spawn_grouped(&mut cmd).expect("spawn sleep");
+            pid.store(guard.pgid, Ordering::SeqCst);
+            panic!("unwind with a live fido child");
+        }));
+        assert!(panicked.is_err());
+        let pid = pid.load(Ordering::SeqCst);
+        assert_pid_gone(pid);
+    }
+
+    #[test]
+    fn cancel_stops_wait_and_reaps_the_child() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = spawn_grouped(&mut cmd).expect("spawn sleep");
+        let pid = guard.pgid;
+        let cancel = Fido2Cancel::new();
+        let cancel_thread = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_thread.cancel();
+        });
+        let started = Instant::now();
+        let err = match with_cancel(&cancel, || {
+            wait_with_timeout(guard, Duration::from_secs(45), "sleep")
+        }) {
+            Err(err) => err,
+            Ok(_) => panic!("cancelled wait returned success"),
+        };
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "elapsed {:?}",
+            started.elapsed()
+        );
+        match err {
+            VaultError::Fido2Error(msg) => assert_eq!(msg, "FIDO2 operation cancelled"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_pid_gone(pid);
+    }
+
+    struct IndexPastEnd;
+
+    impl Fido2Provider for IndexPastEnd {
+        fn enroll(&self, _device: Option<&str>, _require_uv: bool) -> Result<Fido2Metadata> {
+            Err(VaultError::Fido2Error("enroll unused".into()))
+        }
+
+        fn get_hmac_secret(
+            &self,
+            _meta: &Fido2Metadata,
+            _device: Option<&str>,
+        ) -> Result<Zeroizing<[u8; 32]>> {
+            Err(VaultError::Fido2Error("hmac unused".into()))
+        }
+
+        fn assert_matching_slot(
+            &self,
+            _slots: &[Fido2KeySlot],
+            _device: Option<&str>,
+        ) -> Result<(usize, Zeroizing<[u8; 32]>)> {
+            Ok((1, Zeroizing::new([0x5a; 32])))
+        }
+    }
+
+    #[test]
+    fn resolve_master_key_out_of_range_slot_does_not_panic() {
+        let params = crate::crypto::kdf::KdfParams {
+            mem_kib: 32,
+            time_cost: 1,
+            parallelism: 1,
+        };
+        let mut header =
+            crate::crypto::VaultHeader::new_v2_fido2_shell(params, false).expect("v2 shell");
+        header.fido2_slots.push(test_slot("only", false));
+        let err = match crate::crypto::resolve_master_key(
+            &header,
+            b"pw",
+            None,
+            &IndexPastEnd,
+            None,
+            false,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("out-of-range slot unlocked"),
+        };
+        assert!(matches!(err, VaultError::Fido2NoMatchingCredential));
+    }
+
+    #[test]
+    fn to_bytes_rejects_mem_kib_above_the_ceiling() {
+        let params = crate::crypto::kdf::KdfParams {
+            mem_kib: crate::crypto::kdf::MAX_ARGON2_MEM_KIB + 1,
+            time_cost: 1,
+            parallelism: 1,
+        };
+        let header = crate::crypto::VaultHeader::new_v2_fido2_shell(params, false).expect("shell");
+        let err = header.to_bytes().expect_err("absurd mem_kib");
+        assert!(matches!(err, VaultError::WeakKdfParameters(_)));
     }
 }

@@ -58,6 +58,10 @@ Offset   Size   Field            Notes
   - Valid CBOR major-type-2 byte-string `authdata` (fail-closed, no raw fallback)
   - `authdata[0..32] == SHA-256(rp_id)` (`rpIdHash`)
   - CTAP2 flags: `UP` (`0x01`) always required, `ED` (`0x80`) required for `hmac-secret`, `AT` (`0x40`) required on enrollment, and `UV` (`0x04`) required when `require_uv == true`.
+- Slot probing tries non-UV credentials before UV credentials on each device. "No credentials" and "this authenticator cannot satisfy UV" move on to the next slot. A wrong PIN, a blocked PIN, or a refused touch stops the probe immediately, so later slots cannot burn the key's PIN retry counter.
+- Each `fido2-*` child is placed in its own process group and killed with that group on timeout, cancellation, panic, or if the parent dies (`PR_SET_PDEATHSIG`, checked again after `fork`). TUI cancel and every daemon lock path (lock, sleep, screen lock, `SIGUSR1`) set that cancel flag.
+- UV slots request PIN first (`-t pin=true`) and retry once with `-t uv=true` only when the token reports it has no PIN or rejects the option. Both attempts still require the authenticator-data UV flag.
+- **Limit:** `fido2-assert -t pin=true` reads the PIN from `/dev/tty`. `omavaultd` has no terminal, so UV/PIN-required slots cannot be unlocked through the daemon. They work in the standalone CLI/TUI (`systemctl --user stop omavaultd`, or no daemon). A PIN-forwarding protocol is out of scope.
 
 ## 4. Threat Model (Honest Boundaries)
 

@@ -16,22 +16,17 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::clipboard::{
     clear_clipboard_best_effort, copy_secret, ClipboardOptions, DEFAULT_CLIPBOARD_TIMEOUT_SECS,
 };
-use crate::crypto::fido2::LibFido2Cli;
+use crate::crypto::fido2::{with_cancel, Fido2Cancel, LibFido2Cli};
 use crate::crypto::kdf::hash_keyfile;
 use crate::crypto::{header_revision, resolve_master_key, VaultHeader, VAULT_VERSION_V2};
 use crate::daemon::{DaemonClient, DEFAULT_IDLE_TIMEOUT_SECS};
-use crate::procsig::TuiRegistration;
-use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault};
-use crate::sleep::SleepMonitor;
 use crate::error::{Result, VaultError};
 use crate::generator::{
     estimate_entropy_bits, generate_passphrase, generate_password, generated_password_entropy_bits,
@@ -41,8 +36,11 @@ use crate::hardening::{
     boottime_monotonic_skew_ms, boottime_secs, is_screen_locker_active, sanitize_multiline,
     sanitize_single_line, swap_exposure, HardeningStatus, LockedKey,
 };
+use crate::procsig::TuiRegistration;
+use crate::sleep::SleepMonitor;
 use crate::totp::TotpConfig;
 use crate::vault::audit::{run_audit, AuditReport};
+use crate::vault::rollback::{enforce_rollback_policy, record_saved_vault};
 use crate::vault::storage::{
     load_vault_from_disk, read_header_from_disk, save_vault_to_disk_checked,
 };
@@ -466,14 +464,16 @@ impl App {
                 } else {
                     None
                 };
-                let res = resolve_master_key(
-                    &header,
-                    passphrase.as_bytes(),
-                    kf_digest.as_deref(),
-                    &LibFido2Cli,
-                    fido2_device.as_deref(),
-                    true,
-                )?;
+                let res = with_cancel(&Fido2Cancel::from_flag(Arc::clone(&cancelled)), || {
+                    resolve_master_key(
+                        &header,
+                        passphrase.as_bytes(),
+                        kf_digest.as_deref(),
+                        &LibFido2Cli,
+                        fido2_device.as_deref(),
+                        true,
+                    )
+                })?;
                 if cancelled.load(Ordering::SeqCst) {
                     return Err(VaultError::Daemon("unlock cancelled".into()));
                 }
@@ -618,7 +618,10 @@ impl App {
 
     fn copy_to_secret_clipboard(&mut self, label: &str, secret: &str) {
         if secret.is_empty() {
-            self.set_toast(ToastLevel::Warn, format!("{label} is empty — nothing copied"));
+            self.set_toast(
+                ToastLevel::Warn,
+                format!("{label} is empty — nothing copied"),
+            );
             return;
         }
         let opts = ClipboardOptions {
@@ -912,8 +915,8 @@ impl App {
                         form.active_field = (form.active_field + 1) % EntryForm::FIELD_COUNT;
                     }
                     KeyCode::BackTab | KeyCode::Up => {
-                        form.active_field =
-                            (form.active_field + EntryForm::FIELD_COUNT - 1) % EntryForm::FIELD_COUNT;
+                        form.active_field = (form.active_field + EntryForm::FIELD_COUNT - 1)
+                            % EntryForm::FIELD_COUNT;
                     }
                     KeyCode::Enter => {
                         if form.active_field + 1 < EntryForm::FIELD_COUNT {
@@ -1005,7 +1008,10 @@ impl App {
                         match totp.generate_now() {
                             Ok(code) => {
                                 self.copy_to_secret_clipboard(
-                                    &format!("'{}' TOTP ({}s left)", entry.name, code.remaining_secs),
+                                    &format!(
+                                        "'{}' TOTP ({}s left)",
+                                        entry.name, code.remaining_secs
+                                    ),
                                     &code.code,
                                 );
                             }
@@ -1190,7 +1196,9 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
 
     let run_res = (|| -> Result<()> {
         loop {
-            terminal.draw(|f| draw_ui(f, &mut app)).map_err(VaultError::Io)?;
+            terminal
+                .draw(|f| draw_ui(f, &mut app))
+                .map_err(VaultError::Io)?;
 
             let poll_ms = if matches!(app.mode, Mode::Unlocking { .. }) {
                 100
@@ -1206,7 +1214,9 @@ pub fn run_tui(cfg: TuiConfig) -> Result<()> {
             }
             if sleep_request.swap(false, Ordering::SeqCst) {
                 app.emergency_lock("system pre-sleep/hibernate");
-                terminal.draw(|f| draw_ui(f, &mut app)).map_err(VaultError::Io)?;
+                terminal
+                    .draw(|f| draw_ui(f, &mut app))
+                    .map_err(VaultError::Io)?;
                 sleep_done.store(true, Ordering::SeqCst);
             }
             if signal_lock.swap(false, Ordering::SeqCst) {
@@ -1243,7 +1253,8 @@ fn sanitize_display(s: &str) -> String {
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let bg_block = Block::default().style(Style::default().bg(theme::BG_PRIMARY).fg(theme::FG_PRIMARY));
+    let bg_block =
+        Block::default().style(Style::default().bg(theme::BG_PRIMARY).fg(theme::FG_PRIMARY));
     f.render_widget(bg_block, area);
 
     match &app.mode {
@@ -1349,7 +1360,10 @@ fn draw_locked_screen(
     };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("  OMAVAULT  ·  HARDENED PASSWORD VAULT", theme::title_style()),
+            Span::styled(
+                "  OMAVAULT  ·  HARDENED PASSWORD VAULT",
+                theme::title_style(),
+            ),
             Span::styled(format!("   v{}", crate::VERSION), theme::muted_style()),
         ]),
         Line::from(""),
@@ -1469,7 +1483,9 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!("Search: {search_text}  "),
             if search_active {
-                Style::default().fg(theme::ACCENT_CYAN).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::ACCENT_CYAN)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 theme::muted_style()
             },
@@ -1500,7 +1516,10 @@ fn draw_entry_list(f: &mut Frame, area: Rect, app: &mut App) {
                 let entry = &vault.entries[idx];
                 let mut spans = vec![Span::raw(format!(" {}", sanitize_display(&entry.name)))];
                 if entry.totp.is_some() {
-                    spans.push(Span::styled(" [2FA]", Style::default().fg(theme::ACCENT_GREEN)));
+                    spans.push(Span::styled(
+                        " [2FA]",
+                        Style::default().fg(theme::ACCENT_GREEN),
+                    ));
                 }
                 if entry.password.is_empty() || estimate_entropy_bits(&entry.password) < 60.0 {
                     spans.push(Span::styled(" [!]", theme::warn_style()));
@@ -1576,7 +1595,9 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(" Name:     ", theme::muted_style()),
             Span::styled(
                 sanitize_display(&entry.name),
-                Style::default().fg(theme::ACCENT_CYAN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::ACCENT_CYAN)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -1640,7 +1661,10 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
 
     if !entry.custom_fields.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(" Custom Fields:", theme::muted_style())));
+        lines.push(Line::from(Span::styled(
+            " Custom Fields:",
+            theme::muted_style(),
+        )));
         for cf in &entry.custom_fields {
             let val = if cf.secret && !app.reveal_password {
                 "••••••••".to_string()
@@ -1678,12 +1702,17 @@ fn draw_entry_detail(f: &mut Frame, area: Rect, app: &App) {
                         .border_style(Style::default().fg(gauge_color))
                         .title(Span::styled(
                             format!(" 2FA TOTP ({}) — press [t] to copy ", totp.algorithm),
-                            Style::default().fg(gauge_color).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(gauge_color)
+                                .add_modifier(Modifier::BOLD),
                         )),
                 )
                 .gauge_style(Style::default().fg(gauge_color).bg(theme::BG_ELEVATED))
                 .ratio(ratio)
-                .label(format!("{formatted}   ({}s remaining)", code.remaining_secs));
+                .label(format!(
+                    "{formatted}   ({}s remaining)",
+                    code.remaining_secs
+                ));
             f.render_widget(gauge, sections[1]);
         }
     }
@@ -1752,7 +1781,9 @@ fn draw_editor_modal(f: &mut Frame, area: Rect, form: &EntryForm) {
         let active = idx == form.active_field;
         let prefix = if active { "▸ " } else { "  " };
         let style = if active {
-            Style::default().fg(theme::ACCENT_CYAN).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::ACCENT_CYAN)
+                .add_modifier(Modifier::BOLD)
         } else {
             theme::muted_style()
         };
@@ -1845,7 +1876,10 @@ fn draw_generator_modal(f: &mut Frame, area: Rect, gen: &GenModalState) {
                 .borders(Borders::ALL)
                 .border_style(theme::border_style(true))
                 .style(Style::default().bg(theme::BG_PRIMARY))
-                .title(Span::styled(" CSPRNG Password Generator ", theme::title_style())),
+                .title(Span::styled(
+                    " CSPRNG Password Generator ",
+                    theme::title_style(),
+                )),
         )
         .wrap(Wrap { trim: false });
     f.render_widget(p, modal);
@@ -1886,7 +1920,10 @@ fn draw_audit_modal(f: &mut Frame, area: Rect, report: &AuditReport) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("  ! Weak / empty passwords ({}):", report.weak_passwords.len()),
+            format!(
+                "  ! Weak / empty passwords ({}):",
+                report.weak_passwords.len()
+            ),
             theme::danger_style(),
         )));
         for w in report.weak_passwords.iter().take(6) {
@@ -1900,7 +1937,10 @@ fn draw_audit_modal(f: &mut Frame, area: Rect, report: &AuditReport) {
         }
         if report.weak_passwords.len() > 6 {
             lines.push(Line::from(Span::styled(
-                format!("    ...and {} more (run `omavault audit` for full list)", report.weak_passwords.len() - 6),
+                format!(
+                    "    ...and {} more (run `omavault audit` for full list)",
+                    report.weak_passwords.len() - 6
+                ),
                 theme::muted_style(),
             )));
         }
@@ -1913,7 +1953,10 @@ fn draw_audit_modal(f: &mut Frame, area: Rect, report: &AuditReport) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("  ! Reused password groups ({}):", report.reused_groups.len()),
+            format!(
+                "  ! Reused password groups ({}):",
+                report.reused_groups.len()
+            ),
             theme::danger_style(),
         )));
         for g in report.reused_groups.iter().take(5) {
@@ -1994,7 +2037,10 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         Line::from("   j / k / ↑ / ↓   Move selection"),
         Line::from("   /               Filter entries (Esc clears)"),
         Line::from(""),
-        Line::from(Span::styled("  Secrets & Wayland Clipboard", theme::title_style())),
+        Line::from(Span::styled(
+            "  Secrets & Wayland Clipboard",
+            theme::title_style(),
+        )),
         Line::from("   y               Copy password (x-kde-passwordManagerHint secret-tagged)"),
         Line::from("   u               Copy username (secret-tagged)"),
         Line::from("   t               Copy live 2FA TOTP code (secret-tagged)"),
