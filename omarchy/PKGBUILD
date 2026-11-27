@@ -13,15 +13,20 @@ optdepends=(
 )
 makedepends=('cargo')
 
+prepare() {
+    cd "$startdir/.."
+    cargo fetch --locked
+}
+
 build() {
     cd "$startdir/.."
     export CARGO_TARGET_DIR=target
-    cargo build --locked --release
+    cargo build --frozen --release
 }
 
 check() {
     cd "$startdir/.."
-    cargo test --locked
+    cargo test --frozen
 }
 
 package() {

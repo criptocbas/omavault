@@ -31,13 +31,19 @@ local function omavault_launch_cmd()
       .. quoted_bin
       .. " tui"
   elseif o.cmd_present("ghostty") then
+    -- Ghostty 1.4 renamed --scrollback-limit to --scrollback-limit-bytes
+    -- (compat alias). Set both byte and line limits to 0 so neither the 50 MB
+    -- default nor unlimited lines keeps history. copy-on-select=none is the
+    -- current name (false remains an alias). clipboard-write=deny is unchanged.
     return "uwsm-app -- ghostty --gtk-single-instance=false --class=org.omarchy.omavault"
-      .. " --title=omavault --scrollback-limit=0 --copy-on-select=false --clipboard-write=deny -e "
+      .. " --title=omavault --scrollback-limit-lines=0 --scrollback-limit-bytes=0"
+      .. " --copy-on-select=none --clipboard-write=deny -e "
       .. quoted_bin
       .. " tui"
   elseif o.cmd_present("alacritty") then
     return "uwsm-app -- alacritty --class org.omarchy.omavault --title omavault"
-      .. " -o scrolling.history=0 -o 'terminal.osc52=\"Disabled\"' -e "
+      .. " -o scrolling.history=0 -o 'terminal.osc52=\"Disabled\"'"
+      .. " -o selection.save_to_clipboard=false -e "
       .. quoted_bin
       .. " tui"
   else

@@ -15,6 +15,19 @@ HYPR_DIR="${HOME}/.config/hypr"
 
 mkdir -p "${BIN_DIR}" "${SYSTEMD_DIR}" "${HYPR_DIR}"
 
+# A packaged unit at /usr/lib is the one that should run. A leftover user unit
+# shadows it and keeps ExecStart pointed at ~/.local/bin/omavault.
+if [[ -e /usr/lib/systemd/user/omavaultd.service && -e "${SYSTEMD_DIR}/omavaultd.service" ]]; then
+    echo "Warning: ${SYSTEMD_DIR}/omavaultd.service shadows the packaged unit" >&2
+    echo "         (/usr/lib/systemd/user/omavaultd.service) and points at ~/.local/bin/omavault." >&2
+    echo "         Remove the user unit if you want the packaged service:" >&2
+    echo "         rm ${SYSTEMD_DIR}/omavaultd.service && systemctl --user daemon-reload" >&2
+fi
+if [[ -e /usr/bin/omavault && -e "${BIN_DIR}/omavault" ]]; then
+    echo "Warning: both /usr/bin/omavault and ${BIN_DIR}/omavault exist." >&2
+    echo "         Hyprland launches /usr/bin/omavault when it is present; the copy under ~/.local/bin is separate." >&2
+fi
+
 install -m 0700 "${TARGET_DIR}/release/omavault" "${BIN_DIR}/omavault"
 echo "==> Installed binary to ${BIN_DIR}/omavault (0700)"
 

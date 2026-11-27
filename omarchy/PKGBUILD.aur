@@ -1,0 +1,46 @@
+# Maintainer: CBas
+# [MAINTAINER] Do not publish until validpgpkeys is the fingerprint of the key
+# that signs `git tag -s v$pkgver`. The placeholder below will not verify.
+pkgname=omavault
+pkgver=0.3.1
+pkgrel=1
+pkgdesc="Bulletproof, memory-hardened Rust password manager for Omarchy Linux (Arch + Hyprland + Wayland)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/criptocbas/omavault"
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'dbus')
+optdepends=(
+    'libfido2: FIDO2 / YubiKey hmac-secret hardware 2FA support'
+    'foot: zero-scrollback TUI terminal launcher on Omarchy 4.5+'
+)
+makedepends=('cargo' 'git')
+source=("$pkgname::git+https://github.com/criptocbas/omavault.git#tag=v$pkgver?signed")
+validpgpkeys=('<MAINTAINER KEY FINGERPRINT>')
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$srcdir/$pkgname"
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$srcdir/$pkgname"
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$srcdir/$pkgname"
+    cargo test --frozen
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+    install -Dm755 "target/release/omavault" "$pkgdir/usr/bin/omavault"
+    install -Dm644 "omarchy/omavaultd.service" "$pkgdir/usr/lib/systemd/user/omavaultd.service"
+    sed -i 's|%h/.local/bin/omavault|/usr/bin/omavault|g' "$pkgdir/usr/lib/systemd/user/omavaultd.service"
+    install -Dm644 "omarchy/omavault.lua" "$pkgdir/usr/share/doc/$pkgname/omavault.lua"
+    install -Dm644 "omarchy/hypr-omavault.conf" "$pkgdir/usr/share/doc/$pkgname/hypr-omavault.conf"
+    install -Dm644 "omarchy/hypridle-hook.conf" "$pkgdir/usr/share/doc/$pkgname/hypridle-hook.conf"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
