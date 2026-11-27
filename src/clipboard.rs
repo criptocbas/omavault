@@ -614,7 +614,22 @@ pub fn clear_clipboard_best_effort() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// `tempfile` creates its directory as `0o777` masked by the process umask.
+    /// A host or CI umask of `0000` / `0002` leaves that directory `0777` /
+    /// `0775`, and [`ensure_private_dir_strict`] refuses a pre-existing
+    /// group- or world-writable directory. Clipboard tests therefore use a
+    /// subdirectory forced to `0o700`, independent of umask.
+    fn private_clip_dir() -> (tempfile::TempDir, PathBuf) {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("omavault");
+        fs::create_dir(&dir).unwrap();
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&dir, perms).unwrap();
+        (parent, dir)
+    }
 
     fn jitter(n: u32) {
         let micros = (n.wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 16) % 40;
@@ -632,8 +647,8 @@ mod tests {
 
     #[test]
     fn write_read_round_trip_and_remove_if_matches_generation_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ClipStore::in_dir(dir.path().to_path_buf());
+        let (_parent, dir) = private_clip_dir();
+        let store = ClipStore::in_dir(dir.clone());
         let guard = store.lock(CLIP_LOCK_TIMEOUT).unwrap();
         assert!(guard.read().is_none());
         guard.write(1234, "G1").unwrap();
@@ -649,25 +664,25 @@ mod tests {
 
     #[test]
     fn lock_refuses_symlink_and_hardlink_and_is_mode_0600() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ClipStore::in_dir(dir.path().to_path_buf());
+        let (_parent, dir) = private_clip_dir();
+        let store = ClipStore::in_dir(dir.clone());
         drop(store.lock(CLIP_LOCK_TIMEOUT).unwrap());
-        let lock_path = dir.path().join("clip.lock");
+        let lock_path = dir.join("clip.lock");
         let mode = fs::metadata(&lock_path).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600, "clip.lock mode is {mode:04o}");
 
-        let hard = dir.path().join("clip.lock.hard");
+        let hard = dir.join("clip.lock.hard");
         fs::hard_link(&lock_path, &hard).unwrap();
         assert!(
             store.lock(CLIP_LOCK_TIMEOUT).is_err(),
             "hard-linked clip.lock must be refused"
         );
 
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("not-the-lock");
+        let (_parent, dir) = private_clip_dir();
+        let target = dir.join("not-the-lock");
         fs::write(&target, b"x").unwrap();
-        std::os::unix::fs::symlink(&target, dir.path().join("clip.lock")).unwrap();
-        let store = ClipStore::in_dir(dir.path().to_path_buf());
+        std::os::unix::fs::symlink(&target, dir.join("clip.lock")).unwrap();
+        let store = ClipStore::in_dir(dir);
         assert!(
             store.lock(CLIP_LOCK_TIMEOUT).is_err(),
             "symlinked clip.lock must be refused"
@@ -676,10 +691,10 @@ mod tests {
 
     #[test]
     fn lock_timeout_is_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ClipStore::in_dir(dir.path().to_path_buf());
+        let (_parent, dir) = private_clip_dir();
+        let store = ClipStore::in_dir(dir.clone());
         let _held = store.lock(CLIP_LOCK_TIMEOUT).unwrap();
-        let store2 = ClipStore::in_dir(dir.path().to_path_buf());
+        let store2 = ClipStore::in_dir(dir);
         let started = Instant::now();
         let err = store2.lock(Duration::from_millis(100));
         let elapsed = started.elapsed();
@@ -696,8 +711,8 @@ mod tests {
 
     #[test]
     fn h3_state_is_published_before_previous_helper_is_signalled() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ClipStore::in_dir(dir.path().to_path_buf());
+        let (_parent, dir) = private_clip_dir();
+        let store = ClipStore::in_dir(dir.clone());
         let guard = store.lock(CLIP_LOCK_TIMEOUT).unwrap();
         guard.write(1, "G1").unwrap();
         let previous = guard.read();
@@ -714,8 +729,8 @@ mod tests {
 
     #[test]
     fn h3_superseded_helper_never_decides_to_clear() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ClipStore::in_dir(dir.path().to_path_buf());
+        let (_parent, dir) = private_clip_dir();
+        let store = ClipStore::in_dir(dir.clone());
         for i in 0..1000 {
             {
                 let guard = store.lock(CLIP_LOCK_TIMEOUT).unwrap();
@@ -755,8 +770,8 @@ mod tests {
 
     #[test]
     fn m9_remove_if_cannot_orphan_newer_generation() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ClipStore::in_dir(dir.path().to_path_buf());
+        let (_parent, dir) = private_clip_dir();
+        let store = ClipStore::in_dir(dir.clone());
         for i in 0..1000 {
             {
                 let guard = store.lock(CLIP_LOCK_TIMEOUT).unwrap();
