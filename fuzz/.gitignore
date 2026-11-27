@@ -1,0 +1,4 @@
+target
+artifacts
+coverage
+# Seed inputs under corpus/ are committed. Do not ignore that directory.

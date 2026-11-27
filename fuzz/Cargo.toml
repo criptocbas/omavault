@@ -1,0 +1,38 @@
+[package]
+name = "omavault-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.omavault]
+path = ".."
+
+[workspace]
+
+[[bin]]
+name = "parse_header"
+path = "fuzz_targets/parse_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_totp"
+path = "fuzz_targets/parse_totp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_vault"
+path = "fuzz_targets/parse_vault.rs"
+test = false
+doc = false
+bench = false
